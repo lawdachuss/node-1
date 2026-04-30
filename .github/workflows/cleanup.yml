@@ -39,18 +39,14 @@ jobs:
           echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/ec2-key.pem
           chmod 600 ~/.ssh/ec2-key.pem
           
-          # Add EC2 host to known_hosts
-          EC2_HOST="${{ secrets.EC2_HOST }}"
-          if [ -z "$EC2_HOST" ]; then
-            echo "❌ ERROR: EC2_HOST secret is empty!"
-            exit 1
-          fi
+          # Disable strict host key checking for GitHub Actions
+          cat >> ~/.ssh/config <<EOF
+          Host ${{ secrets.EC2_HOST }}
+            StrictHostKeyChecking no
+            UserKnownHostsFile=/dev/null
+          EOF
           
-          echo "Adding $EC2_HOST to known_hosts..."
-          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>&1 || {
-            echo "⚠️ ssh-keyscan failed, adding host key manually..."
-            ssh-keyscan "$EC2_HOST" >> ~/.ssh/known_hosts 2>&1
-          }
+          echo "SSH setup complete for ${{ secrets.EC2_HOST }}"
 
       - name: Run cleanup script
         run: |
