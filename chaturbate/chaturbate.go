@@ -97,8 +97,9 @@ func FetchStream(ctx context.Context, client *internal.Req, username string) (*S
 		fmt.Printf("[DEBUG] [%s] Attempting POST API (primary method)...\n", username)
 	}
 	
-	// Generate CSRF token
-	csrfToken := fmt.Sprintf("%032x", time.Now().UnixNano())
+	// Generate CSRF token - must be a 32-character hex string (like UUID)
+	// Using timestamp-based UUID v1 format for uniqueness
+	csrfToken := fmt.Sprintf("%016x%016x", time.Now().UnixNano(), time.Now().UnixNano()^0xDEADBEEF)
 	
 	// Use the POST API
 	body, err := internal.PostChaturbateAPI(ctx, username, csrfToken)
