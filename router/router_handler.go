@@ -241,10 +241,14 @@ func UpdateConfig(c *gin.Context) {
 func GetVideos(c *gin.Context) {
 	var allRecords []map[string]interface{}
 	
-	// Try Supabase first if enabled
-	if server.Config.EnableSupabase && server.Config.SupabaseURL != "" && server.Config.SupabaseAPIKey != "" {
+	// Try Supabase first if credentials are configured
+	if server.Config.SupabaseURL != "" && server.Config.SupabaseAPIKey != "" {
+		log.Printf("[API] Fetching videos from Supabase...")
 		records, err := server.SupabaseClient.GetAllUploads()
-		if err == nil {
+		if err != nil {
+			log.Printf("[API] Supabase fetch failed: %v, falling back to local database", err)
+		} else {
+			log.Printf("[API] Fetched %d videos from Supabase", len(records))
 			// Convert to generic map format
 			for _, record := range records {
 				allRecords = append(allRecords, map[string]interface{}{
@@ -261,13 +265,25 @@ func GetVideos(c *gin.Context) {
 				})
 			}
 		}
+	} else {
+		log.Printf("[API] Supabase not configured, using local database only")
 	}
 	
-	// Also read from local JSON database
+	// Also read from local JSON database (as backup/supplement)
+	log.Printf("[API] Fetching videos from local database...")
 	localRecords := readLocalDatabase()
+	log.Printf("[API] Fetched %d videos from local database", len(localRecords))
 	allRecords = append(allRecords, localRecords...)
 	
-	c.JSON(http.StatusOK, gin.H{"videos": allRecords, "count": len(allRecords)})
+	log.Printf("[API] Total videos: %d (Supabase + Local)", len(allRecords))
+	c.JSON(http.StatusOK, gin.H{
+		"videos": allRecords, 
+		"count": len(allRecords),
+		"sources": gin.H{
+			"supabase_configured": server.Config.SupabaseURL != "" && server.Config.SupabaseAPIKey != "",
+			"local_database": true,
+		},
+	})
 }
 
 // readLocalDatabase reads video records from the local JSON database
@@ -325,6 +341,18 @@ func readLocalDatabase() []map[string]interface{} {
 				if gofileLink, ok := recMap["gofile_link"].(string); ok {
 					normalized["gofile_link"] = gofileLink
 				}
+				if turboviplayLink, ok := recMap["turboviplay_link"].(string); ok {
+					normalized["turboviplay_link"] = turboviplayLink
+				}
+				if voesxLink, ok := recMap["voesx_link"].(string); ok {
+					normalized["voesx_link"] = voesxLink
+				}
+				if streamtapeLink, ok := recMap["streamtape_link"].(string); ok {
+					normalized["streamtape_link"] = streamtapeLink
+				}
+				if thumbnailLink, ok := recMap["thumbnail_link"].(string); ok {
+					normalized["thumbnail_link"] = thumbnailLink
+				}
 				if uploadedAt, ok := recMap["uploaded_at"].(string); ok {
 					normalized["upload_date"] = uploadedAt
 				}
@@ -360,10 +388,16 @@ func GetVideosByUsername(c *gin.Context) {
 	username := c.Param("username")
 	var allRecords []map[string]interface{}
 	
-	// Try Supabase first if enabled
-	if server.Config.EnableSupabase && server.Config.SupabaseURL != "" && server.Config.SupabaseAPIKey != "" {
+	log.Printf("[API] Fetching videos for username: %s", username)
+	
+	// Try Supabase first if credentials are configured
+	if server.Config.SupabaseURL != "" && server.Config.SupabaseAPIKey != "" {
+		log.Printf("[API] Fetching from Supabase for %s...", username)
 		records, err := server.SupabaseClient.GetUploadsByStreamer(username)
-		if err == nil {
+		if err != nil {
+			log.Printf("[API] Supabase fetch failed for %s: %v", username, err)
+		} else {
+			log.Printf("[API] Fetched %d videos from Supabase for %s", len(records), username)
 			// Convert to generic map format
 			for _, record := range records {
 				allRecords = append(allRecords, map[string]interface{}{
@@ -383,10 +417,21 @@ func GetVideosByUsername(c *gin.Context) {
 	}
 	
 	// Also read from local JSON database
+	log.Printf("[API] Fetching from local database for %s...", username)
 	localRecords := readLocalDatabaseByUsername(username)
+	log.Printf("[API] Fetched %d videos from local database for %s", len(localRecords), username)
 	allRecords = append(allRecords, localRecords...)
 	
-	c.JSON(http.StatusOK, gin.H{"videos": allRecords, "count": len(allRecords), "username": username})
+	log.Printf("[API] Total videos for %s: %d", username, len(allRecords))
+	c.JSON(http.StatusOK, gin.H{
+		"videos": allRecords, 
+		"count": len(allRecords), 
+		"username": username,
+		"sources": gin.H{
+			"supabase_configured": server.Config.SupabaseURL != "" && server.Config.SupabaseAPIKey != "",
+			"local_database": true,
+		},
+	})
 }
 
 // readLocalDatabaseByUsername reads video records for a specific username from the local JSON database
@@ -440,6 +485,18 @@ func readLocalDatabaseByUsername(username string) []map[string]interface{} {
 				}
 				if gofileLink, ok := recMap["gofile_link"].(string); ok {
 					normalized["gofile_link"] = gofileLink
+				}
+				if turboviplayLink, ok := recMap["turboviplay_link"].(string); ok {
+					normalized["turboviplay_link"] = turboviplayLink
+				}
+				if voesxLink, ok := recMap["voesx_link"].(string); ok {
+					normalized["voesx_link"] = voesxLink
+				}
+				if streamtapeLink, ok := recMap["streamtape_link"].(string); ok {
+					normalized["streamtape_link"] = streamtapeLink
+				}
+				if thumbnailLink, ok := recMap["thumbnail_link"].(string); ok {
+					normalized["thumbnail_link"] = thumbnailLink
 				}
 				if uploadedAt, ok := recMap["uploaded_at"].(string); ok {
 					normalized["upload_date"] = uploadedAt
@@ -554,6 +611,7 @@ func uploadCompletedFilesAsync() {
 	
 	uploadCount := 0
 	errorCount := 0
+	skippedCount := 0
 
 	// Walk through completed directory
 	err := filepath.Walk(completedDir, func(path string, info os.FileInfo, err error) error {
@@ -565,9 +623,14 @@ func uploadCompletedFilesAsync() {
 			return nil // Skip directories
 		}
 
-		// Only process video files
+		// Only process video files - CRITICAL: Only .mp4 and .mkv files (NOT .ts)
 		ext := strings.ToLower(filepath.Ext(path))
-		if ext != ".mp4" && ext != ".mkv" && ext != ".ts" {
+		if ext != ".mp4" && ext != ".mkv" {
+			// Skip .ts files and other formats
+			if ext == ".ts" {
+				log.Printf("⚠️  SKIPPED: %s (unconverted .ts file - use automatic recording for proper conversion)", filepath.Base(path))
+				skippedCount++
+			}
 			return nil
 		}
 
@@ -653,7 +716,7 @@ func uploadCompletedFilesAsync() {
 		log.Printf("ERROR: Failed to walk completed directory: %v", err)
 	}
 
-	log.Printf("Upload complete: %d successful, %d failed", uploadCount, errorCount)
+	log.Printf("Upload complete: %d successful, %d failed, %d skipped (.ts files)", uploadCount, errorCount, skippedCount)
 }
 
 

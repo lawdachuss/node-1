@@ -1,7 +1,7 @@
 # Connect to EC2 and diagnose recording issues
 # Run this from your local machine
 
-$EC2_IP = "54.210.37.19"
+$EC2_IP = "3.84.15.178"
 $KEY_PATH = "aws-secrets/aws-key.pem"
 
 Write-Host "🔌 Connecting to EC2: $EC2_IP" -ForegroundColor Cyan

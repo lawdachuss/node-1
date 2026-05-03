@@ -2,7 +2,7 @@
 # This script downloads your EC2 configuration files to local backup
 
 param(
-    [string]$EC2Host = "54.210.37.19",
+    [string]$EC2Host = "3.84.15.178",
     [string]$KeyPath = "aws-secrets/aws-key.pem",
     [string]$AppDir = "/home/ubuntu/goondvr"
 )

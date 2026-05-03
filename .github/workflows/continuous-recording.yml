@@ -366,6 +366,7 @@ jobs:
           END_TIME=$(($(date +%s) + 18000))  # 5 hours = 18000 seconds
           LAST_URL_DISPLAY=0
           LAST_CLEANUP=0
+          LAST_CHANNEL_SYNC=0
           
           while [ $(date +%s) -lt $END_TIME ]; do
             CURRENT_TIME=$(date +%s)
@@ -376,6 +377,22 @@ jobs:
               echo "Last 50 lines of log:"
               docker logs --tail 50 goondvr
               break
+            fi
+            
+            # Sync channels from container every 5 minutes to capture UI changes
+            if [ $((CURRENT_TIME - LAST_CHANNEL_SYNC)) -gt 300 ]; then
+              echo "🔄 Syncing channels from container..."
+              docker exec goondvr cat /usr/src/app/conf/channels.json > conf/channels.json 2>/dev/null || true
+              
+              # Sync to Supabase if configured
+              if [ -n "${{ secrets.SUPABASE_URL }}" ] && [ -n "${{ secrets.SUPABASE_API_KEY }}" ]; then
+                export SUPABASE_URL="${{ secrets.SUPABASE_URL }}"
+                export SUPABASE_API_KEY="${{ secrets.SUPABASE_API_KEY }}"
+                chmod +x scripts/sync-channels-to-supabase.sh
+                ./scripts/sync-channels-to-supabase.sh 2>/dev/null || true
+              fi
+              
+              LAST_CHANNEL_SYNC=$CURRENT_TIME
             fi
             
             # Cleanup uploaded videos every 10 minutes to save disk space
@@ -441,11 +458,76 @@ jobs:
         if: always()
         run: |
           echo "🧹 Final cleanup - removing all local videos..."
-          find videos -type f \( -name "*.mp4" -o -name "*.ts" \) -delete 2>/dev/null || true
+          find videos -type f \( -name "*.mp4" -o -name "*.ts" -o -name "*.mkv" \) -delete 2>/dev/null || true
           echo "✅ All videos cleaned up (they're already uploaded to GoFile/etc)"
           echo ""
           echo "💾 Final disk usage:"
           df -h /
+      
+      - name: Clear all caches and temporary files
+        if: always()
+        run: |
+          echo "🧹 Clearing all caches and temporary files..."
+          
+          # Clear Docker build cache
+          echo "🐳 Clearing Docker build cache..."
+          docker builder prune -af --filter "until=1h" 2>/dev/null || true
+          
+          # Clear Docker system cache
+          echo "🐳 Clearing Docker system cache..."
+          docker system prune -af --volumes 2>/dev/null || true
+          
+          # Clear Go build cache
+          echo "🔧 Clearing Go build cache..."
+          go clean -cache -modcache -testcache 2>/dev/null || true
+          
+          # Clear npm cache (if any)
+          echo "📦 Clearing npm cache..."
+          npm cache clean --force 2>/dev/null || true
+          
+          # Clear pip cache (if any)
+          echo "🐍 Clearing pip cache..."
+          pip cache purge 2>/dev/null || true
+          
+          # Clear apt cache
+          echo "📦 Clearing apt cache..."
+          sudo apt-get clean 2>/dev/null || true
+          sudo rm -rf /var/lib/apt/lists/* 2>/dev/null || true
+          
+          # Clear GitHub Actions cache directories
+          echo "🗂️  Clearing GitHub Actions cache directories..."
+          sudo rm -rf /opt/hostedtoolcache/* 2>/dev/null || true
+          sudo rm -rf ~/.cache/* 2>/dev/null || true
+          sudo rm -rf /tmp/* 2>/dev/null || true
+          
+          # Clear cloudflared cache
+          echo "☁️  Clearing cloudflared cache..."
+          rm -f cloudflared.deb 2>/dev/null || true
+          
+          # Clear any leftover video files
+          echo "🎬 Clearing any leftover video files..."
+          find . -type f \( -name "*.mp4" -o -name "*.ts" -o -name "*.mkv" -o -name "*.flv" \) -delete 2>/dev/null || true
+          
+          # Clear thumbnail files
+          echo "🖼️  Clearing thumbnail files..."
+          find . -type f \( -name "*_thumb.jpg" -o -name "*.jpg" -o -name "*.png" \) -delete 2>/dev/null || true
+          
+          # Clear database files (they're in Supabase)
+          echo "💾 Clearing local database files..."
+          rm -rf database/* 2>/dev/null || true
+          
+          # Clear any .finalizing files
+          echo "🔄 Clearing temporary processing files..."
+          find . -type f -name "*.finalizing*" -delete 2>/dev/null || true
+          
+          echo ""
+          echo "✅ All caches and temporary files cleared"
+          echo ""
+          echo "💾 Disk space after cleanup:"
+          df -h /
+          echo ""
+          echo "📊 Disk usage by directory:"
+          du -sh /* 2>/dev/null | sort -h | tail -20 || true
       
       - name: Show session logs
         if: always()
@@ -487,13 +569,37 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
+          echo "🧹 Starting final cleanup..."
+          
           # Stop and remove Docker containers
+          echo "🐳 Stopping Docker containers..."
           docker stop goondvr byparr 2>/dev/null || true
           docker rm -f goondvr byparr 2>/dev/null || true
           docker network rm recorder-network 2>/dev/null || true
           
+          # Remove Docker images to free space
+          echo "🐳 Removing Docker images..."
+          docker rmi goondvr:latest 2>/dev/null || true
+          docker rmi ghcr.io/thephaseless/byparr:latest 2>/dev/null || true
+          docker rmi ghcr.io/flaresolverr/flaresolverr:latest 2>/dev/null || true
+          
+          # Clear all Docker resources
+          echo "🐳 Clearing all Docker resources..."
+          docker system prune -af --volumes 2>/dev/null || true
+          
+          # Stop cloudflare tunnel
+          echo "☁️  Stopping Cloudflare tunnel..."
+          if [ -f tunnel.pid ]; then
+            kill $(cat tunnel.pid) 2>/dev/null || true
+            rm -f tunnel.pid
+          fi
+          pkill -f cloudflared 2>/dev/null || true
+          
+          # Clear tunnel logs
+          rm -f tunnel.log 2>/dev/null || true
+          
           echo ""
-          echo "✅ Workflow completed"
+          echo "✅ Cleanup completed"
           echo "🔄 Next run will start automatically in ~5 hours"
           echo "🌐 A new dashboard URL will be generated on next run"
 

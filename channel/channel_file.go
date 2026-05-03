@@ -9,7 +9,6 @@ import (
 	"html/template"
 	"io"
 	"io/fs"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +21,14 @@ import (
 	"github.com/HeapOfChaos/goondvr/supabase"
 	"github.com/HeapOfChaos/goondvr/uploader"
 )
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
 
 // Pattern holds the date/time and sequence information for the filename pattern
 type Pattern struct {
@@ -330,132 +337,107 @@ func isMP4InitSegment(b []byte) bool {
 	return hasFtyp && hasMoov
 }
 
-func (ch *Channel) finalizeRecording(filename string, recordedDuration float64, recordedFilesize int64) {
-	defer ch.finishFinalization()
-
-	finalPath := filename
-	if server.Config.FinalizeMode == "none" {
-		if strings.HasSuffix(filename, ".mp4") {
-			if err := chaturbate.BuildSeekIndex(filename); err != nil {
-				log.Printf("WARN  seek index %s: %v", filename, err)
-			}
-		}
-	} else {
-		processedPath, err := ch.runFFmpegFinalizer(filename)
-		if err != nil {
-			ch.Error("ffmpeg %s failed for `%s`: %s", server.Config.FinalizeMode, filename, err.Error())
-			ch.Info("keeping original recording because finalization failed")
-		} else {
-			if processedPath != filename {
-				if err := os.Remove(filename); err != nil {
-					ch.Error("remove original after ffmpeg finalization `%s`: %s", filename, err.Error())
-				}
-			}
-			finalPath = processedPath
-		}
-	}
-
-	// Upload to GoFile if enabled
-	if server.Config.EnableGoFileUpload {
-		ch.Info("uploading `%s` to GoFile...", filepath.Base(finalPath))
-		
-		gofileUploader := uploader.NewGoFileUploader()
-		downloadLink, err := gofileUploader.Upload(finalPath)
-		
-		if err != nil {
-			ch.Error("gofile upload failed for `%s`: %s", finalPath, err.Error())
-			ch.Info("keeping local file because upload failed")
-			// Do not create database folders or log failed uploads
-		} else {
-			ch.Info("upload successful: %s", downloadLink)
-			
-			// Only create database folders and log after successful upload
-			// Store in GitHub Actions database (JSON files) - creates folders only on success
-			if err := ch.logUploadToDatabase(finalPath, downloadLink, "", "", "", "", recordedDuration, recordedFilesize); err != nil {
-				ch.Error("failed to log upload to GitHub Actions database: %s", err.Error())
-			} else {
-				ch.Info("upload logged to GitHub Actions database")
-			}
-			
-			// Store upload record in Supabase if configured (dual database system)
-			if server.Config.SupabaseURL != "" && server.Config.SupabaseAPIKey != "" {
-				supabaseClient := supabase.NewClient(server.Config.SupabaseURL, server.Config.SupabaseAPIKey)
-				if err := supabaseClient.InsertUploadRecord(ch.Config.Username, downloadLink, ""); err != nil {
-					ch.Error("failed to store upload record in Supabase: %s", err.Error())
-				} else {
-					ch.Info("upload record stored in Supabase database")
-				}
-			}
-			
-			// Delete local file only after successful upload and database logging
-			if err := os.Remove(finalPath); err != nil {
-				ch.Error("failed to delete local file `%s`: %s", finalPath, err.Error())
-			} else {
-				ch.Info("local file deleted: `%s`", filepath.Base(finalPath))
-			}
-			
-			go ch.ScanTotalDiskUsage()
-			return
-		}
-	}
-
-	// Smart strategy: file was written directly into completedDir, no move needed.
-	// Only fall back to moveRecordingToDir if the file ended up outside completedDir.
-	completedDir := completedDirForChannel(ch)
-	if completedDir != "" {
-		cleanCompleted := filepath.Clean(completedDir)
-		cleanFinal := filepath.Clean(filepath.Dir(finalPath))
-		if cleanFinal != cleanCompleted {
-			dst, err := moveRecordingToDir(finalPath, recordingDirFromPattern(ch.Config.Pattern), completedDir)
-			if err != nil {
-				ch.Error("move completed recording `%s`: %s", finalPath, err.Error())
-			} else {
-				ch.Info("completed recording moved to `%s`", dst)
-			}
-		} else {
-			ch.Info("recording already in completed dir: `%s`", filepath.Base(finalPath))
-		}
-	}
-
-	go ch.ScanTotalDiskUsage()
-}
-
 // finalizeRecordingAsync processes a completed recording file in the background
 // This allows recording to continue while conversion and upload happen in parallel
 func (ch *Channel) finalizeRecordingAsync(filename string, recordedDuration float64, recordedFilesize int64) {
 	defer ch.finishFinalization()
 	
-	ch.Info("starting background processing for `%s`", filepath.Base(filename))
+	ch.Info("🎬 starting background processing for `%s`", filepath.Base(filename))
 
 	finalPath := filename
 	
 	// Step 1: Convert/remux if needed (runs in parallel with recording)
 	if server.Config.FinalizeMode != "none" {
-		ch.Info("converting `%s` to %s...", filepath.Base(filename), finalOutputExt(filename))
+		inputExt := filepath.Ext(filename)
+		outputExt := finalOutputExt(filename)
+		ch.Info("🔄 converting `%s` (%s) to %s format using %s mode...", filepath.Base(filename), inputExt, outputExt, server.Config.FinalizeMode)
 		processedPath, err := ch.runFFmpegFinalizer(filename)
 		if err != nil {
-			ch.Error("ffmpeg %s failed for `%s`: %s", server.Config.FinalizeMode, filename, err.Error())
-			ch.Info("keeping original recording because finalization failed")
+			ch.Error("❌ ffmpeg %s failed for `%s`: %s", server.Config.FinalizeMode, filename, err.Error())
+			ch.Error("❌ CRITICAL: conversion failed - will NOT upload .ts file")
+			ch.Info("keeping original recording locally because finalization failed")
+			// Move to completed dir but don't upload
+			completedDir := completedDirForChannel(ch)
+			if completedDir != "" {
+				cleanCompleted := filepath.Clean(completedDir)
+				cleanFinal := filepath.Clean(filepath.Dir(filename))
+				if cleanFinal != cleanCompleted {
+					dst, err := moveRecordingToDir(filename, recordingDirFromPattern(ch.Config.Pattern), completedDir)
+					if err != nil {
+						ch.Error("move failed recording `%s`: %s", filename, err.Error())
+					} else {
+						ch.Info("failed recording moved to `%s`", dst)
+					}
+				}
+			}
+			go ch.ScanTotalDiskUsage()
+			return // Don't upload unconverted .ts files
 		} else {
-			ch.Info("conversion complete: `%s`", filepath.Base(processedPath))
+			ch.Info("✅ conversion complete: `%s` (%s)", filepath.Base(processedPath), filepath.Ext(processedPath))
 			if processedPath != filename {
 				if err := os.Remove(filename); err != nil {
 					ch.Error("remove original after ffmpeg finalization `%s`: %s", filename, err.Error())
 				} else {
-					ch.Info("removed original .ts file")
+					ch.Info("✅ removed original %s file", inputExt)
 				}
 			}
 			finalPath = processedPath
 		}
 	} else if strings.HasSuffix(filename, ".mp4") {
+		ch.Info("building seek index for mp4 file...")
 		if err := chaturbate.BuildSeekIndex(filename); err != nil {
 			ch.Error("seek index %s: %v", filename, err)
 		}
 	}
+	
+	// Step 1.5: Validate file before upload (ensure it's .mp4 or .mkv, not .ts)
+	finalExt := strings.ToLower(filepath.Ext(finalPath))
+	if finalExt != ".mp4" && finalExt != ".mkv" {
+		ch.Error("❌ CRITICAL: final file has invalid extension %s (expected .mp4 or .mkv)", finalExt)
+		ch.Error("❌ refusing to upload unconverted file - this indicates FFmpeg conversion failed silently")
+		ch.Info("keeping file locally: `%s`", filepath.Base(finalPath))
+		// Move to completed dir but don't upload
+		completedDir := completedDirForChannel(ch)
+		if completedDir != "" {
+			cleanCompleted := filepath.Clean(completedDir)
+			cleanFinal := filepath.Clean(filepath.Dir(finalPath))
+			if cleanFinal != cleanCompleted {
+				dst, err := moveRecordingToDir(finalPath, recordingDirFromPattern(ch.Config.Pattern), completedDir)
+				if err != nil {
+					ch.Error("move invalid file `%s`: %s", finalPath, err.Error())
+				} else {
+					ch.Info("invalid file moved to `%s`", dst)
+				}
+			}
+		}
+		go ch.ScanTotalDiskUsage()
+		return
+	}
 
 	// Step 2: Upload to multiple hosts if enabled (runs in parallel with recording)
 	if server.Config.EnableGoFileUpload {
-		ch.Info("uploading `%s` to multiple hosts...", filepath.Base(finalPath))
+		fileInfo, _ := os.Stat(finalPath)
+		fileSizeMB := float64(fileInfo.Size()) / (1024 * 1024)
+		ch.Info("📤 uploading `%s` (%.2f MB) to multiple hosts...", filepath.Base(finalPath), fileSizeMB)
+		
+		// Log API key status for debugging
+		ch.Info("🔑 API key status:")
+		ch.Info("  • GoFile: always enabled (no key required)")
+		if server.Config.TurboViPlayAPIKey != "" {
+			ch.Info("  • TurboViPlay: ✓ configured (key: %s...)", server.Config.TurboViPlayAPIKey[:min(10, len(server.Config.TurboViPlayAPIKey))])
+		} else {
+			ch.Info("  • TurboViPlay: ✗ not configured")
+		}
+		if server.Config.VoeSXAPIKey != "" {
+			ch.Info("  • VOE.sx: ✓ configured (key: %s...)", server.Config.VoeSXAPIKey[:min(10, len(server.Config.VoeSXAPIKey))])
+		} else {
+			ch.Info("  • VOE.sx: ✗ not configured")
+		}
+		if server.Config.StreamtapeLogin != "" && server.Config.StreamtapeAPIKey != "" {
+			ch.Info("  • Streamtape: ✓ configured (login: %s)", server.Config.StreamtapeLogin)
+		} else {
+			ch.Info("  • Streamtape: ✗ not configured")
+		}
 		
 		// Create multi-host uploader with API keys (GoFile + TurboViPlay + VOE.sx + Streamtape)
 		multiUploader := uploader.NewMultiHostUploader(
@@ -466,20 +448,21 @@ func (ch *Channel) finalizeRecordingAsync(filename string, recordedDuration floa
 		)
 		
 		// Upload to all hosts in parallel
+		ch.Info("🚀 starting parallel uploads to all configured hosts...")
 		results := multiUploader.UploadToAll(finalPath)
 		
 		// Get successful uploads
 		successfulUploads := uploader.GetSuccessfulUploads(results)
 		
 		if len(successfulUploads) == 0 {
-			ch.Error("all uploads failed for `%s`", finalPath)
+			ch.Error("❌ all uploads failed for `%s`", finalPath)
 			for _, result := range results {
-				ch.Error("  %s: %v", result.Host, result.Error)
+				ch.Error("  ✗ %s: %v", result.Host, result.Error)
 			}
 			ch.Info("keeping local file because all uploads failed")
 		} else {
 			// Log results
-			ch.Info("upload completed: %d/%d successful", len(successfulUploads), len(results))
+			ch.Info("✅ upload completed: %d/%d hosts successful", len(successfulUploads), len(results))
 			for _, result := range results {
 				if result.Error == nil {
 					ch.Info("  ✓ %s: %s", result.Host, result.DownloadLink)
@@ -488,26 +471,31 @@ func (ch *Channel) finalizeRecordingAsync(filename string, recordedDuration floa
 				}
 			}
 			
-			// Step 2.5: Generate and upload thumbnail to Catbox.moe
+			// Step 2.5: Generate and upload thumbnail to ImgBB
 			var thumbnailLink string
-			ch.Info("generating thumbnail for `%s`...", filepath.Base(finalPath))
+			ch.Info("📸 generating thumbnail for `%s`...", filepath.Base(finalPath))
 			tempThumbPath, err := generateThumbnail(finalPath)
 			if err != nil {
-				ch.Error("thumbnail generation failed: %s", err.Error())
+				ch.Error("❌ thumbnail generation failed: %s", err.Error())
 			} else {
-				// Upload thumbnail to Catbox.moe (supports adult content, permanent hosting)
-				ch.Info("uploading thumbnail to Catbox.moe...")
-				thumbnailUploader := uploader.NewThumbnailUploader(server.Config.ImgBBAPIKey)
-				uploadedURL, err := thumbnailUploader.Upload(tempThumbPath)
-				if err != nil {
-					ch.Error("thumbnail upload failed: %s", err.Error())
-					// Clean up temp file
+				// Upload thumbnail to ImgBB (free image hosting with API)
+				ch.Info("uploading thumbnail to ImgBB...")
+				if server.Config.ImgBBAPIKey == "" {
+					ch.Error("❌ ImgBB API key not configured, skipping thumbnail upload")
 					os.Remove(tempThumbPath)
 				} else {
-					ch.Info("thumbnail uploaded successfully: %s", uploadedURL)
-					thumbnailLink = uploadedURL
-					// Clean up temp file after successful upload
-					os.Remove(tempThumbPath)
+					thumbnailUploader := uploader.NewThumbnailUploader(server.Config.ImgBBAPIKey)
+					uploadedURL, err := thumbnailUploader.Upload(tempThumbPath)
+					if err != nil {
+						ch.Error("❌ thumbnail upload to ImgBB failed: %s", err.Error())
+						// Clean up temp file
+						os.Remove(tempThumbPath)
+					} else {
+						ch.Info("✓ thumbnail uploaded to ImgBB: %s", uploadedURL)
+						thumbnailLink = uploadedURL
+						// Clean up temp file after successful upload
+						os.Remove(tempThumbPath)
+					}
 				}
 			}
 			
@@ -529,14 +517,17 @@ func (ch *Channel) finalizeRecordingAsync(filename string, recordedDuration floa
 			// Store all successful upload links in database
 			// Only create database folders and log after successful upload
 			// Store in GitHub Actions database (JSON files) - creates folders only on success
+			ch.Info("💾 logging upload to GitHub Actions database...")
 			if err := ch.logUploadToDatabase(finalPath, gofileLink, turboviplayLink, voesxLink, streamtapeLink, thumbnailLink, recordedDuration, recordedFilesize); err != nil {
-				ch.Error("failed to log upload to GitHub Actions database: %s", err.Error())
+				ch.Error("❌ failed to log upload to GitHub Actions database: %s", err.Error())
 			} else {
-				ch.Info("upload logged to GitHub Actions database")
+				ch.Info("✓ upload logged to GitHub Actions database")
 			}
 			
-			// Store upload records in Supabase only when enabled.
-			if server.Config.EnableSupabase && server.Config.SupabaseURL != "" && server.Config.SupabaseAPIKey != "" {
+			// Store upload records in Supabase when enabled (independent of EnableSupabase flag)
+			// The flag controls whether uploads happen, but if we have credentials, we should use them
+			if server.Config.SupabaseURL != "" && server.Config.SupabaseAPIKey != "" {
+				ch.Info("💾 storing upload record in Supabase...")
 				supabaseClient := supabase.NewClient(server.Config.SupabaseURL, server.Config.SupabaseAPIKey)
 				
 				// Store single record with all links
@@ -549,18 +540,20 @@ func (ch *Channel) finalizeRecordingAsync(filename string, recordedDuration floa
 					streamtapeLink,
 					thumbnailLink,
 				); err != nil {
-					ch.Error("failed to store multi-host upload record in Supabase: %s", err.Error())
+					ch.Error("❌ failed to store multi-host upload record in Supabase: %s", err.Error())
 				} else {
-					ch.Info("multi-host upload record stored in Supabase (%d hosts)", len(successfulUploads))
+					ch.Info("✓ multi-host upload record stored in Supabase (%d hosts)", len(successfulUploads))
 				}
+			} else {
+				ch.Info("⚠️  Supabase credentials not configured, skipping Supabase upload")
 			}
 			
 			// Step 3: Delete local file only after successful upload and database logging
-			ch.Info("deleting local file `%s`...", filepath.Base(finalPath))
+			ch.Info("🗑️  deleting local file `%s`...", filepath.Base(finalPath))
 			if err := os.Remove(finalPath); err != nil {
-				ch.Error("failed to delete local file `%s`: %s", finalPath, err.Error())
+				ch.Error("❌ failed to delete local file `%s`: %s", finalPath, err.Error())
 			} else {
-				ch.Info("local file deleted successfully")
+				ch.Info("✓ local file deleted successfully")
 			}
 			
 			go ch.ScanTotalDiskUsage()
@@ -949,18 +942,35 @@ func (ch *Channel) ProcessOrphanedFile(filePath string) {
 	
 	// Step 1: Convert/remux if needed
 	if server.Config.FinalizeMode != "none" {
-		ch.Info("converting orphaned file `%s` to %s...", filepath.Base(filePath), finalOutputExt(filePath))
+		ch.Info("🔄 converting orphaned file `%s` to %s...", filepath.Base(filePath), finalOutputExt(filePath))
 		processedPath, err := ch.runFFmpegFinalizer(filePath)
 		if err != nil {
-			ch.Error("ffmpeg %s failed for orphaned file `%s`: %s", server.Config.FinalizeMode, filePath, err.Error())
-			ch.Info("keeping original file because finalization failed")
+			ch.Error("❌ ffmpeg %s failed for orphaned file `%s`: %s", server.Config.FinalizeMode, filePath, err.Error())
+			ch.Error("❌ CRITICAL: conversion failed - will NOT upload .ts file")
+			ch.Info("keeping original file locally because finalization failed")
+			// Move to completed dir but don't upload
+			completedDir := completedDirForChannel(ch)
+			if completedDir != "" {
+				cleanCompleted := filepath.Clean(completedDir)
+				cleanFinal := filepath.Clean(filepath.Dir(filePath))
+				if cleanFinal != cleanCompleted {
+					dst, err := moveRecordingToDir(filePath, recordingDirFromPattern(ch.Config.Pattern), completedDir)
+					if err != nil {
+						ch.Error("move failed orphaned file `%s`: %s", filePath, err.Error())
+					} else {
+						ch.Info("failed orphaned file moved to `%s`", dst)
+					}
+				}
+			}
+			go ch.ScanTotalDiskUsage()
+			return // Don't upload unconverted .ts files
 		} else {
-			ch.Info("conversion complete: `%s`", filepath.Base(processedPath))
+			ch.Info("✅ conversion complete: `%s`", filepath.Base(processedPath))
 			if processedPath != filePath {
 				if err := os.Remove(filePath); err != nil {
 					ch.Error("remove original after ffmpeg finalization `%s`: %s", filePath, err.Error())
 				} else {
-					ch.Info("removed original .ts file")
+					ch.Info("✅ removed original .ts file")
 				}
 			}
 			finalPath = processedPath
@@ -971,9 +981,52 @@ func (ch *Channel) ProcessOrphanedFile(filePath string) {
 		}
 	}
 	
+	// Step 1.5: Validate file before upload (ensure it's .mp4 or .mkv, not .ts)
+	finalExt := strings.ToLower(filepath.Ext(finalPath))
+	if finalExt != ".mp4" && finalExt != ".mkv" {
+		ch.Error("❌ CRITICAL: orphaned file has invalid extension %s (expected .mp4 or .mkv)", finalExt)
+		ch.Error("❌ refusing to upload unconverted file - this indicates FFmpeg conversion failed silently")
+		ch.Info("keeping file locally: `%s`", filepath.Base(finalPath))
+		// Move to completed dir but don't upload
+		completedDir := completedDirForChannel(ch)
+		if completedDir != "" {
+			cleanCompleted := filepath.Clean(completedDir)
+			cleanFinal := filepath.Clean(filepath.Dir(finalPath))
+			if cleanFinal != cleanCompleted {
+				dst, err := moveRecordingToDir(finalPath, recordingDirFromPattern(ch.Config.Pattern), completedDir)
+				if err != nil {
+					ch.Error("move invalid orphaned file `%s`: %s", finalPath, err.Error())
+				} else {
+					ch.Info("invalid orphaned file moved to `%s`", dst)
+				}
+			}
+		}
+		go ch.ScanTotalDiskUsage()
+		return
+	}
+	
 	// Step 2: Upload to multiple hosts if enabled
 	if server.Config.EnableGoFileUpload {
-		ch.Info("uploading orphaned file `%s` to multiple hosts...", filepath.Base(finalPath))
+		ch.Info("📤 uploading orphaned file `%s` to multiple hosts...", filepath.Base(finalPath))
+		
+		// Log API key status for debugging
+		ch.Info("🔑 API key status:")
+		ch.Info("  • GoFile: always enabled (no key required)")
+		if server.Config.TurboViPlayAPIKey != "" {
+			ch.Info("  • TurboViPlay: ✓ configured")
+		} else {
+			ch.Info("  • TurboViPlay: ✗ not configured")
+		}
+		if server.Config.VoeSXAPIKey != "" {
+			ch.Info("  • VOE.sx: ✓ configured")
+		} else {
+			ch.Info("  • VOE.sx: ✗ not configured")
+		}
+		if server.Config.StreamtapeLogin != "" && server.Config.StreamtapeAPIKey != "" {
+			ch.Info("  • Streamtape: ✓ configured")
+		} else {
+			ch.Info("  • Streamtape: ✗ not configured")
+		}
 		
 		// Create multi-host uploader
 		multiUploader := uploader.NewMultiHostUploader(
@@ -984,20 +1037,21 @@ func (ch *Channel) ProcessOrphanedFile(filePath string) {
 		)
 		
 		// Upload to all hosts in parallel
+		ch.Info("🚀 starting parallel uploads to all configured hosts...")
 		results := multiUploader.UploadToAll(finalPath)
 		
 		// Get successful uploads
 		successfulUploads := uploader.GetSuccessfulUploads(results)
 		
 		if len(successfulUploads) == 0 {
-			ch.Error("all uploads failed for orphaned file `%s`", finalPath)
+			ch.Error("❌ all uploads failed for orphaned file `%s`", finalPath)
 			for _, result := range results {
-				ch.Error("  %s: %v", result.Host, result.Error)
+				ch.Error("  ✗ %s: %v", result.Host, result.Error)
 			}
 			ch.Info("keeping local file because all uploads failed")
 		} else {
 			// Log results
-			ch.Info("upload completed: %d/%d successful", len(successfulUploads), len(results))
+			ch.Info("✅ upload completed: %d/%d successful", len(successfulUploads), len(results))
 			for _, result := range results {
 				if result.Error == nil {
 					ch.Info("  ✓ %s: %s", result.Host, result.DownloadLink)
@@ -1006,24 +1060,29 @@ func (ch *Channel) ProcessOrphanedFile(filePath string) {
 				}
 			}
 			
-			// Step 2.5: Generate and upload thumbnail to Catbox.moe
+			// Step 2.5: Generate and upload thumbnail to ImgBB
 			var thumbnailLink string
-			ch.Info("generating thumbnail for orphaned file `%s`...", filepath.Base(finalPath))
+			ch.Info("📸 generating thumbnail for orphaned file `%s`...", filepath.Base(finalPath))
 			tempThumbPath, err := generateThumbnail(finalPath)
 			if err != nil {
-				ch.Error("thumbnail generation failed: %s", err.Error())
+				ch.Error("❌ thumbnail generation failed: %s", err.Error())
 			} else {
-				// Upload thumbnail to Catbox.moe
-				ch.Info("uploading thumbnail to Catbox.moe...")
-				thumbnailUploader := uploader.NewThumbnailUploader(server.Config.ImgBBAPIKey)
-				uploadedURL, err := thumbnailUploader.Upload(tempThumbPath)
-				if err != nil {
-					ch.Error("thumbnail upload failed: %s", err.Error())
+				// Upload thumbnail to ImgBB
+				ch.Info("uploading thumbnail to ImgBB...")
+				if server.Config.ImgBBAPIKey == "" {
+					ch.Error("❌ ImgBB API key not configured, skipping thumbnail upload")
 					os.Remove(tempThumbPath)
 				} else {
-					ch.Info("thumbnail uploaded successfully: %s", uploadedURL)
-					thumbnailLink = uploadedURL
-					os.Remove(tempThumbPath)
+					thumbnailUploader := uploader.NewThumbnailUploader(server.Config.ImgBBAPIKey)
+					uploadedURL, err := thumbnailUploader.Upload(tempThumbPath)
+					if err != nil {
+						ch.Error("❌ thumbnail upload to ImgBB failed: %s", err.Error())
+						os.Remove(tempThumbPath)
+					} else {
+						ch.Info("✓ thumbnail uploaded to ImgBB: %s", uploadedURL)
+						thumbnailLink = uploadedURL
+						os.Remove(tempThumbPath)
+					}
 				}
 			}
 			
@@ -1051,8 +1110,9 @@ func (ch *Channel) ProcessOrphanedFile(filePath string) {
 				ch.Info("upload logged to GitHub Actions database")
 			}
 			
-			// Store upload records in Supabase if enabled
-			if server.Config.EnableSupabase && server.Config.SupabaseURL != "" && server.Config.SupabaseAPIKey != "" {
+			// Store upload records in Supabase when credentials are available
+			if server.Config.SupabaseURL != "" && server.Config.SupabaseAPIKey != "" {
+				ch.Info("storing orphaned file upload record in Supabase...")
 				supabaseClient := supabase.NewClient(server.Config.SupabaseURL, server.Config.SupabaseAPIKey)
 				// Store single record with all links (reuse vars from outer scope)
 				if err := supabaseClient.InsertMultiHostUploadRecord(
@@ -1066,8 +1126,10 @@ func (ch *Channel) ProcessOrphanedFile(filePath string) {
 				); err != nil {
 					ch.Error("failed to store multi-host upload record in Supabase: %s", err.Error())
 				} else {
-					ch.Info("multi-host upload record stored in Supabase (%d hosts)", len(successfulUploads))
+					ch.Info("✓ multi-host upload record stored in Supabase (%d hosts)", len(successfulUploads))
 				}
+			} else {
+				ch.Info("Supabase credentials not configured, skipping Supabase upload")
 			}
 			
 			// Step 3: Delete local file after successful upload

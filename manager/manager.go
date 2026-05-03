@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"github.com/HeapOfChaos/goondvr/notifier"
 	"github.com/HeapOfChaos/goondvr/router/view"
 	"github.com/HeapOfChaos/goondvr/server"
+	"github.com/HeapOfChaos/goondvr/supabase"
 	"github.com/r3labs/sse/v2"
 )
 
@@ -341,7 +343,7 @@ func migrateLegacyPatternConflicts(config []*entity.ChannelConfig) (bool, error)
 	}
 }
 
-// SaveConfig saves the current channels and state to a JSON file.
+// SaveConfig saves the current channels to Supabase (primary) and local JSON file (backup).
 func (m *Manager) SaveConfig() error {
 	var config []*entity.ChannelConfig
 
@@ -350,6 +352,32 @@ func (m *Manager) SaveConfig() error {
 		return true
 	})
 
+	// Save to Supabase first if credentials are configured
+	if server.Config.SupabaseURL != "" && server.Config.SupabaseAPIKey != "" {
+		log.Printf("[CHANNELS] Saving %d channels to Supabase...", len(config))
+		for _, conf := range config {
+			supabaseChannel := supabase.ChannelConfig{
+				Username:    conf.Username,
+				Site:        conf.Site,
+				IsPaused:    conf.IsPaused,
+				Framerate:   conf.Framerate,
+				Resolution:  conf.Resolution,
+				Pattern:     conf.Pattern,
+				MaxDuration: conf.MaxDuration,
+				MaxFilesize: conf.MaxFilesize,
+				CreatedAt:   conf.CreatedAt,
+				StreamedAt:  conf.StreamedAt,
+			}
+			
+			// Use upsert to insert or update
+			if err := server.SupabaseClient.UpsertChannel(supabaseChannel); err != nil {
+				log.Printf("[CHANNELS] Warning: Failed to save channel %s to Supabase: %v", conf.Username, err)
+			}
+		}
+		log.Println("[CHANNELS] ✓ Channels saved to Supabase")
+	}
+
+	// Also save to local file as backup
 	b, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
@@ -357,7 +385,12 @@ func (m *Manager) SaveConfig() error {
 	if err := os.MkdirAll("./conf", 0700); err != nil {
 		return fmt.Errorf("mkdir all conf: %w", err)
 	}
-	return atomicWriteFile(channelsFile, b, 0600)
+	if err := atomicWriteFile(channelsFile, b, 0600); err != nil {
+		return fmt.Errorf("save local backup: %w", err)
+	}
+	log.Println("[CHANNELS] ✓ Channels saved to local file (backup)")
+	
+	return nil
 }
 
 func saveChannelConfig(config []*entity.ChannelConfig) error {
@@ -385,19 +418,59 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	return nil
 }
 
-// LoadConfig loads the channels from JSON and starts them.
+// LoadConfig loads the channels from Supabase (primary) or JSON file (fallback) and starts them.
 func (m *Manager) LoadConfig() error {
-	b, err := os.ReadFile(channelsFile)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("read file: %w", err)
-	}
-
 	var config []*entity.ChannelConfig
-	if err := json.Unmarshal(b, &config); err != nil {
-		return fmt.Errorf("unmarshal: %w", err)
+	
+	// Try loading from Supabase first if credentials are configured
+	if server.Config.SupabaseURL != "" && server.Config.SupabaseAPIKey != "" {
+		log.Println("[CHANNELS] Loading channels from Supabase...")
+		supabaseChannels, err := server.SupabaseClient.GetAllChannels()
+		if err != nil {
+			log.Printf("[CHANNELS] Failed to load from Supabase: %v, falling back to local file", err)
+		} else {
+			log.Printf("[CHANNELS] Loaded %d channels from Supabase", len(supabaseChannels))
+			// Convert Supabase channels to entity.ChannelConfig
+			for _, sc := range supabaseChannels {
+				config = append(config, &entity.ChannelConfig{
+					IsPaused:    sc.IsPaused,
+					Username:    sc.Username,
+					Site:        sc.Site,
+					Framerate:   sc.Framerate,
+					Resolution:  sc.Resolution,
+					Pattern:     sc.Pattern,
+					MaxDuration: sc.MaxDuration,
+					MaxFilesize: sc.MaxFilesize,
+					CreatedAt:   sc.CreatedAt,
+					StreamedAt:  sc.StreamedAt,
+				})
+			}
+			
+			// Also save to local file as backup
+			if err := saveChannelConfig(config); err != nil {
+				log.Printf("[CHANNELS] Warning: Failed to save backup to local file: %v", err)
+			} else {
+				log.Println("[CHANNELS] Backup saved to local file")
+			}
+		}
+	}
+	
+	// If Supabase failed or not configured, load from local file
+	if len(config) == 0 {
+		log.Println("[CHANNELS] Loading channels from local file...")
+		b, err := os.ReadFile(channelsFile)
+		if os.IsNotExist(err) {
+			log.Println("[CHANNELS] No channels file found, starting with empty configuration")
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read file: %w", err)
+		}
+
+		if err := json.Unmarshal(b, &config); err != nil {
+			return fmt.Errorf("unmarshal: %w", err)
+		}
+		log.Printf("[CHANNELS] Loaded %d channels from local file", len(config))
 	}
 
 	migrated, err := migrateLegacyPatternConflicts(config)
@@ -481,15 +554,30 @@ func (m *Manager) CreateChannel(conf *entity.ChannelConfig, shouldSave bool) err
 	return nil
 }
 
-// StopChannel stops the channel.
+// StopChannel stops the channel and removes it from Supabase and local storage.
 func (m *Manager) StopChannel(channelID string) error {
 	thing, ok := m.Channels.Load(channelID)
 	if !ok {
 		return nil
 	}
-	thing.(*channel.Channel).Stop()
+	
+	ch := thing.(*channel.Channel)
+	username := ch.Config.Username
+	
+	ch.Stop()
 	m.Channels.Delete(channelID)
 
+	// Delete from Supabase if configured
+	if server.Config.SupabaseURL != "" && server.Config.SupabaseAPIKey != "" {
+		log.Printf("[CHANNELS] Deleting channel %s from Supabase...", username)
+		if err := server.SupabaseClient.DeleteChannel(username); err != nil {
+			log.Printf("[CHANNELS] Warning: Failed to delete channel %s from Supabase: %v", username, err)
+		} else {
+			log.Printf("[CHANNELS] ✓ Channel %s deleted from Supabase", username)
+		}
+	}
+
+	// Save updated config to local file
 	if err := m.SaveConfig(); err != nil {
 		return fmt.Errorf("save config: %w", err)
 	}
@@ -760,9 +848,10 @@ func (m *Manager) ProcessOrphanedRecordings() {
 	}
 	
 	var orphanedFiles []string
+	// Only process converted video files (.mp4, .mkv)
+	// .ts files should NOT be processed as orphaned files - they need conversion first
 	videoExtensions := map[string]bool{
 		".mp4": true,
-		".ts":  true,
 		".mkv": true,
 	}
 	
