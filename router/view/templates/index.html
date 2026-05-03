@@ -1098,7 +1098,7 @@
                             </div>
                         </div>
                         <div class="column">
-                            <button type="button" class="ts-button is-start-icon is-outlined" onclick="uploadCompletedFiles()" title="Upload completed files to GoFile">
+                            <button type="button" class="ts-button is-start-icon is-outlined" onclick="uploadCompletedFiles()" title="Upload completed files to all configured hosts (GoFile, TurboViPlay, VOE.sx, Streamtape)">
                                 <span class="ts-icon is-cloud-arrow-up-icon"></span>
                                 Upload Completed
                             </button>
@@ -1670,11 +1670,11 @@
 
             // Upload completed files function
             function uploadCompletedFiles() {
-                if (!confirm('Upload all completed video files to GoFile and delete local copies?\n\nThis will:\n✓ Upload videos to GoFile\n✓ Store links in Supabase\n✓ Delete local files after upload')) {
+                if (!confirm('Upload all completed video files to ALL configured hosts and delete local copies?\n\nThis will:\n✓ Upload videos to GoFile, TurboViPlay, VOE.sx, and Streamtape (if configured)\n✓ Store links in Supabase\n✓ Delete local files after upload\n\nCheck the console logs for detailed progress.')) {
                     return;
                 }
 
-                showToast('Starting upload...', 'info');
+                showToast('Starting multi-host upload...', 'info');
 
                 fetch('/api/upload/completed', {
                     method: 'POST',
@@ -1687,14 +1687,20 @@
                     if (data.error) {
                         showToast(data.error, 'error');
                     } else {
-                        showToast('Upload started! Check console for progress.', 'success');
-                        // Reload videos after a delay to show new uploads
-                        setTimeout(() => {
-                            loadVideos();
-                        }, 5000);
+                        const count = data.count || 0;
+                        if (count === 0) {
+                            showToast(data.message || 'No files to upload', 'info');
+                        } else {
+                            showToast(`Upload started for ${count} file(s)! Check console for progress.`, 'success');
+                            // Reload videos after a delay to show new uploads
+                            setTimeout(() => {
+                                loadVideos();
+                            }, 10000); // Wait longer for multi-host uploads
+                        }
                     }
                 })
                 .catch(err => {
+                    console.error('Upload error:', err);
                     showToast('Failed to start upload', 'error');
                 });
             }

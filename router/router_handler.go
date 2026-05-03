@@ -611,23 +611,63 @@ func BackupDatabase(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "not implemented"})
 }
 
-// UploadCompletedFiles uploads all completed video files to GoFile
+// UploadCompletedFiles uploads all completed video files to multiple hosts
 func UploadCompletedFiles(c *gin.Context) {
 	if !server.Config.EnableGoFileUpload {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "GoFile upload is not enabled"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Multi-host upload is not enabled"})
+		return
+	}
+
+	// Check if directory exists and has files
+	completedDir := "videos/completed"
+	if server.Config.CompletedDir != "" {
+		completedDir = server.Config.CompletedDir
+	}
+
+	if _, err := os.Stat(completedDir); os.IsNotExist(err) {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "No completed directory found",
+			"count":   0,
+		})
+		return
+	}
+
+	// Count files to upload
+	fileCount := 0
+	filepath.Walk(completedDir, func(path string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			ext := strings.ToLower(filepath.Ext(path))
+			if ext == ".mp4" || ext == ".mkv" {
+				fileCount++
+			}
+		}
+		return nil
+	})
+
+	if fileCount == 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "No video files to upload",
+			"count":   0,
+		})
 		return
 	}
 
 	// Start upload in background
 	go uploadCompletedFilesAsync()
 
-	c.JSON(http.StatusOK, gin.H{"message": "Upload started in background"})
+	c.JSON(http.StatusOK, gin.H{
+		"message": fmt.Sprintf("Upload started for %d file(s) - check logs for progress", fileCount),
+		"count":   fileCount,
+	})
 }
 
 
-// uploadCompletedFilesAsync uploads all completed video files to GoFile in the background
+// uploadCompletedFilesAsync uploads all completed video files to multiple hosts in the background
 func uploadCompletedFilesAsync() {
-	log.Println("Starting upload of completed files...")
+	log.Println("╔════════════════════════════════════════════════════════════╗")
+	log.Println("║          📤 MANUAL UPLOAD: Starting batch upload           ║")
+	log.Println("╚════════════════════════════════════════════════════════════╝")
+	log.Println("")
 	
 	completedDir := "videos/completed"
 	if server.Config.CompletedDir != "" {
@@ -636,19 +676,44 @@ func uploadCompletedFilesAsync() {
 
 	// Check if directory exists
 	if _, err := os.Stat(completedDir); os.IsNotExist(err) {
-		log.Printf("Completed directory does not exist: %s", completedDir)
+		log.Printf("❌ Completed directory does not exist: %s", completedDir)
 		return
 	}
 
-	gofileUploader := uploader.NewGoFileUploader()
+	// Initialize multi-host uploader
+	multiUploader := uploader.NewMultiHostUploader(
+		server.Config.TurboViPlayAPIKey,
+		server.Config.VoeSXAPIKey,
+		server.Config.StreamtapeLogin,
+		server.Config.StreamtapeAPIKey,
+	)
+
 	var supabaseClient *supabase.Client
 	if server.Config.EnableSupabase && server.Config.SupabaseURL != "" && server.Config.SupabaseAPIKey != "" {
 		supabaseClient = supabase.NewClient(server.Config.SupabaseURL, server.Config.SupabaseAPIKey)
+		log.Println("✓ Supabase client initialized for upload records")
+	} else {
+		log.Println("⚠️  Supabase not configured - upload records will not be saved")
 	}
 	
 	uploadCount := 0
 	errorCount := 0
 	skippedCount := 0
+	totalFiles := 0
+
+	// First, count total files
+	filepath.Walk(completedDir, func(path string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			ext := strings.ToLower(filepath.Ext(path))
+			if ext == ".mp4" || ext == ".mkv" {
+				totalFiles++
+			}
+		}
+		return nil
+	})
+
+	log.Printf("📦 Found %d video file(s) to upload", totalFiles)
+	log.Println("")
 
 	// Walk through completed directory
 	err := filepath.Walk(completedDir, func(path string, info os.FileInfo, err error) error {
@@ -671,24 +736,40 @@ func uploadCompletedFilesAsync() {
 			return nil
 		}
 
-		log.Printf("Uploading: %s (%d MB)", filepath.Base(path), info.Size()/(1024*1024))
+		uploadCount++
+		log.Println("────────────────────────────────────────────────────────────")
+		log.Printf("📹 Processing file %d/%d: %s", uploadCount, totalFiles, filepath.Base(path))
+		log.Printf("   Size: %d MB", info.Size()/(1024*1024))
+		log.Println("")
 
-		// Upload to GoFile
-		downloadLink, err := gofileUploader.Upload(path)
-		if err != nil {
-			log.Printf("ERROR: Upload failed for %s: %v", filepath.Base(path), err)
+		// Upload to all configured hosts in parallel
+		log.Println("🚀 Starting parallel uploads to all configured hosts...")
+		results := multiUploader.UploadToAll(path)
+		
+		// Check results
+		successfulUploads := uploader.GetSuccessfulUploads(results)
+		if len(successfulUploads) == 0 {
+			log.Printf("❌ All uploads failed for %s", filepath.Base(path))
 			errorCount++
 			return nil
 		}
 
-		log.Printf("SUCCESS: Uploaded %s -> %s", filepath.Base(path), downloadLink)
+		log.Printf("✅ Upload completed: %d/%d hosts successful", len(successfulUploads), len(results))
+		for _, result := range results {
+			if result.Error == nil && result.DownloadLink != "" {
+				log.Printf("   ✓ %s: %s", result.Host, result.DownloadLink)
+			} else {
+				log.Printf("   ✗ %s: %v", result.Host, result.Error)
+			}
+		}
+		log.Println("")
 
-		// Generate and save thumbnail locally
-		var thumbnailPath string
-		log.Printf("Generating thumbnail for %s...", filepath.Base(path))
+		// Generate and upload thumbnail
+		var thumbnailLink string
+		log.Printf("📸 Generating thumbnail for %s...", filepath.Base(path))
 		tempThumbPath, err := generateThumbnailForUpload(path)
 		if err != nil {
-			log.Printf("WARNING: Thumbnail generation failed for %s: %v", filepath.Base(path), err)
+			log.Printf("⚠️  Thumbnail generation failed: %v", err)
 		} else {
 			// Save to thumbnails directory
 			thumbnailDir := "thumbnails"
@@ -698,7 +779,7 @@ func uploadCompletedFilesAsync() {
 			filename := filepath.Base(path)
 			username := strings.Split(filename, "_")[0]
 			thumbnailFilename := fmt.Sprintf("%s_%d.jpg", username, time.Now().Unix())
-			thumbnailPath = filepath.Join(thumbnailDir, thumbnailFilename)
+			thumbnailPath := filepath.Join(thumbnailDir, thumbnailFilename)
 			
 			if err := os.Rename(tempThumbPath, thumbnailPath); err != nil {
 				// Try copy if rename fails
@@ -713,47 +794,65 @@ func uploadCompletedFilesAsync() {
 				}
 				os.Remove(tempThumbPath)
 			}
-			log.Printf("SUCCESS: Thumbnail saved -> %s", thumbnailPath)
+			
+			// Upload thumbnail to Supabase if available
+			if supabaseClient != nil {
+				if link, err := supabaseClient.UploadThumbnail("thumbnails", filepath.Base(thumbnailPath), thumbnailPath, "image/jpeg"); err != nil {
+					log.Printf("⚠️  Thumbnail upload failed (keeping local): %v", err)
+					thumbnailLink = thumbnailPath
+				} else {
+					thumbnailLink = link
+					log.Printf("✓ Thumbnail uploaded: %s", thumbnailLink)
+				}
+			} else {
+				thumbnailLink = thumbnailPath
+				log.Printf("✓ Thumbnail saved locally: %s", thumbnailPath)
+			}
 		}
+		log.Println("")
 
 		// Extract username from filename (assumes format: username_date_time.ext)
 		filename := filepath.Base(path)
 		username := strings.Split(filename, "_")[0]
 
-		// Store in Supabase
+		// Store multi-host upload record in Supabase
 		if supabaseClient != nil {
-			thumbnailLink := thumbnailPath
-			if thumbnailPath != "" {
-				if link, err := supabaseClient.UploadThumbnail("thumbnails", filepath.Base(thumbnailPath), thumbnailPath, "image/jpeg"); err != nil {
-					log.Printf("WARNING: Thumbnail upload failed (keeping local) for %s: %v", filename, err)
+			log.Println("💾 Storing upload record in Supabase...")
+			
+			// Store each successful upload as a separate record
+			for _, result := range successfulUploads {
+				if err := supabaseClient.InsertUploadRecord(username, result.DownloadLink, thumbnailLink); err != nil {
+					log.Printf("⚠️  Failed to store %s record: %v", result.Host, err)
 				} else {
-					thumbnailLink = link
-					log.Printf("SUCCESS: Thumbnail uploaded -> %s", thumbnailLink)
+					log.Printf("✓ %s record stored in Supabase", result.Host)
 				}
 			}
-			if err := supabaseClient.InsertUploadRecord(username, downloadLink, thumbnailLink); err != nil {
-				log.Printf("ERROR: Failed to store in Supabase for %s: %v", filename, err)
-			} else {
-				log.Printf("SUCCESS: Stored in Supabase for %s", filename)
-			}
+			log.Println("")
 		}
 
 		// Delete local file after successful upload
+		log.Printf("🗑️  Deleting local file: %s", filepath.Base(path))
 		if err := os.Remove(path); err != nil {
-			log.Printf("ERROR: Failed to delete %s: %v", filepath.Base(path), err)
+			log.Printf("❌ Failed to delete: %v", err)
 		} else {
-			log.Printf("SUCCESS: Deleted local file %s", filepath.Base(path))
+			log.Printf("✓ Local file deleted successfully")
 		}
+		log.Println("")
 
-		uploadCount++
 		return nil
 	})
 
 	if err != nil {
-		log.Printf("ERROR: Failed to walk completed directory: %v", err)
+		log.Printf("❌ Failed to walk completed directory: %v", err)
 	}
 
-	log.Printf("Upload complete: %d successful, %d failed, %d skipped (.ts files)", uploadCount, errorCount, skippedCount)
+	log.Println("╔════════════════════════════════════════════════════════════╗")
+	log.Println("║          📊 MANUAL UPLOAD: Batch upload complete           ║")
+	log.Println("╚════════════════════════════════════════════════════════════╝")
+	log.Printf("✅ Successfully uploaded: %d file(s)", uploadCount-errorCount)
+	log.Printf("❌ Failed uploads: %d file(s)", errorCount)
+	log.Printf("⚠️  Skipped (.ts files): %d file(s)", skippedCount)
+	log.Println("")
 }
 
 
