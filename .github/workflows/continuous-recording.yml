@@ -1,13 +1,9 @@
 name: Continuous Recording (24/7) with Web UI
 
 on:
-  # Run every 5 hours to ensure 24/7 coverage
+  # Run every hour for continuous 24/7 coverage
   schedule:
-    - cron: '0 0 * * *'    # 00:00 UTC
-    - cron: '0 5 * * *'    # 05:00 UTC
-    - cron: '0 10 * * *'   # 10:00 UTC
-    - cron: '0 15 * * *'   # 15:00 UTC
-    - cron: '0 20 * * *'   # 20:00 UTC
+    - cron: '0 * * * *'    # Every hour at minute 0
   
   # Allow manual trigger
   workflow_dispatch:
