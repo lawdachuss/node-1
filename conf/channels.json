@@ -1,5 +1,16 @@
 [
   {
+    "is_paused": true,
+    "username": "indulgencex",
+    "framerate": 30,
+    "resolution": 1080,
+    "pattern": "videos/{{.Username}}_{{.Year}}-{{.Month}}-{{.Day}}_{{.Hour}}-{{.Minute}}-{{.Second}}{{if .Sequence}}_{{.Sequence}}{{end}}",
+    "max_duration": 0,
+    "max_filesize": 0,
+    "compress": false,
+    "created_at": 1778959755
+  },
+  {
     "is_paused": false,
     "username": "altycouple",
     "framerate": 30,
