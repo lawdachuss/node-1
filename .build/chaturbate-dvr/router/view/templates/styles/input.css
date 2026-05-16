@@ -1,0 +1,347 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Dialog backdrop */
+dialog::backdrop {
+  background: rgba(0, 0, 0, 0.3);
+  backdrop-filter: blur(4px);
+}
+
+
+/* Select dropdown arrow */
+select {
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%2371717a' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e");
+  background-position: right 0.5rem center;
+  background-repeat: no-repeat;
+  background-size: 1.5em 1.5em;
+  padding-right: 2.5rem;
+}
+.dark select {
+  background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%23a1a1aa' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e");
+}
+
+/* ── Log container ── */
+.log-container {
+  scrollbar-width: thin;
+  scrollbar-color: #d4d4d8 transparent;
+  overflow-x: hidden;
+  scroll-behavior: smooth;
+}
+.dark .log-container {
+  scrollbar-color: #52525b transparent;
+}
+.log-container::-webkit-scrollbar { width: 5px; }
+.log-container::-webkit-scrollbar-track { background: transparent; }
+.log-container::-webkit-scrollbar-thumb { background: #d4d4d8; border-radius: 4px; }
+.log-container::-webkit-scrollbar-thumb:hover { background: #a1a1aa; }
+.dark .log-container::-webkit-scrollbar-thumb { background: #52525b; }
+.dark .log-container::-webkit-scrollbar-thumb:hover { background: #71717a; }
+
+/* ── Log entry ── */
+.log-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 4px 12px 4px 10px;
+  border-left: 3px solid transparent;
+  line-height: 1.5;
+  transition: background-color 0.2s ease;
+  position: relative;
+}
+.log-line::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  border-radius: inherit;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+  box-shadow: inset 0 0 0 1px rgba(0,0,0,0.04);
+}
+.dark .log-line::after {
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.04);
+}
+.log-line:hover {
+  background-color: rgba(0,0,0,0.025);
+}
+.log-line:hover::after {
+  opacity: 1;
+}
+.dark .log-line:hover {
+  background-color: rgba(255,255,255,0.025);
+}
+
+/* ── Slide-in animation for new entries ── */
+@keyframes log-slide-in {
+  0% {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.98);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+.log-line.log-new {
+  animation: log-slide-in 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  will-change: transform, opacity;
+}
+
+/* ── New-entry flash indicator ── */
+@keyframes log-flash {
+  0%   { background-color: rgba(59,130,246,0.08); }
+  100% { background-color: transparent; }
+}
+.dark .log-line.log-flash {
+  animation: log-flash 1.2s ease-out;
+}
+.log-line.log-flash {
+  animation: log-flash 1.2s ease-out;
+}
+
+/* ── Log time ── */
+.log-line .log-time {
+  color: #a1a1aa;
+  flex-shrink: 0;
+  user-select: none;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Log icon ── */
+.log-line .log-icon {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  width: 14px;
+  height: 14px;
+}
+.log-line .log-icon-svg {
+  width: 14px;
+  height: 14px;
+  transition: color 0.2s ease;
+}
+
+/* ── Log level badge ── */
+.log-line .log-level {
+  flex-shrink: 0;
+  display: inline-block;
+  font-weight: 700;
+  font-size: 9px;
+  padding: 0 5px;
+  border-radius: 4px;
+  line-height: 16px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  user-select: none;
+  background: #e4e4e7;
+  color: #52525b;
+  transition: background 0.2s, color 0.2s;
+}
+.dark .log-line .log-level {
+  background: #3f3f46;
+  color: #a1a1aa;
+}
+
+/* ── Log message ── */
+.log-line .log-msg {
+  color: #52525b;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dark .log-line .log-msg {
+  color: #d4d4d8;
+}
+
+/* ── Log type colors — light ── */
+.log-type-play     { border-left-color: #10b981; }
+.log-type-play .log-icon-svg { color: #10b981; }
+.log-type-stop     { border-left-color: #e11d48; }
+.log-type-stop .log-icon-svg { color: #e11d48; }
+.log-type-error    { border-left-color: #dc2626; }
+.log-type-error .log-icon-svg { color: #dc2626; }
+.log-type-compress { border-left-color: #8b5cf6; }
+.log-type-compress .log-icon-svg { color: #8b5cf6; }
+.log-type-mux      { border-left-color: #0891b2; }
+.log-type-mux .log-icon-svg { color: #0891b2; }
+.log-type-file     { border-left-color: #d97706; }
+.log-type-file .log-icon-svg { color: #d97706; }
+.log-type-upload   { border-left-color: #2563eb; }
+.log-type-upload .log-icon-svg { color: #2563eb; }
+.log-type-delete   { border-left-color: #dc2626; }
+.log-type-delete .log-icon-svg { color: #dc2626; }
+.log-type-cf       { border-left-color: #ea580c; }
+.log-type-cf .log-icon-svg { color: #ea580c; }
+.log-type-status   { border-left-color: #0d9488; }
+.log-type-status .log-icon-svg { color: #0d9488; }
+.log-type-info     { border-left-color: #71717a; }
+.log-type-info .log-icon-svg { color: #71717a; }
+
+/* ── Log type colors — dark ── */
+.dark .log-type-play     { border-left-color: #34d399; }
+.dark .log-type-play .log-icon-svg { color: #34d399; }
+.dark .log-type-stop     { border-left-color: #fb7185; }
+.dark .log-type-stop .log-icon-svg { color: #fb7185; }
+.dark .log-type-error    { border-left-color: #fca5a5; }
+.dark .log-type-error .log-icon-svg { color: #fca5a5; }
+.dark .log-type-compress { border-left-color: #a78bfa; }
+.dark .log-type-compress .log-icon-svg { color: #a78bfa; }
+.dark .log-type-mux      { border-left-color: #22d3ee; }
+.dark .log-type-mux .log-icon-svg { color: #22d3ee; }
+.dark .log-type-file     { border-left-color: #fbbf24; }
+.dark .log-type-file .log-icon-svg { color: #fbbf24; }
+.dark .log-type-upload   { border-left-color: #60a5fa; }
+.dark .log-type-upload .log-icon-svg { color: #60a5fa; }
+.dark .log-type-delete   { border-left-color: #f87171; }
+.dark .log-type-delete .log-icon-svg { color: #f87171; }
+.dark .log-type-cf       { border-left-color: #fb923c; }
+.dark .log-type-cf .log-icon-svg { color: #fb923c; }
+.dark .log-type-status   { border-left-color: #2dd4bf; }
+.dark .log-type-status .log-icon-svg { color: #2dd4bf; }
+.dark .log-type-info     { border-left-color: #a1a1aa; }
+.dark .log-type-info .log-icon-svg { color: #a1a1aa; }
+
+/* ── Log filter bar ── */
+.log-filter-btn {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid #e4e4e7;
+  background: transparent;
+  color: #71717a;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  line-height: 1.4;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  user-select: none;
+}
+.log-filter-btn:hover {
+  background: #f4f4f5;
+  color: #3f3f46;
+}
+.log-filter-btn.active {
+  background: #18181b;
+  color: #fafafa;
+  border-color: #18181b;
+}
+.dark .log-filter-btn {
+  border-color: #3f3f46;
+  color: #a1a1aa;
+}
+.dark .log-filter-btn:hover {
+  background: #27272a;
+  color: #e4e4e7;
+}
+.dark .log-filter-btn.active {
+  background: #fafafa;
+  color: #18181b;
+  border-color: #fafafa;
+}
+
+.log-filter-dot {
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  border: 1.5px solid transparent;
+  background: transparent;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  opacity: 0.45;
+  user-select: none;
+  padding: 0;
+  line-height: 1;
+}
+.log-filter-dot:hover {
+  opacity: 0.75;
+  transform: scale(1.15);
+}
+.log-filter-dot.active {
+  opacity: 1;
+  border-color: currentColor;
+  transform: scale(1);
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.06);
+}
+.dark .log-filter-dot.active {
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.12);
+}
+
+.log-filter-clear {
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: none;
+  background: transparent;
+  color: #a1a1aa;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  user-select: none;
+  line-height: 1.4;
+}
+.log-filter-clear:hover {
+  color: #dc2626;
+  background: rgba(220,38,38,0.08);
+}
+.dark .log-filter-clear:hover {
+  background: rgba(220,38,38,0.15);
+}
+
+/* ── Filtered log state ── */
+.log-line.log-filtered {
+  display: none;
+}
+
+/* ── Sprite sheet slideshow ── */
+.sprite-slideshow {
+  animation: sprite-scroll 1.5s step-end infinite;
+  animation-play-state: paused;
+}
+.group:hover .sprite-slideshow {
+  animation-play-state: running;
+}
+@keyframes sprite-scroll {
+  0%   { background-position: 0% 0%; }
+  10%  { background-position: 11.11% 0%; }
+  20%  { background-position: 22.22% 0%; }
+  30%  { background-position: 33.33% 0%; }
+  40%  { background-position: 44.44% 0%; }
+  50%  { background-position: 55.56% 0%; }
+  60%  { background-position: 66.67% 0%; }
+  70%  { background-position: 77.78% 0%; }
+  80%  { background-position: 88.89% 0%; }
+  90%  { background-position: 100% 0%; }
+  100% { background-position: 0% 0%; }
+}
+
+/* ── Loading spinner ── */
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.animate-spin {
+  animation: spin 1s linear infinite;
+}
+
+/* ── Video card duration badge ── */
+.video-duration-badge {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  padding: 1px 6px;
+  background: rgba(0,0,0,0.65);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 500;
+  border-radius: 4px;
+  line-height: 1.4;
+  backdrop-filter: blur(4px);
+}

@@ -1,8 +1,5 @@
-version: '3.8'
-
-services:
+﻿services:
   # Byparr - Scalable Cloudflare bypass service
-  # FREE TIER c7i-flex.large (4GB RAM): 2 instances optimized for Cloudflare 2026
   byparr:
     image: ghcr.io/thephaseless/byparr:latest
     environment:
@@ -11,7 +8,7 @@ services:
       - PROXY_SERVER=${PROXY_SERVER:-}
       - PROXY_USERNAME=${PROXY_USERNAME:-}
       - PROXY_PASSWORD=${PROXY_PASSWORD:-}
-      - TIMEOUT=180  # 3 minutes timeout for Cloudflare challenges
+      - TIMEOUT=180
       - LOG_LEVEL=INFO
     restart: unless-stopped
     healthcheck:
@@ -23,10 +20,10 @@ services:
     networks:
       - recorder-network
     deploy:
-      replicas: 2  # FREE TIER: 2 instances with more resources each
+      replicas: 2
       resources:
         limits:
-          memory: 1.5G  # Increased from 1G - Cloudflare 2026 needs more memory
+          memory: 1.5G
         reservations:
           cpus: '0.5'
           memory: 500M
@@ -51,38 +48,74 @@ services:
       retries: 3
       start_period: 10s
 
-  # GoOnDVR - Stream recorder (FREE TIER c7i-flex.large OPTIMIZED)
-  # NOTE: For best results, use manual cookies from browser instead of Byparr
-  # See docs/CLOUDFLARE_BYPASS_2026.md for 100% success rate method
-  recorder:
-    build: .
-    container_name: goondvr
-    command: ["--debug"]
+  # Chaturbate DVR - Stream recorder (built from gogoqaz fork)
+  chaturbate-dvr:
+    build: .build/chaturbate-dvr
+    container_name: chaturbate-dvr
+    command: ["--port", "8080", "--compress=false"]
     environment:
-      - FLARESOLVERR_URL=http://byparr-lb/v1
-      - PROXY_URL=${PROXY_URL:-}
-      - PROXY_USERNAME=${PROXY_USERNAME:-}
-      - PROXY_PASSWORD=${PROXY_PASSWORD:-}
+      - VOESX_API_KEY=${VOESX_API_KEY:-}
+      - STREAMTAPE_LOGIN=${STREAMTAPE_LOGIN:-}
+      - STREAMTAPE_API_KEY=${STREAMTAPE_API_KEY:-}
+      - SENDCM_API_KEY=${SENDCM_API_KEY:-}
+      - BYSE_API_KEY=${BYSE_API_KEY:-}
     ports:
       - "8080:8080"
     volumes:
       - ./videos:/usr/src/app/videos
-      - ./database:/usr/src/app/database
       - ./conf:/usr/src/app/conf
-    depends_on:
-      byparr-lb:
-        condition: service_healthy
+      - ./database:/database
     restart: unless-stopped
-    stop_grace_period: 5m  # Allow 5 minutes for graceful shutdown (finalize recordings)
+    stop_grace_period: 5m
     networks:
       - recorder-network
     deploy:
       resources:
         limits:
-          memory: 600M  # Increased slightly for better stability
+          memory: 1G
         reservations:
           cpus: '0.2'
           memory: 200M
+
+  # Cookie Refresher - Auto refresh Cloudflare clearance via Byparr
+  cookie-refresher:
+    image: alpine:3
+    container_name: cookie-refresher
+    volumes:
+      - ./scripts/cookie-refresher.sh:/cookie-refresher.sh:ro
+    command: ["sh", "/cookie-refresher.sh"]
+    depends_on:
+      byparr:
+        condition: service_started
+      chaturbate-dvr:
+        condition: service_started
+    networks:
+      - recorder-network
+    restart: unless-stopped
+
+  # Uploader - Automatically upload recordings to GoFile, Streamtape, VoeSX, SendCM
+  uploader:
+    image: python:3.12-alpine
+    container_name: uploader
+    environment:
+      - STREAMTAPE_API_KEY=${STREAMTAPE_API_KEY:-}
+      - STREAMTAPE_LOGIN=${STREAMTAPE_LOGIN:-}
+      - VOESX_API_KEY=${VOESX_API_KEY:-}
+      - SENDCM_API_KEY=${SENDCM_API_KEY:-}
+      - BYSE_API_KEY=${BYSE_API_KEY:-}
+      - GOFILE_API_KEY=${GOFILE_API_KEY:-}
+    volumes:
+      - ./videos:/videos
+      - ./database:/database
+      - ./scripts/uploader_daemon.py:/uploader_daemon.py:ro
+    command: >
+      sh -c "apk add --no-cache ffmpeg > /dev/null 2>&1 && pip install requests --quiet && python /uploader_daemon.py"
+    depends_on:
+      chaturbate-dvr:
+        condition: service_started
+    networks:
+      - recorder-network
+    restart: unless-stopped
 
 networks:
   recorder-network:

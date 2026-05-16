@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <link rel="stylesheet" href="/static/styles/app.css" />
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+        <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap" rel="stylesheet" />
+        <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
+        <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32x32.png">
+        <link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16x16.png">
+        <link rel="manifest" href="/static/site.webmanifest">
+        <title>Videos — Chaturbate DVR</title>
+        <script>
+            (function() {
+                if (localStorage.getItem('darkMode') === 'true' ||
+                    (localStorage.getItem('darkMode') === null && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+                    document.documentElement.classList.add('dark');
+                }
+            })();
+        </script>
+    </head>
+    <body class="bg-zinc-50 text-zinc-900 dark:bg-zinc-900 dark:text-zinc-100 min-h-dvh font-sans">
+        <div class="max-w-7xl mx-auto px-4 py-6">
+            <div class="flex items-center justify-between mb-8">
+                <div class="flex items-center gap-4">
+                    <a href="/" class="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300" title="Back to dashboard">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+                    </a>
+                    <h1 class="text-xl font-black uppercase tracking-tight">Videos</h1>
+                </div>
+                <div class="flex items-center gap-3">
+                    <span class="text-xs text-zinc-400">{{ len .Videos }} file(s)</span>
+                    <div class="relative channel-filter-dropdown">
+                        <button onclick="toggleChannelFilter()"
+                                class="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-zinc-200 dark:border-zinc-600 rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-700 transition-colors">
+                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 6h16M7 12h10M10 18h4"/></svg>
+                            <span id="channel-filter-label">All Channels</span>
+                            <svg class="w-3 h-3 text-zinc-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>
+                        </button>
+                        <div id="channel-filter-menu" class="hidden absolute right-0 mt-1 w-48 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg shadow-xl z-10 py-1 max-h-64 overflow-y-auto">
+                            <button onclick="filterChannel('')" class="channel-filter-option w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-50 dark:hover:bg-zinc-700 transition-colors">All Channels</button>
+                            {{ range .Groups }}
+                            <button onclick="filterChannel('{{ .Username }}')" class="channel-filter-option w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-50 dark:hover:bg-zinc-700 transition-colors">{{ .Username }}</button>
+                            {{ end }}
+                        </div>
+                    </div>
+                    <button onclick="toggleDarkMode()" class="w-7 h-7 flex items-center justify-center rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-700 transition-colors text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200" title="Toggle dark mode">
+                        <svg class="w-4 h-4 block dark:hidden" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg>
+                        <svg class="w-4 h-4 hidden dark:block" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><path d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+                    </button>
+                </div>
+            </div>
+
+            {{ if not .Videos }}
+            <div class="flex flex-col items-center justify-center py-24 text-zinc-400">
+                <svg class="w-16 h-16 mb-4" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
+                    <path d="M15.75 10.5l4.72-4.72a.75.75 0 011.28.53v11.38a.75.75 0 01-1.28.53l-4.72-4.72M4.5 18.75h9a2.25 2.25 0 002.25-2.25v-9a2.25 2.25 0 00-2.25-2.25h-9A2.25 2.25 0 002.25 7.5v9a2.25 2.25 0 002.25 2.25z"/>
+                </svg>
+                <h2 class="text-lg font-semibold text-zinc-600 dark:text-zinc-300 mb-1">No videos found</h2>
+                <p class="text-sm text-zinc-400">Recorded videos will appear here.</p>
+            </div>
+            {{ else }}
+
+            {{ range .Groups }}
+            <div class="mb-8" data-channel-group="{{ .Username }}">
+                <h2 class="text-sm font-semibold text-zinc-500 dark:text-zinc-400 uppercase tracking-wide mb-3 flex items-center gap-2">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+                    {{ .Username }}
+                    {{ if .Gender }}
+                    <span class="text-[10px] font-normal uppercase px-1.5 py-0.5 rounded {{ if eq .Gender "female" }}bg-pink-100 text-pink-600 dark:bg-pink-900/30 dark:text-pink-300{{ else if eq .Gender "male" }}bg-blue-100 text-blue-600 dark:bg-blue-900/30 dark:text-blue-300{{ else }}bg-zinc-200 text-zinc-500 dark:bg-zinc-700 dark:text-zinc-400{{ end }}">{{ .Gender }}</span>
+                    {{ end }}
+                    <span class="text-[10px] text-zinc-400 font-normal">({{ len .Videos }})</span>
+                </h2>
+                <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                    {{ range .Videos }}
+                    <div onclick="window.location.href='/video?path=videos%2F{{ .Filename | urlquery }}'"
+                         class="bg-white dark:bg-zinc-800/90 border border-zinc-200 dark:border-zinc-700/60 rounded-xl overflow-hidden hover:shadow-xl hover:border-zinc-300 dark:hover:border-zinc-600 transition-all duration-300 group relative cursor-pointer">
+                        <div class="relative overflow-hidden bg-zinc-900">
+                            {{ if and .ThumbnailURL .FullPath }}
+                            <img src="{{ .ThumbnailURL }}" alt=""
+                                 class="w-full aspect-video object-cover transition-all duration-500 {{ if .SpriteURL }}group-hover:opacity-0{{ else }}group-hover:scale-105{{ end }}"
+                                 loading="lazy" />
+                            {{ else if .ThumbnailURL }}
+                            <img src="{{ .ThumbnailURL }}" alt=""
+                                 class="w-full aspect-video object-cover"
+                                 loading="lazy" />
+                            {{ end }}
+                            {{ if .SpriteURL }}
+                            <div class="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity duration-500 sprite-slideshow"
+                                 style="background-image:url('{{ .SpriteURL }}');background-size:auto 100%;background-repeat:no-repeat;background-position:0% 0%;"></div>
+                            {{ end }}
+                            {{ if not .ThumbnailURL }}
+                            <div class="bg-zinc-100 dark:bg-zinc-700/50 aspect-video flex items-center justify-center">
+                                <svg class="w-10 h-10 text-zinc-300 dark:text-zinc-600" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
+                                    <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
+                                    <polyline points="14 2 14 8 20 8"/>
+                                </svg>
+                            </div>
+                            {{ end }}
+                            <!-- Bottom gradient overlay -->
+                            <div class="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-black/50 to-transparent pointer-events-none"></div>
+                            <!-- Badges row -->
+                            <div class="absolute top-2 right-2 left-2 flex items-start justify-between gap-1 pointer-events-none">
+                                <div class="flex flex-wrap gap-1">
+                                    {{ if .Resolution }}
+                                    <span class="px-1.5 py-0.5 bg-black/60 text-white text-[9px] font-medium rounded">{{ .Resolution }}</span>
+                                    {{ end }}
+                                    {{ if gt .Framerate 0 }}
+                                    <span class="px-1.5 py-0.5 bg-black/60 text-white text-[9px] font-medium rounded">{{ .Framerate }}fps</span>
+                                    {{ end }}
+                                </div>
+                                <span class="px-1.5 py-0.5 bg-black/60 text-white text-[9px] font-medium rounded">{{ .Size }}</span>
+                            </div>
+                            {{ if not .FullPath }}
+                            <!-- Uploaded badge -->
+                            <div class="absolute top-2 left-2">
+                                <span class="px-2 py-0.5 text-[9px] font-semibold bg-emerald-600 text-white rounded-full flex items-center gap-1">
+                                    <svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg>
+                                    Uploaded
+                                </span>
+                            </div>
+                            {{ end }}
+                        </div>
+                        <div class="p-3 space-y-1.5">
+                            <div class="flex items-center justify-between gap-2">
+                                <span class="text-xs font-semibold text-zinc-800 dark:text-zinc-100 truncate">{{ .Username }}</span>
+                                <span class="text-[10px] text-zinc-400 shrink-0">{{ .ModTime }}</span>
+                            </div>
+                            <div class="text-[10px] text-zinc-500 dark:text-zinc-400 truncate leading-relaxed" title="{{ .Filename }}">{{ .Filename }}</div>
+                            {{ if .RoomTitle }}
+                            <div class="text-[10px] text-zinc-400 dark:text-zinc-500 truncate italic" title="{{ .RoomTitle }}">{{ .RoomTitle }}</div>
+                            {{ end }}
+                            {{ if .Tags }}
+                            <div class="flex flex-wrap gap-1 pt-0.5">
+                                {{ range .Tags }}
+                                <span class="text-[8px] px-1.5 py-0.5 rounded-full bg-violet-100/80 text-violet-600 dark:bg-violet-900/30 dark:text-violet-300 font-medium">{{ . }}</span>
+                                {{ end }}
+                            </div>
+                            {{ end }}
+                            {{ if or .Links (and .FullPath (not .IsOutputDir)) }}
+                            <div class="flex items-center gap-1.5 pt-0.5">
+                                {{ range $host, $link := .Links }}
+                                <a href="{{ $link }}" target="_blank" rel="noopener" onclick="event.stopPropagation()"
+                                   class="text-[9px] px-1.5 py-0.5 font-medium bg-emerald-600/90 hover:bg-emerald-600 text-white rounded transition-colors">
+                                    {{ $host }}
+                                </a>
+                                {{ end }}
+                                {{ if and .FullPath (not .IsOutputDir) }}
+                                <div class="ml-auto">
+                                    <form action="/delete_video" method="POST" onsubmit="return confirm('Delete {{ .Filename }}?')" onclick="event.stopPropagation()">
+                                        <input type="hidden" name="path" value="{{ .FullPath }}" />
+                                        <button type="submit" class="flex items-center justify-center p-0.5 text-zinc-300 hover:text-red-400 transition-colors">
+                                            <svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+                                        </button>
+                                    </form>
+                                </div>
+                                {{ end }}
+                            </div>
+                            {{ end }}
+                        </div>
+                    </div>
+                    {{ end }}
+                </div>
+            </div>
+            {{ end }}
+
+            {{ end }}
+        </div>
+
+        <script>
+            function toggleDarkMode() {
+                var isDark = document.documentElement.classList.toggle('dark');
+                localStorage.setItem('darkMode', isDark ? 'true' : 'false');
+            }
+
+            // === Channel filter dropdown ===
+            function toggleChannelFilter() {
+                var menu = document.getElementById('channel-filter-menu');
+                menu.classList.toggle('hidden');
+            }
+            document.addEventListener('click', function(e) {
+                if (!e.target.closest('.channel-filter-dropdown')) {
+                    var menu = document.getElementById('channel-filter-menu');
+                    if (menu) menu.classList.add('hidden');
+                }
+            });
+            function filterChannel(username) {
+                document.getElementById('channel-filter-menu').classList.add('hidden');
+                document.getElementById('channel-filter-label').textContent = username || 'All Channels';
+                document.querySelectorAll('[data-channel-group]').forEach(function(el) {
+                    if (!username || el.dataset.channelGroup === username) {
+                        el.classList.remove('hidden');
+                    } else {
+                        el.classList.add('hidden');
+                    }
+                });
+            }
+        </script>
+    </body>
+</html>

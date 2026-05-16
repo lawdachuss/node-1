@@ -1,4 +1,4 @@
-name: 24/7 Recorder
+﻿name: 24/7 Recorder
 
 on:
   workflow_dispatch:
@@ -12,17 +12,18 @@ on:
       - '.github/workflows/recorder.yml'
 
 concurrency:
-  group: recorder-${{ github.run_id }}
+  group: recorder
   cancel-in-progress: false
 
 permissions:
   actions: write
-  contents: read
+  contents: write
+  workflows: write
 
 jobs:
   record:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6h — 1h buffer over 5h recording
+    timeout-minutes: 360  # 6h â€” 1h buffer over 5h recording
 
     steps:
       - name: Checkout code
@@ -30,7 +31,7 @@ jobs:
 
       - name: Create directories
         run: |
-          mkdir -p videos/completed database conf emergency-backup
+          mkdir -p videos conf database emergency-backup
           echo "[INFO] Disk space:"; df -h /
 
       - name: Verify Supabase credentials
@@ -47,460 +48,207 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Start Byparr (Cloudflare bypass)
-        continue-on-error: true
         run: |
           docker network create recorder-network 2>/dev/null || true
-          # Pre-pull Byparr in background while we continue
-          docker pull ghcr.io/thephaseless/byparr:latest &
-          PULL_PID=$!
-          wait $PULL_PID || true
+          docker pull ghcr.io/thephaseless/byparr:latest
           docker run -d --name byparr --network recorder-network -p 8191:8191 \
             -e HOST=0.0.0.0 -e PORT=8191 -e TIMEOUT=180 -e LOG_LEVEL=INFO \
-            ghcr.io/thephaseless/byparr:latest || true
+            ghcr.io/thephaseless/byparr:latest
+          echo "Waiting for Byparr on port 8191..."
+          for i in $(seq 1 15); do
+            if curl -sf http://localhost:8191 > /dev/null 2>&1; then
+              echo "Byparr ready after ${i}s"
+              break
+            fi
+            if [ "$i" -eq 15 ]; then
+              echo "Byparr not responding, continuing anyway"
+            fi
+            sleep 2
+          done
 
-      - name: Build and start recorder
+      - name: Build and start Chaturbate DVR
         run: |
+          git clone --depth 1 https://github.com/gogoqaz/chaturbate-dvr.git .build/chaturbate-dvr
           docker buildx build \
             --cache-from type=gha \
             --cache-to type=gha,mode=max \
-            -t goondvr:latest --load .
+            -t chaturbate-dvr:latest --load .build/chaturbate-dvr
 
-          BYPARR_URL=""
-          docker ps | grep -q byparr && BYPARR_URL="http://byparr:8191/v1"
-          EXTRA_ARGS=""
-          [ -n "$BYPARR_URL" ] && EXTRA_ARGS="-e FLARESOLVERR_URL=$BYPARR_URL"
-
-          docker run -d --name goondvr \
+          docker run -d --name chaturbate-dvr \
             --restart=unless-stopped \
             --network recorder-network \
             -p 8080:8080 \
-            $EXTRA_ARGS \
-            -e SUPABASE_URL="${{ secrets.SUPABASE_URL }}" \
-            -e SUPABASE_API_KEY="${{ secrets.SUPABASE_API_KEY }}" \
             -v $(pwd)/videos:/usr/src/app/videos \
-            goondvr:latest --port 8080 --enable-gofile-upload --debug
+            -v $(pwd)/conf:/usr/src/app/conf \
+            -v $(pwd)/database:/database \
+            chaturbate-dvr:latest --port 8080 --compress=false
 
           # Wait until port 8080 is actually accepting connections
-          echo "⏳ Waiting for app on port 8080..."
+          echo "â³ Waiting for app on port 8080..."
           APP_STARTED=false
           for i in $(seq 1 45); do
             # Check if container is still running
-            if ! docker ps --format '{{.Names}}' | grep -q '^goondvr$'; then
-              echo "❌ Container stopped unexpectedly!"
-              docker logs goondvr
+            if ! docker ps --format '{{.Names}}' | grep -q '^chaturbate-dvr$'; then
+              echo "âŒ Container stopped unexpectedly!"
+              docker logs chaturbate-dvr
               exit 1
             fi
             
             # Try to connect to the app
             if curl -sf --max-time 5 http://localhost:8080 > /dev/null 2>&1; then
-              echo "✅ App ready after $((i * 2)) seconds"
+              echo "âœ… App ready after $((i * 2)) seconds"
               APP_STARTED=true
               break
             fi
             
             # Show progress every 5 attempts
             if [ $((i % 5)) -eq 0 ]; then
-              echo "⏳ Still waiting... ($i/45 attempts)"
+              echo "â³ Still waiting... ($i/45 attempts)"
             fi
             
             sleep 2
           done
           
           if [ "$APP_STARTED" = false ]; then
-            echo "❌ App never came up after 90 seconds"
-            echo "Container status:"; docker ps -a | grep goondvr
-            echo "Container logs:"; docker logs goondvr
+            echo "âŒ App never came up after 90 seconds"
+            echo "Container status:"; docker ps -a | grep chaturbate-dvr
+            echo "Container logs:"; docker logs chaturbate-dvr
             exit 1
           fi
 
-          # Additional verification - check if API endpoint works
-          echo "🔍 Verifying API endpoint..."
-          if curl -sf --max-time 5 http://localhost:8080/api/stats > /dev/null 2>&1; then
-            echo "✅ API endpoint is responding"
+          # Verify app is responding
+          echo "ðŸ” Verifying app is responding..."
+          if curl -sf --max-time 5 http://localhost:8080 > /dev/null 2>&1; then
+            echo "âœ… App is responding"
           else
-            echo "⚠️  Main page works but API may not be fully ready"
+            echo "âš ï¸  App may not be fully ready"
           fi
 
-          echo "📋 Container logs (last 50 lines):"
-          docker logs goondvr 2>&1 | tail -50
+          echo "ðŸ“‹ Container logs (last 50 lines):"
+          docker logs chaturbate-dvr 2>&1 | tail -50
+
+      - name: Start cookie refresher (auto Cloudflare bypass)
+        run: |
+          chmod +x scripts/cookie-refresher.sh
+          docker run -d --name cookie-refresher \
+            --restart=unless-stopped \
+            --network recorder-network \
+            -v $(pwd)/scripts/cookie-refresher.sh:/cookie-refresher.sh:ro \
+            alpine:3 sh /cookie-refresher.sh || echo "âš ï¸ cookie-refresher startup issue (non-critical)"
+          echo "âœ… Cookie refresher started"
+
+      - name: Start uploader (GoFile, Streamtape, VoeSX, SendCM auto-upload)
+        run: |
+          chmod +x scripts/uploader_daemon.py
+          docker run -d --name uploader \
+            --restart=unless-stopped \
+            --network recorder-network \
+            -e STREAMTAPE_LOGIN="${{ secrets.STREAMTAPE_LOGIN }}" \
+            -e STREAMTAPE_API_KEY="${{ secrets.STREAMTAPE_API_KEY }}" \
+            -e VOESX_API_KEY="${{ secrets.VOESX_API_KEY }}" \
+            -e SENDCM_API_KEY="${{ secrets.SENDCM_API_KEY }}" \
+            -v $(pwd)/videos:/videos \
+            -v $(pwd)/database:/database \
+            -v $(pwd)/scripts/uploader_daemon.py:/uploader_daemon.py:ro \
+            python:3.12-alpine sh -c "apk add --no-cache ffmpeg > /dev/null 2>&1 && pip install requests --quiet && python /uploader_daemon.py" \
+            || echo "âš ï¸ uploader startup issue (non-critical)"
+          echo "âœ… Uploader started"
 
       - name: Install and start Cloudflare Tunnel
         id: cloudflare_tunnel
         continue-on-error: true
         run: |
-          # Double-check app is responding before creating tunnel
-          echo "🔍 Final verification that app is responding..."
-          APP_READY=false
+          echo "Verifying app is responding..."
           for i in $(seq 1 10); do
             if curl -sf http://localhost:8080 > /dev/null 2>&1; then
-              echo "✅ App confirmed ready"
+              echo "App confirmed ready"
               APP_READY=true
               break
             fi
-            echo "⏳ Waiting for app... attempt $i/10"
             sleep 3
           done
-
-          if [ "$APP_READY" = false ]; then
-            echo "❌ App is not responding on port 8080!"
-            echo "Container status:"; docker ps -a | grep goondvr
-            echo "Container logs:"; docker logs goondvr --tail 100
+          if [ "$APP_READY" != true ]; then
+            echo "App not responding on port 8080"
+            docker logs chaturbate-dvr --tail 50
             exit 1
           fi
 
-          # Install cloudflared
-          curl -L --output cloudflared.deb \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared.deb
 
-          # Function to create and verify tunnel
-          create_tunnel() {
-            local attempt=$1
-            echo ""
-            echo "🚀 Starting Cloudflare Tunnel (Attempt $attempt)..."
-            
-            # Kill any existing tunnel
-            pkill -f cloudflared 2>/dev/null || true
-            sleep 2
-            
-            # Start new tunnel
-            rm -f tunnel.log
-            cloudflared tunnel --url http://localhost:8080 --no-autoupdate > tunnel.log 2>&1 &
-            TUNNEL_PID=$!
-            echo $TUNNEL_PID > tunnel.pid
-            echo "Tunnel PID: $TUNNEL_PID"
+          pkill -f cloudflared 2>/dev/null || true
+          sleep 2
+          rm -f tunnel.log
+          cloudflared tunnel --url http://localhost:8080 --no-autoupdate > tunnel.log 2>&1 &
+          TUNNEL_PID=$!
 
-            # Wait for tunnel URL to appear
-            echo "⏳ Waiting for tunnel URL..."
-            local TUNNEL_URL=""
-            for i in $(seq 1 18); do
-              if [ -f tunnel.log ]; then
-                TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-                if [ -n "$TUNNEL_URL" ]; then
-                  echo "✅ Tunnel URL found: $TUNNEL_URL"
-                  break
-                fi
-              fi
-              sleep 5
-            done
-
-            if [ -z "$TUNNEL_URL" ]; then
-              echo "❌ Failed to get tunnel URL"
-              cat tunnel.log 2>/dev/null || true
-              return 1
-            fi
-
-            # CRITICAL: Verify tunnel is actually accessible
-            echo "🔍 Verifying tunnel accessibility..."
-            local VERIFIED=false
-            
-            # First, verify the backend is still responding
-            echo "Checking backend app on localhost:8080..."
-            if ! curl -sf http://localhost:8080 > /dev/null 2>&1; then
-              echo "⚠️  Backend app not responding! Tunnel will fail."
-              docker logs goondvr --tail 50 || true
-            fi
-            
-            for i in $(seq 1 20); do
-              echo "Testing tunnel (attempt $i/20)..."
-              
-              # Test with curl - check HTTP status code
-              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 15 "$TUNNEL_URL" 2>&1 | tail -1)
-              
-              # Clean up the HTTP code (remove any extra characters)
-              HTTP_CODE=$(echo "$HTTP_CODE" | grep -oE '[0-9]{3}' | head -1)
-              
-              if [ -z "$HTTP_CODE" ]; then
-                # Try with verbose output to see what's happening
-                if [ $i -eq 5 ] || [ $i -eq 10 ]; then
-                  echo "Debug: Testing with verbose output..."
-                  curl -v --connect-timeout 5 --max-time 10 "$TUNNEL_URL" 2>&1 | head -20 || true
-                fi
-                echo "⏳ Connection timeout or DNS not resolved yet..."
-                sleep 5
-                continue
-              fi
-              
-              if [ "$HTTP_CODE" = "200" ]; then
-                echo "✅ Tunnel is VERIFIED ACCESSIBLE (HTTP 200)"
-                VERIFIED=true
-                
-                # Double-check API endpoint
-                API_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 "$TUNNEL_URL/api/stats" 2>&1 | tail -1 | grep -oE '[0-9]{3}' | head -1)
-                if [ "$API_CODE" = "200" ]; then
-                  echo "✅ API endpoint also verified (HTTP 200)"
-                else
-                  echo "⚠️  API returned HTTP ${API_CODE:-'no response'} (main page works though)"
-                fi
-                
-                break
-              elif [ "$HTTP_CODE" = "502" ] || [ "$HTTP_CODE" = "503" ] || [ "$HTTP_CODE" = "504" ]; then
-                echo "⚠️  Gateway error (HTTP $HTTP_CODE) - backend not responding"
-                # Check if backend is still alive
-                if ! curl -sf http://localhost:8080 > /dev/null 2>&1; then
-                  echo "❌ Backend app died! Cannot proceed."
-                  return 1
-                fi
-              elif [ "$HTTP_CODE" = "000" ]; then
-                echo "⚠️  HTTP 000 (connection failed - DNS propagation or network issue)"
-              else
-                echo "⚠️  HTTP $HTTP_CODE (waiting for 200...)"
-              fi
-              
-              sleep 5
-            done
-
-            if [ "$VERIFIED" = false ]; then
-              echo "❌ Tunnel URL exists but is NOT accessible after 100 seconds"
-              echo "Last HTTP code received: ${HTTP_CODE:-'none'}"
-              
-              # Additional diagnostics
-              echo ""
-              echo "🔍 Running diagnostics..."
-              echo "1. DNS resolution test:"
-              nslookup $(echo "$TUNNEL_URL" | sed 's|https://||' | sed 's|/.*||') || true
-              
-              echo ""
-              echo "2. Ping test:"
-              ping -c 2 $(echo "$TUNNEL_URL" | sed 's|https://||' | sed 's|/.*||') || true
-              
-              echo ""
-              echo "3. Backend app test:"
-              curl -v http://localhost:8080 2>&1 | head -20 || true
-              
-              echo ""
-              echo "This tunnel is unusable - will retry with new tunnel"
-              kill $TUNNEL_PID 2>/dev/null || true
-              return 1
-            fi
-
-            # Success - export the URL
-            echo "$TUNNEL_URL" > tunnel_url.txt
-            echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
-            echo "TUNNEL_PID=$TUNNEL_PID" >> $GITHUB_ENV
-            
-            return 0
-          }
-
-          # Try up to 2 times to get a working tunnel (reduced from 3)
-          # Most failures are DNS propagation, not actual tunnel issues
-          TUNNEL_SUCCESS=false
-          for attempt in 1 2; do
-            if create_tunnel $attempt; then
-              TUNNEL_SUCCESS=true
-              break
-            else
-              echo "❌ Attempt $attempt failed"
-              if [ $attempt -lt 2 ]; then
-                echo "⏳ Waiting 10 seconds before retry..."
-                sleep 10
-              fi
-            fi
+          echo "Waiting for tunnel URL..."
+          TUNNEL_URL=""
+          for i in $(seq 1 18); do
+            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+            if [ -n "$TUNNEL_URL" ]; then break; fi
+            sleep 5
           done
 
-          if [ "$TUNNEL_SUCCESS" = false ]; then
-            echo "⚠️  Failed to verify tunnel accessibility after 2 attempts"
-            echo "⚠️  This is usually due to Cloudflare DNS propagation delays"
-            echo "⚠️  Proceeding anyway - tunnel should become accessible in 1-2 minutes"
-            
-            # Get the last tunnel URL even if not verified
-            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-            
-            if [ -z "$TUNNEL_URL" ]; then
-              echo "❌ No tunnel URL found at all - cannot proceed"
-              exit 1
-            fi
-            
-            echo "$TUNNEL_URL" > tunnel_url.txt
-            echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
-            
-            echo ""
-            echo "╔════════════════════════════════════════════════════════════╗"
-            echo "║                    🌐 WEB UI ACCESS                        ║"
-            echo "╚════════════════════════════════════════════════════════════╝"
-            echo ""
-            echo "   $TUNNEL_URL"
-            echo ""
-            echo "   Status: ⏳ PROPAGATING (wait 2-3 minutes then try accessing)"
-            echo ""
-            echo "   The tunnel URL exists but DNS may not be propagated yet."
-            echo "   Try accessing it in 2-3 minutes."
-            echo ""
-          else
-            # Read the verified tunnel URL
-            TUNNEL_URL=$(cat tunnel_url.txt)
-
-            echo ""
-            echo "╔════════════════════════════════════════════════════════════╗"
-            echo "║                    🌐 WEB UI ACCESS                        ║"
-            echo "╚════════════════════════════════════════════════════════════╝"
-            echo ""
-            echo "   $TUNNEL_URL"
-            echo ""
-            echo "   Status: ✅ VERIFIED ACCESSIBLE"
-            echo ""
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "Failed to get tunnel URL"
+            cat tunnel.log
+            exit 1
           fi
+          echo "Tunnel URL: $TUNNEL_URL"
 
-          # Save tunnel URL to Supabase
-          echo "💾 Saving tunnel URL to Supabase..."
-          SAVE_SUCCESS=false
-          
-          for attempt in 1 2 3 4 5; do
+          echo "Verifying tunnel accessibility..."
+          for i in $(seq 1 12); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 15 "$TUNNEL_URL" 2>/dev/null || echo "000")
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Tunnel verified accessible"
+              break
+            fi
+            if [ "$i" -eq 12 ]; then
+              echo "Tunnel not yet accessible (HTTP $HTTP_CODE), continuing anyway"
+            fi
+            sleep 5
+          done
+
+          echo "$TUNNEL_URL" > tunnel_url.txt
+          echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+
+          echo "Saving tunnel URL to Supabase..."
+          for attempt in 1 2 3; do
             HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/supabase_response.txt \
               -X POST "${{ secrets.SUPABASE_URL }}/rest/v1/tunnel_sessions" \
               -H "apikey: ${{ secrets.SUPABASE_API_KEY }}" \
               -H "Content-Type: application/json" \
               -H "Prefer: return=minimal" \
               -d "{\"run_id\": ${{ github.run_number }}, \"url\": \"$TUNNEL_URL\", \"started_at\": \"$(date -u +%FT%TZ)\", \"is_active\": true}")
-            
             if [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "204" ]; then
-              echo "✅ Tunnel URL saved to Supabase (HTTP $HTTP_CODE)"
-              SAVE_SUCCESS=true
-              break
-            else
-              echo "⚠️  Attempt $attempt/5: Failed to save URL (HTTP $HTTP_CODE)"
-              cat /tmp/supabase_response.txt 2>/dev/null || true
-              [ $attempt -lt 5 ] && sleep 3
-            fi
-          done
-          
-          if [ "$SAVE_SUCCESS" = false ]; then
-            echo "⚠️  Could not save URL to Supabase (table may not exist)"
-            echo "You can still access the UI using the URL above"
-          fi
-
-          # Monitor tunnel health and recreate if it becomes inaccessible
-          (
-            while true; do
-              sleep 120  # Check every 2 minutes
-              
-              # Check if process is alive
-              if ! ps -p $TUNNEL_PID > /dev/null 2>&1; then
-                echo "⚠️  Tunnel process died!"
-                
-                # Try to create new tunnel
-                if create_tunnel "auto-restart"; then
-                  TUNNEL_URL=$(cat tunnel_url.txt)
-                  echo "✅ New tunnel created: $TUNNEL_URL"
-                  
-                  # Update Supabase with new URL
-                  curl -s -X POST "${{ secrets.SUPABASE_URL }}/rest/v1/tunnel_sessions" \
-                    -H "apikey: ${{ secrets.SUPABASE_API_KEY }}" \
-                    -H "Content-Type: application/json" \
-                    -H "Prefer: return=minimal" \
-                    -d "{\"run_id\": ${{ github.run_number }}, \"url\": \"$TUNNEL_URL\", \"started_at\": \"$(date -u +%FT%TZ)\", \"is_active\": true}" \
-                    > /dev/null 2>&1 || true
-                fi
-                continue
-              fi
-              
-              # Check if tunnel is still accessible
-              CURRENT_URL=$(cat tunnel_url.txt 2>/dev/null || echo "")
-              if [ -n "$CURRENT_URL" ]; then
-                HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$CURRENT_URL" 2>/dev/null || echo "000")
-                
-                if [ "$HTTP_CODE" != "200" ]; then
-                  echo "⚠️  Tunnel not accessible (HTTP $HTTP_CODE), recreating..."
-                  
-                  # Kill old tunnel and create new one
-                  kill $TUNNEL_PID 2>/dev/null || true
-                  
-                  if create_tunnel "auto-restart"; then
-                    TUNNEL_URL=$(cat tunnel_url.txt)
-                    echo "✅ New tunnel created: $TUNNEL_URL"
-                    
-                    # Update Supabase with new URL
-                    curl -s -X POST "${{ secrets.SUPABASE_URL }}/rest/v1/tunnel_sessions" \
-                      -H "apikey: ${{ secrets.SUPABASE_API_KEY }}" \
-                      -H "Content-Type: application/json" \
-                      -H "Prefer: return=minimal" \
-                      -d "{\"run_id\": ${{ github.run_number }}, \"url\": \"$TUNNEL_URL\", \"started_at\": \"$(date -u +%FT%TZ)\", \"is_active\": true}" \
-                      > /dev/null 2>&1 || true
-                  fi
-                fi
-              fi
-            done
-          ) &
-
-      - name: Fallback to ngrok if Cloudflare fails
-        if: steps.cloudflare_tunnel.outcome == 'failure'
-        run: |
-          echo "⚠️  Cloudflare Tunnel failed, trying ngrok as fallback..."
-          
-          # Install ngrok
-          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
-          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
-          sudo apt update && sudo apt install ngrok -y
-          
-          # Start ngrok (no auth required for basic usage)
-          ngrok http 8080 --log=stdout > ngrok.log 2>&1 &
-          NGROK_PID=$!
-          echo $NGROK_PID > ngrok.pid
-          
-          # Wait for ngrok URL
-          echo "⏳ Waiting for ngrok URL..."
-          TUNNEL_URL=""
-          for i in $(seq 1 30); do
-            # Try to get URL from ngrok API
-            TUNNEL_URL=$(curl -s http://localhost:4040/api/tunnels | grep -oP 'https://[a-zA-Z0-9-]+\.ngrok-free\.app' | head -1)
-            if [ -n "$TUNNEL_URL" ]; then
-              echo "✅ ngrok URL found: $TUNNEL_URL"
+              echo "Tunnel URL saved"
               break
             fi
-            sleep 2
+            echo "Save attempt $attempt failed (HTTP $HTTP_CODE)"
+            [ $attempt -lt 3 ] && sleep 3
           done
-          
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "❌ Failed to get ngrok URL"
-            cat ngrok.log
-            exit 1
-          fi
-          
-          # Test accessibility
-          echo "🔍 Testing ngrok tunnel..."
-          sleep 5
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$TUNNEL_URL" || echo "000")
-          
-          if [ "$HTTP_CODE" = "200" ]; then
-            echo "✅ ngrok tunnel is accessible"
-          else
-            echo "⚠️  ngrok returned HTTP $HTTP_CODE (may need to click through warning page)"
-          fi
-          
-          echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
-          echo "$TUNNEL_URL" > tunnel_url.txt
-          
+
           echo ""
-          echo "╔════════════════════════════════════════════════════════════╗"
-          echo "║                    🌐 WEB UI ACCESS (ngrok)                ║"
-          echo "╚════════════════════════════════════════════════════════════╝"
+          echo "=============================="
+          echo "  WEB UI ACCESS"
+          echo "=============================="
           echo ""
-          echo "   $TUNNEL_URL"
+          echo "  $TUNNEL_URL"
           echo ""
-          echo "   ⚠️  Note: ngrok free tier shows a warning page first"
-          echo "   Click 'Visit Site' to access the UI"
-          echo ""
-          
-          # Save to Supabase
-          curl -s -X POST "${{ secrets.SUPABASE_URL }}/rest/v1/tunnel_sessions" \
-            -H "apikey: ${{ secrets.SUPABASE_API_KEY }}" \
-            -H "Content-Type: application/json" \
-            -H "Prefer: return=minimal" \
-            -d "{\"run_id\": ${{ github.run_number }}, \"url\": \"$TUNNEL_URL\", \"started_at\": \"$(date -u +%FT%TZ)\", \"is_active\": true}" \
-            > /dev/null 2>&1 || true
 
       - name: Create GitHub Actions Summary
         if: always()
         run: |
-          echo "# 🌐 GoOnDVR Web UI Access" >> $GITHUB_STEP_SUMMARY
+          echo "# ðŸŒ Chaturbate DVR Web UI Access" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
           if [ -n "$TUNNEL_URL" ]; then
-            echo "## ✅ Tunnel Active" >> $GITHUB_STEP_SUMMARY
+            echo "## âœ… Tunnel Active" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "**Access your recorder at:**" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "🔗 [$TUNNEL_URL]($TUNNEL_URL)" >> $GITHUB_STEP_SUMMARY
+            echo "ðŸ”— [$TUNNEL_URL]($TUNNEL_URL)" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "---" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
@@ -508,9 +256,9 @@ jobs:
             echo "- **Started:** $(date -u +%Y-%m-%d\ %H:%M:%S\ UTC)" >> $GITHUB_STEP_SUMMARY
             echo "- **Duration:** ${{ github.event.inputs.duration_hours || '5' }} hours" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "> ⚠️ **Note:** This URL is only active while the workflow is running. It will expire when the run completes." >> $GITHUB_STEP_SUMMARY
+            echo "> âš ï¸ **Note:** This URL is only active while the workflow is running. It will expire when the run completes." >> $GITHUB_STEP_SUMMARY
           else
-            echo "## ❌ Tunnel Failed" >> $GITHUB_STEP_SUMMARY
+            echo "## âŒ Tunnel Failed" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "The tunnel could not be established. Check the logs above for details." >> $GITHUB_STEP_SUMMARY
           fi
@@ -518,19 +266,10 @@ jobs:
       - name: Record for 5 hours
         run: |
           graceful_shutdown() {
-            echo "⚠️  Saving recordings..."
-            docker exec goondvr pkill -SIGTERM -f goondvr 2>/dev/null || true
-            sleep 180
-
-            COMPLETED_COUNT=$(docker exec goondvr find /usr/src/app/videos/completed \
-              -type f \( -name "*.mp4" -o -name "*.mkv" \) 2>/dev/null | wc -l || echo "0")
-            if [ "$COMPLETED_COUNT" -gt 0 ]; then
-              echo "📤 Uploading $COMPLETED_COUNT file(s)..."
-              curl -s -X POST -m 600 http://localhost:8080/api/upload/completed || true
-              sleep 60
-            fi
-
-            docker cp goondvr:/usr/src/app/videos/. emergency-backup/ 2>/dev/null || true
+            echo "âš ï¸  Stopping chaturbate-dvr gracefully..."
+            docker exec chaturbate-dvr pkill -SIGTERM -f chaturbate-dvr 2>/dev/null || true
+            sleep 30
+            docker cp chaturbate-dvr:/usr/src/app/videos/. emergency-backup/ 2>/dev/null || true
             CANCELLED=true
           }
 
@@ -540,30 +279,29 @@ jobs:
           DURATION_HOURS="${{ github.event.inputs.duration_hours }}"
           DURATION_HOURS="${DURATION_HOURS:-5}"
           END_TIME=$(($(date +%s) + DURATION_HOURS * 3600))
-          LAST_CLEANUP=0
           LAST_HEARTBEAT=0
 
           while [ $(date +%s) -lt $END_TIME ] && [ "$CANCELLED" = false ]; do
             # Check if container is still running
-            if ! docker ps --format '{{.Names}}' | grep -q '^goondvr$'; then
-              echo "⚠️  Container stopped unexpectedly!"
-              docker logs --tail 100 goondvr
-              echo "⚠️  Attempting to restart container..."
+            if ! docker ps --format '{{.Names}}' | grep -q '^chaturbate-dvr$'; then
+              echo "âš ï¸  Container stopped unexpectedly!"
+              docker logs --tail 100 chaturbate-dvr 2>/dev/null || true
+              echo "âš ï¸  Attempting to restart container..."
               
               # Try to restart the container
-              docker start goondvr 2>/dev/null || {
-                echo "❌ Failed to restart container, exiting"
+              docker start chaturbate-dvr 2>/dev/null || {
+                echo "âŒ Failed to restart container, exiting"
                 break
               }
               
               # Wait for app to be ready
               for i in $(seq 1 30); do
                 if curl -sf http://localhost:8080 > /dev/null 2>&1; then
-                  echo "✅ Container restarted successfully"
+                  echo "âœ… Container restarted successfully"
                   break
                 fi
                 if [ "$i" -eq 30 ]; then
-                  echo "❌ Container failed to restart properly"
+                  echo "âŒ Container failed to restart properly"
                   break
                 fi
                 sleep 2
@@ -572,31 +310,12 @@ jobs:
 
             CURRENT_TIME=$(date +%s)
 
-            # Disk space guard — upload early if >80% used
-            DISK_USED=$(df / | awk 'NR==2{print $5}' | tr -d '%')
-            if [ "$DISK_USED" -gt 80 ]; then
-              echo "⚠️  Disk at ${DISK_USED}%, triggering early upload..."
-              curl -s -X POST -m 120 http://localhost:8080/api/upload/completed > /dev/null 2>&1 || true
-            fi
-
-            # Periodic upload every 30 min
-            if [ $((CURRENT_TIME - LAST_CLEANUP)) -gt 1800 ]; then
-              COMPLETED_COUNT=$(docker exec goondvr find /usr/src/app/videos/completed \
-                -type f \( -name "*.mp4" -o -name "*.mkv" \) 2>/dev/null | wc -l || echo "0")
-              if [ "$COMPLETED_COUNT" -gt 0 ]; then
-                echo "📤 Uploading $COMPLETED_COUNT completed file(s)..."
-                curl -s -X POST -m 120 http://localhost:8080/api/upload/completed > /dev/null 2>&1 &
-              fi
-              LAST_CLEANUP=$CURRENT_TIME
-            fi
-
-            # Heartbeat to Supabase every 5 min
             if [ $((CURRENT_TIME - LAST_HEARTBEAT)) -gt 300 ]; then
               curl -s -X POST "${{ secrets.SUPABASE_URL }}/rest/v1/heartbeats" \
                 -H "apikey: ${{ secrets.SUPABASE_API_KEY }}" \
                 -H "Content-Type: application/json" \
                 -H "Prefer: return=minimal" \
-                -d "{\"run_id\": ${{ github.run_number }}, \"timestamp\": \"$(date -u +%FT%TZ)\", \"tunnel_url\": \"$TUNNEL_URL\", \"disk_used_pct\": $DISK_USED}" \
+                -d "{\"run_id\": ${{ github.run_number }}, \"timestamp\": \"$(date -u +%FT%TZ)\", \"tunnel_url\": \"$TUNNEL_URL\"}" \
                 > /dev/null 2>&1 || true
               LAST_HEARTBEAT=$CURRENT_TIME
             fi
@@ -604,16 +323,26 @@ jobs:
             sleep 60
           done
 
-          # Final upload
-          echo "📤 Performing final upload..."
-          COMPLETED_COUNT=$(docker exec goondvr find /usr/src/app/videos/completed \
-            -type f \( -name "*.mp4" -o -name "*.mkv" \) 2>/dev/null | wc -l || echo "0")
-          if [ "$COMPLETED_COUNT" -gt 0 ]; then
-            echo "📤 Uploading $COMPLETED_COUNT final file(s)..."
-            curl -s -X POST -m 300 http://localhost:8080/api/upload/completed || true
-            sleep 60
+          # Final backup
+          echo "ðŸ“¦ Performing final backup..."
+          docker cp chaturbate-dvr:/usr/src/app/videos/. emergency-backup/ 2>/dev/null || true
+
+      - name: Commit recordings database to repo
+        if: always()
+        run: |
+          if [ -f database/recordings.json ]; then
+            git config user.name "github-actions"
+            git config user.email "github-actions@github.com"
+            git add database/recordings.json
+            if git diff --staged --quiet; then
+              echo "No changes to commit"
+            else
+              git commit -m "Update recordings database [skip ci]"
+              git push
+              echo "âœ… Recordings database committed"
+            fi
           else
-            echo "✅ No files to upload"
+            echo "No recordings database found"
           fi
 
       - name: Trigger next run
@@ -621,7 +350,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "🔍 Checking for pending workflow runs..."
+          echo "ðŸ” Checking for pending workflow runs..."
           
           CURRENT_RUN_ID=${{ github.run_id }}
           
@@ -631,22 +360,22 @@ jobs:
           echo "Found $PENDING_RUNS pending runs (excluding current: $CURRENT_RUN_ID)"
           
           if [ "$PENDING_RUNS" -gt 0 ]; then
-            echo "✅ Next run already queued/running, skipping trigger"
+            echo "âœ… Next run already queued/running, skipping trigger"
           else
-            echo "🔁 No other pending runs, triggering next run..."
+            echo "ðŸ” No other pending runs, triggering next run..."
             gh workflow run "${{ github.workflow }}" --repo "${{ github.repository }}"
-            echo "✅ Next run queued"
+            echo "âœ… Next run queued"
           fi
 
       - name: Cleanup
         if: always()
         run: |
-          docker stop --time=60 goondvr byparr 2>/dev/null || true
-          docker rm -f goondvr byparr 2>/dev/null || true
+          docker stop --time=60 chaturbate-dvr byparr 2>/dev/null || true
+          docker rm -f chaturbate-dvr byparr cookie-refresher uploader 2>/dev/null || true
           docker network rm recorder-network 2>/dev/null || true
           docker system prune -af --volumes 2>/dev/null || true
           pkill -f cloudflared 2>/dev/null || true
-          rm -rf videos/* database/* 2>/dev/null || true
+          rm -rf videos/* emergency-backup/* 2>/dev/null || true
 
       - name: Upload artifacts (emergency fallback)
         if: always()
@@ -656,3 +385,4 @@ jobs:
           path: emergency-backup/
           retention-days: 30
           if-no-files-found: ignore
+

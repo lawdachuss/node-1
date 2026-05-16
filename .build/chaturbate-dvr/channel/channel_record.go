@@ -1,0 +1,243 @@
+package channel
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/avast/retry-go/v4"
+	"github.com/teacat/chaturbate-dvr/chaturbate"
+	"github.com/teacat/chaturbate-dvr/internal"
+	"github.com/teacat/chaturbate-dvr/server"
+)
+
+// Monitor starts monitoring the channel for live streams and records them.
+func (ch *Channel) Monitor() {
+	client := chaturbate.NewClient()
+	ch.Info("starting to record `%s`", ch.Config.Username)
+
+	// Create a new context with a cancel function,
+	// the CancelFunc will be stored in the channel's CancelFunc field
+	// and will be called by `Pause` or `Stop` functions
+	ctx, _ := ch.WithCancel(context.Background())
+
+	var err error
+	for {
+		if err = ctx.Err(); err != nil {
+			break
+		}
+
+		pipeline := func() error {
+			return ch.RecordStream(ctx, client)
+		}
+
+		cfBlockCount := 0
+
+		onRetry := func(_ uint, err error) {
+			ch.UpdateOnlineStatus(false)
+
+			if isCFBlock(err) {
+				cfBlockCount++
+				delay := cfBackoffMinutes(cfBlockCount, server.Config.Interval)
+				ch.Info("blocked by Cloudflare (attempt %d); try with `-cookies` and `-user-agent`? try again in %d min(s)", cfBlockCount, delay)
+			} else if errors.Is(err, internal.ErrChannelOffline) || errors.Is(err, internal.ErrPrivateStream) {
+				cfBlockCount = 0
+				ch.RoomStatus = client.LastRoomStatus
+				ch.Update()
+				ch.Info("channel is %s, try again in %d min(s)", ch.RoomStatus, server.Config.Interval)
+			} else if errors.Is(err, context.Canceled) {
+				cfBlockCount = 0
+			} else {
+				cfBlockCount = 0
+				ch.Error("on retry: %s: retrying in %d min(s)", err.Error(), server.Config.Interval)
+			}
+		}
+
+		customDelay := func(_ uint, err error, _ *retry.Config) time.Duration {
+			if isCFBlock(err) {
+				return time.Duration(cfBackoffMinutes(cfBlockCount, server.Config.Interval)) * time.Minute
+			}
+			return time.Duration(server.Config.Interval) * time.Minute
+		}
+
+		if err = retry.Do(
+			pipeline,
+			retry.Context(ctx),
+			retry.Attempts(0),
+			retry.DelayType(customDelay),
+			retry.OnRetry(onRetry),
+		); err != nil {
+			break
+		}
+	}
+
+	// Always cleanup when monitor exits, regardless of error
+	if err := ch.Cleanup(); err != nil {
+		ch.Error("cleanup on monitor exit: %s", err.Error())
+	}
+
+	// Log error if it's not a context cancellation
+	if err != nil && !errors.Is(err, context.Canceled) {
+		ch.Error("record stream: %s", err.Error())
+	}
+}
+
+// Update sends an update signal to the channel's update channel.
+// This notifies the Server-sent Event to boradcast the channel information to the client.
+func (ch *Channel) Update() {
+	ch.UpdateCh <- true
+}
+
+// RecordStream records the stream of the channel using the provided client.
+// It retrieves the stream information and starts watching the segments.
+func (ch *Channel) RecordStream(ctx context.Context, client *chaturbate.Client) error {
+	stream, err := client.GetStream(ctx, ch.Config.Username)
+	if err != nil {
+		return fmt.Errorf("get stream: %w", err)
+	}
+	playlist, err := stream.GetPlaylist(ctx, ch.Config.Resolution, ch.Config.Framerate)
+	if err != nil {
+		return fmt.Errorf("get playlist: %w", err)
+	}
+
+	ch.StreamedAt = time.Now().Unix()
+	ch.Sequence = 0
+	ch.InitSegment = nil
+	ch.AudioInitSegment = nil
+	ch.HasSeparateAudio = playlist.AudioPlaylistURL != ""
+	ch.switchRequested = false
+
+	if err := ch.NextFile(); err != nil {
+		return fmt.Errorf("next file: %w", err)
+	}
+
+	// Ensure file is cleaned up when this function exits in any case
+	defer func() {
+		if err := ch.Cleanup(); err != nil {
+			ch.Error("cleanup on record stream exit: %s", err.Error())
+		}
+	}()
+
+	ch.RoomStatus = chaturbate.StatusPublic
+	ch.UpdateOnlineStatus(true) // after GetPlaylist succeeds
+
+	ch.Info("stream quality - resolution %dp (target: %dp), framerate %dfps (target: %dfps)", playlist.Resolution, ch.Config.Resolution, playlist.Framerate, ch.Config.Framerate)
+	if ch.HasSeparateAudio {
+		ch.Info("detected separate audio rendition, recording and muxing audio/video streams")
+	}
+
+	return playlist.WatchAVSegments(ctx, ch.HandleSegment, ch.HandleInitSegment, ch.HandleAudioSegment, ch.HandleAudioInitSegment, ch.OnPollComplete)
+}
+
+// HandleInitSegment stores the fMP4 init segment and writes it to the file.
+func (ch *Channel) HandleInitSegment(initData []byte) error {
+	ch.InitSegment = initData
+
+	if ch.File == nil {
+		return nil
+	}
+
+	n, err := ch.File.Write(initData)
+	if err != nil {
+		return fmt.Errorf("write init segment: %w", err)
+	}
+	ch.Filesize += n
+	return nil
+}
+
+// HandleAudioInitSegment stores the fMP4 audio init segment and writes it to the file.
+func (ch *Channel) HandleAudioInitSegment(initData []byte) error {
+	ch.AudioInitSegment = initData
+
+	if ch.AudioFile == nil {
+		return nil
+	}
+
+	if _, err := ch.AudioFile.Write(initData); err != nil {
+		return fmt.Errorf("write audio init segment: %w", err)
+	}
+	return nil
+}
+
+func isCFBlock(err error) bool {
+	return errors.Is(err, internal.ErrCloudflareBlocked) || errors.Is(err, internal.ErrAgeVerification)
+}
+
+// cfBackoffMinutes returns the delay in minutes for Cloudflare block retries.
+// Uses exponential backoff: interval * 2^(n-1), capped at 30 minutes.
+// consecutiveBlocks must be >= 1.
+func cfBackoffMinutes(consecutiveBlocks, baseInterval int) int {
+	shift := min(consecutiveBlocks-1, 4) // max multiplier: 16x
+	delay := baseInterval * (1 << shift)
+	return min(delay, 30)
+}
+
+// HandleSegment processes and writes segment data to a file.
+func (ch *Channel) HandleSegment(b []byte, duration float64) error {
+	if ch.Config.IsPaused {
+		return retry.Unrecoverable(internal.ErrPaused)
+	}
+
+	n, err := ch.File.Write(b)
+	if err != nil {
+		return fmt.Errorf("write file: %w", err)
+	}
+
+	ch.Filesize += n
+	ch.Duration += duration
+	ch.Info("duration: %s, filesize: %s", internal.FormatDuration(ch.Duration), internal.FormatFilesize(ch.Filesize))
+
+	// Send an SSE update to update the view
+	ch.Update()
+
+	if !ch.ShouldSwitchFile() {
+		return nil
+	}
+
+	// For LL-HLS streams with separate audio, defer the rotation until the
+	// current poll cycle finishes so the paired audio segments land in the
+	// same file as the video ones. Single-stream recordings have no pairing
+	// risk, and deferring would let processMediaPlaylist keep appending a
+	// backlog of catch-up segments past the MaxFilesize/MaxDuration limit.
+	if ch.HasSeparateAudio {
+		ch.switchRequested = true
+		return nil
+	}
+
+	if err := ch.NextFile(); err != nil {
+		return fmt.Errorf("next file: %w", err)
+	}
+	ch.Info("max filesize or duration exceeded, new file created: %s", ch.File.Name())
+	return nil
+}
+
+// OnPollComplete performs any file rotation requested during the poll cycle.
+// Called by WatchAVSegments after both video and audio playlists have been
+// processed, guaranteeing that rotation never splits an A/V pair.
+func (ch *Channel) OnPollComplete() error {
+	if !ch.switchRequested {
+		return nil
+	}
+	ch.switchRequested = false
+	if err := ch.NextFile(); err != nil {
+		return fmt.Errorf("next file: %w", err)
+	}
+	ch.Info("max filesize or duration exceeded, new file created: %s", ch.File.Name())
+	return nil
+}
+
+// HandleAudioSegment processes and writes audio segment data to a sidecar file.
+func (ch *Channel) HandleAudioSegment(b []byte, _ float64) error {
+	if ch.AudioFile == nil {
+		return nil
+	}
+	if ch.Config.IsPaused {
+		return retry.Unrecoverable(internal.ErrPaused)
+	}
+
+	if _, err := ch.AudioFile.Write(b); err != nil {
+		return fmt.Errorf("write audio file: %w", err)
+	}
+	return nil
+}
