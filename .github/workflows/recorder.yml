@@ -199,9 +199,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          curl -fsSL \
-            -o cloudflared.deb \
+          curl -fsSL -o cloudflared.deb \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared.deb
           cloudflared --version
@@ -212,10 +210,14 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Clean stale cloudflared state that can cause JSON parse errors
+          rm -rf ~/.cloudflared
+
           tunnel_url=""
 
+          # ── Attempt 1: cloudflared quick tunnel ──────────────────────────
           for retry in {1..3}; do
-            echo "Tunnel attempt $retry/3..."
+            echo "cloudflared attempt $retry/3..."
             rm -f tunnel.log tunnel.pid
             cloudflared tunnel --url "$APP_URL" --no-autoupdate > tunnel.log 2>&1 &
             echo "$!" > tunnel.pid
@@ -228,15 +230,32 @@ jobs:
               sleep 5
             done
 
-            # Kill and retry on next iteration
             kill "$(cat tunnel.pid)" 2>/dev/null || true
             sleep 3
           done
 
+          # ── Attempt 2: localhost.run fallback ────────────────────────────
           if [[ -z "$tunnel_url" ]]; then
-            echo "Cloudflare tunnel URL was not created after 3 attempts."
-            cat tunnel.log
-            echo "Proceeding without a tunnel — recording still works locally."
+            echo "cloudflared failed — trying localhost.run..."
+            rm -f tunnel.log tunnel.pid
+            ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
+              -R 80:localhost:8080 nokey@localhost.run 2>&1 |
+              stdbuf -oL grep -Eo 'https://[a-zA-Z0-9-]+\.lhr\.life' \
+              > tunnel.log 2>/dev/null &
+            echo "$!" > tunnel.pid
+
+            for attempt in {1..24}; do
+              tunnel_url="$(head -1 tunnel.log 2>/dev/null || true)"
+              if [[ -n "$tunnel_url" ]]; then
+                echo "Tunnel via localhost.run: $tunnel_url"
+                break
+              fi
+              sleep 5
+            done
+          fi
+
+          if [[ -z "$tunnel_url" ]]; then
+            echo "No tunnel could be created — recording still works locally."
             echo "TUNNEL_URL=" >> "$GITHUB_ENV"
             exit 0
           fi
@@ -244,7 +263,6 @@ jobs:
           echo "$tunnel_url" > tunnel_url.txt
           echo "TUNNEL_URL=$tunnel_url" >> "$GITHUB_ENV"
           echo "url=$tunnel_url" >> "$GITHUB_OUTPUT"
-          echo "Tunnel URL: $tunnel_url"
 
           for attempt in {1..12}; do
             status="$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 15 "$tunnel_url" || true)"
