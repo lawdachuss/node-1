@@ -133,16 +133,18 @@ jobs:
 
           echo "Waiting for cookie-refresher to push initial Cloudflare cookies..."
           cookies_ok=false
-          for attempt in {1..90}; do
+          for attempt in {1..150}; do
             if docker compose logs cookie-refresher 2>/dev/null | grep -q 'Pushed to chaturbate-dvr (ok)'; then
               echo "Cloudflare cookies applied by cookie-refresher"
               cookies_ok=true
               break
             fi
-            if docker compose logs cookie-refresher 2>/dev/null | grep -q 'Failed to push cookies'; then
-              echo "cookie-refresher retrying (attempt $attempt/90)..."
+            if (( attempt % 10 == 1 )); then
+              elapsed=$(( (attempt - 1) * 3 ))
+              byparr_status="$(curl -sS --max-time 3 http://localhost:8191/backend-health 2>/dev/null || echo 'unreachable')"
+              echo "  [${elapsed}s] waiting (byparr: ${byparr_status})..."
             fi
-            sleep 5
+            sleep 3
           done
 
           if [[ "$cookies_ok" == "true" ]]; then
