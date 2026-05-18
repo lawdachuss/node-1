@@ -114,28 +114,32 @@ func (ch *Channel) RecordStream(ctx context.Context, client *chaturbate.Client) 
                 return fmt.Errorf("get playlist: %w", err)
         }
 
-        // Capture room metadata cached on the client from GetStream.
-        ch.RoomTitle = client.LastRoomTitle
-        ch.Tags = client.LastTags
-        ch.Viewers = client.LastViewers
+	// Capture room metadata cached on the client from GetStream.
+	ch.RoomTitle = client.LastRoomTitle
+	ch.Tags = client.LastTags
+	ch.Viewers = client.LastViewers
 
-        ch.StreamedAt = time.Now().Unix()
-        ch.Sequence = 0
-        ch.InitSegment = nil
-        ch.AudioInitSegment = nil
-        ch.HasSeparateAudio = playlist.AudioPlaylistURL != ""
-        ch.switchRequested = false
+	// Capture actual stream quality from the playlist
+	ch.Resolution = fmt.Sprintf("%dp", playlist.Resolution)
+	ch.Framerate = playlist.Framerate
 
-        if err := ch.NextFile(); err != nil {
-                return fmt.Errorf("next file: %w", err)
-        }
+	ch.StreamedAt = time.Now().Unix()
+	ch.Sequence = 0
+	ch.InitSegment = nil
+	ch.AudioInitSegment = nil
+	ch.HasSeparateAudio = playlist.AudioPlaylistURL != ""
+	ch.switchRequested = false
 
-        // Ensure file is cleaned up when this function exits in any case
-        defer func() {
-                if err := ch.Cleanup(); err != nil {
-                        ch.Error("cleanup on record stream exit: %s", err.Error())
-                }
-        }()
+	if err := ch.NextFile(); err != nil {
+		return fmt.Errorf("next file: %w", err)
+	}
+
+	// Ensure file is cleaned up when this function exits in any case
+	defer func() {
+		if err := ch.Cleanup(); err != nil {
+			ch.Error("cleanup on record stream exit: %s", err.Error())
+		}
+	}()
 
         ch.RoomStatus = chaturbate.StatusPublic
         ch.UpdateOnlineStatus(true) // after GetPlaylist succeeds

@@ -93,4 +93,7 @@ type Config struct {
 	GitHubRepo        string
 	GitHubBranch      string
 	GitHubPreviewPath string
+
+	SupabaseURL    string
+	SupabaseAPIKey string
 }

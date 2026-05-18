@@ -64,47 +64,61 @@ type CreateChannelRequest struct {
 
 // CreateChannel creates a new channel.
 func CreateChannel(c *gin.Context) {
-        var req *CreateChannelRequest
-        if err := c.Bind(&req); err != nil {
-                c.AbortWithError(http.StatusBadRequest, fmt.Errorf("bind: %w", err))
-                return
-        }
+	var req *CreateChannelRequest
+	if err := c.Bind(&req); err != nil {
+		c.AbortWithError(http.StatusBadRequest, fmt.Errorf("bind: %w", err))
+		return
+	}
 
-        for _, username := range strings.Split(req.Username, ",") {
-                server.Manager.CreateChannel(&entity.ChannelConfig{
-                        IsPaused:    false,
-                        Username:    username,
-                        Framerate:   req.Framerate,
-                        Resolution:  req.Resolution,
-                        Pattern:     req.Pattern,
-                        MaxDuration: req.MaxDuration,
-                        MaxFilesize: req.MaxFilesize,
-                        Compress:    req.Compress,
-                        CreatedAt:   time.Now().Unix(),
-                }, true)
-        }
-        c.Redirect(http.StatusFound, "/")
+	var lastErr error
+	for _, username := range strings.Split(req.Username, ",") {
+		if err := server.Manager.CreateChannel(&entity.ChannelConfig{
+			IsPaused:    false,
+			Username:    username,
+			Framerate:   req.Framerate,
+			Resolution:  req.Resolution,
+			Pattern:     req.Pattern,
+			MaxDuration: req.MaxDuration,
+			MaxFilesize: req.MaxFilesize,
+			Compress:    req.Compress,
+			CreatedAt:   time.Now().Unix(),
+		}, true); err != nil {
+			lastErr = err
+			fmt.Printf("[ERROR] create channel %s: %v\n", username, err)
+		}
+	}
+	if lastErr != nil {
+		c.String(http.StatusInternalServerError, "Failed to save channel config: %v", lastErr)
+		return
+	}
+	c.Redirect(http.StatusFound, "/")
 }
 
 // StopChannel stops a channel.
 func StopChannel(c *gin.Context) {
-        server.Manager.StopChannel(c.Param("username"))
+	if err := server.Manager.StopChannel(c.Param("username")); err != nil {
+		fmt.Printf("[ERROR] stop channel %s: %v\n", c.Param("username"), err)
+	}
 
-        c.Redirect(http.StatusFound, "/")
+	c.Redirect(http.StatusFound, "/")
 }
 
 // PauseChannel pauses a channel.
 func PauseChannel(c *gin.Context) {
-        server.Manager.PauseChannel(c.Param("username"))
+	if err := server.Manager.PauseChannel(c.Param("username")); err != nil {
+		fmt.Printf("[ERROR] pause channel %s: %v\n", c.Param("username"), err)
+	}
 
-        c.Redirect(http.StatusFound, "/")
+	c.Redirect(http.StatusFound, "/")
 }
 
 // ResumeChannel resumes a paused channel.
 func ResumeChannel(c *gin.Context) {
-        server.Manager.ResumeChannel(c.Param("username"))
+	if err := server.Manager.ResumeChannel(c.Param("username")); err != nil {
+		fmt.Printf("[ERROR] resume channel %s: %v\n", c.Param("username"), err)
+	}
 
-        c.Redirect(http.StatusFound, "/")
+	c.Redirect(http.StatusFound, "/")
 }
 
 // Updates handles the SSE connection for updates.

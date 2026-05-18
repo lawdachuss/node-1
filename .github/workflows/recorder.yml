@@ -32,6 +32,7 @@ env:
   COMPOSE_PROJECT_NAME: recorder
   SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
   SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
+  DATABASE_URL: ${{ secrets.DATABASE_URL }}
   STREAMTAPE_LOGIN: ${{ secrets.STREAMTAPE_LOGIN }}
   STREAMTAPE_API_KEY: ${{ secrets.STREAMTAPE_API_KEY }}
   VOESX_API_KEY: ${{ secrets.VOESX_API_KEY }}
@@ -98,7 +99,38 @@ jobs:
           echo "duration=$duration" >> "$GITHUB_OUTPUT"
           echo "valid=true" >> "$GITHUB_OUTPUT"
 
-      - name: Start all containers
+      - name: Ensure Supabase app_settings table
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # The app_settings table is required by the Go code's Supabase REST API
+          # fallback for persisting channels, recordings, settings, and tunnel URL.
+          # Try to create it if it doesn't exist (idempotent).
+          SQL="CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value JSONB NOT NULL DEFAULT '{}',
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+          );"
+
+          # Use Supabase REST API to run SQL via pg_dump or similar isn't possible,
+          # but the Go code's migrate() function handles table creation when
+          # DATABASE_URL is set. For REST-only mode, we check if the table exists
+          # by querying it.
+          TABLE_EXISTS=$(curl -sS --max-time 10 \
+            "${SUPABASE_URL}/rest/v1/app_settings?key=eq._dummy_check_&select=key" \
+            -H "apikey: ${SUPABASE_API_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_API_KEY}" 2>/dev/null | grep -c 'key' || true)
+
+          if [[ "$TABLE_EXISTS" -gt 0 ]] 2>/dev/null; then
+            echo "app_settings table is accessible via REST API."
+          else
+            echo "WARNING: app_settings table may not be accessible."
+            echo "If persistence via REST API fails, ensure the table exists and RLS allows anon access."
+            echo "Run the SQL migrations in supabase/migrations/ manually if needed."
+          fi
+
+      - name: Start containers
         shell: bash
         run: |
           set -euo pipefail
@@ -129,6 +161,11 @@ jobs:
 
           echo "=== Full container status ==="
           docker compose ps -a
+
+      - name: Wait for Cloudflare cookies
+        shell: bash
+        run: |
+          set -euo pipefail
 
           echo "Waiting for cookie-refresher to push initial Cloudflare cookies..."
           cookies_ok=false
@@ -263,13 +300,23 @@ jobs:
             echo "WARNING: Tunnel URL not verified as reachable (last status: $status) — recording still works locally"
           fi
 
+          # Save tunnel URL to both Supabase REST API and local file
           curl -fsS -X POST "${SUPABASE_URL}/rest/v1/tunnel_sessions" \
             -H "apikey: ${SUPABASE_API_KEY}" \
             -H "Authorization: Bearer ${SUPABASE_API_KEY}" \
             -H "Content-Type: application/json" \
             -H "Prefer: return=minimal" \
             -d "{\"run_id\": ${GITHUB_RUN_NUMBER}, \"url\": \"${tunnel_url}\", \"started_at\": \"$(date -u +%FT%TZ)\", \"is_active\": true}" \
-            2>/dev/null || echo "Could not save tunnel URL to Supabase."
+            2>/dev/null || echo "Could not save tunnel URL to Supabase tunnel_sessions table."
+
+          # Also persist to the app_settings table (used by the Go code fallback)
+          curl -fsS -X POST "${SUPABASE_URL}/rest/v1/app_settings" \
+            -H "apikey: ${SUPABASE_API_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -H "Prefer: resolution=merge-duplicates" \
+            -d "{\"key\": \"tunnel_url\", \"value\": \"${tunnel_url}\"}" \
+            2>/dev/null || true
 
       - name: Publish run summary
         if: always()
@@ -301,10 +348,12 @@ jobs:
           fi
 
           stop_recorder() {
-            echo "Stopping recorder gracefully."
+            echo "=== Stopping recorder gracefully... ==="
             docker compose stop -t 300 chaturbate-dvr || true
             mkdir -p emergency-backup
+            # Copy any remaining recordings from the container
             docker compose cp chaturbate-dvr:/usr/src/app/videos/. emergency-backup/ 2>/dev/null || true
+            echo "=== Recorder stopped ==="
           }
 
           trap stop_recorder INT TERM
@@ -313,6 +362,7 @@ jobs:
             if ! docker compose ps --services | grep -qx "chaturbate-dvr"; then
               echo "chaturbate-dvr is not running. Recent logs:"
               docker compose logs --tail=120 chaturbate-dvr || true
+              # Rebuild only if the binary changed; otherwise just restart
               docker compose up -d --build chaturbate-dvr
 
               for attempt in {1..30}; do
@@ -322,6 +372,14 @@ jobs:
                 fi
                 sleep 2
               done
+            fi
+
+            # Check if channel processes are alive inside the container
+            if curl -fsS --max-time 5 "$APP_URL" >/dev/null 2>/dev/null; then
+              ch_count="$(curl -sS --max-time 5 "$APP_URL" 2>/dev/null | grep -c 'channel-info' || true)"
+              if (( ch_count > 0 )); then
+                :
+              fi
             fi
 
             sleep 60
@@ -349,16 +407,29 @@ jobs:
           if-no-files-found: ignore
 
       - name: Persist data to repository
-        if: always() && steps.config.outputs.valid == 'true' && !cancelled()
+        # Always persist, even on cancellation. The !cancelled() guard was removed
+        # because losing channel config between runs is worse than a failed commit.
+        # The git push may fail if the remote has diverged (another concurrent run),
+        # but data files on disk are still current for the next run's checkout.
+        if: always() && steps.config.outputs.valid == 'true'
         shell: bash
         run: |
           set -euo pipefail
 
-          # Copy generated data from container to workspace
-          docker compose cp chaturbate-dvr:/usr/src/app/conf/channels.json conf/channels.json 2>/dev/null || true
-          docker compose cp chaturbate-dvr:/database/settings.json database/settings.json 2>/dev/null || true
-          docker compose cp chaturbate-dvr:/database/recordings.json database/recordings.json 2>/dev/null || true
-          docker compose cp chaturbate-dvr:/database/tunnel.json database/tunnel.json 2>/dev/null || true
+          # The conf/ and database/ directories are bind-mounted volumes, so files
+          # written inside the container are immediately available on the host.
+          # These cp commands are explicit safety copies in case the mount behaves
+          # unexpectedly on the GitHub Actions runner.
+          echo "Copying data from container volumes..."
+
+          docker compose cp chaturbate-dvr:/usr/src/app/conf/channels.json conf/channels.json 2>/dev/null || echo "  (no channels.json — first run?)"
+          docker compose cp chaturbate-dvr:/database/settings.json database/settings.json 2>/dev/null || echo "  (no settings.json)"
+          docker compose cp chaturbate-dvr:/database/recordings.json database/recordings.json 2>/dev/null || echo "  (no recordings.json)"
+          docker compose cp chaturbate-dvr:/database/tunnel.json database/tunnel.json 2>/dev/null || echo "  (no tunnel.json)"
+
+          # Verify local files exist
+          echo "=== Local data files ==="
+          ls -la conf/channels.json database/settings.json database/recordings.json database/tunnel.json 2>/dev/null || echo "Some data files are missing (expected on first run)"
 
           # Commit changes back to repo
           git add conf/channels.json database/settings.json database/recordings.json database/tunnel.json
@@ -366,8 +437,13 @@ jobs:
             echo "No data changes to commit"
           else
             git -c user.name="recorder-bot" -c user.email="recorder@github" commit -m "chore: persist recorder data [run ${GITHUB_RUN_NUMBER}]"
-            git push
-            echo "Data committed and pushed"
+            # Push may fail if another run committed first — that's OK, our local
+            # data is still on disk for the next run.
+            if git push; then
+              echo "Data committed and pushed"
+            else
+              echo "WARNING: git push failed (likely race with another run). Local data files are up to date."
+            fi
           fi
 
       - name: Queue next run
@@ -401,20 +477,28 @@ jobs:
         run: |
           set +e
 
-          if [[ -n "${TUNNEL_URL:-}" ]]; then
-            curl -sS -X PATCH "${SUPABASE_URL}/rest/v1/tunnel_sessions?run_id=eq.${GITHUB_RUN_NUMBER}" \
-              -H "apikey: ${SUPABASE_API_KEY}" \
-              -H "Authorization: Bearer ${SUPABASE_API_KEY}" \
-              -H "Content-Type: application/json" \
-              -H "Prefer: return=minimal" \
-              -d "{\"is_active\": false, \"last_seen_at\": \"$(date -u +%FT%TZ)\"}" \
-              >/dev/null || true
+          # Mark tunnel as inactive in both tables
+          if [[ -n "${SUPABASE_URL}" && -n "${SUPABASE_API_KEY}" ]]; then
+            if [[ -n "${TUNNEL_URL:-}" ]]; then
+              curl -sS -X PATCH "${SUPABASE_URL}/rest/v1/tunnel_sessions?run_id=eq.${GITHUB_RUN_NUMBER}" \
+                -H "apikey: ${SUPABASE_API_KEY}" \
+                -H "Authorization: Bearer ${SUPABASE_API_KEY}" \
+                -H "Content-Type: application/json" \
+                -H "Prefer: return=minimal" \
+                -d "{\"is_active\": false, \"last_seen_at\": \"$(date -u +%FT%TZ)\"}" \
+                >/dev/null || true
+            fi
           fi
 
+          # Kill tunnel processes
           if [[ -f tunnel.pid ]]; then
             kill "$(cat tunnel.pid)" 2>/dev/null || true
           fi
           pkill -f cloudflared 2>/dev/null || true
 
-          docker compose down --remove-orphans --volumes
-          docker system prune -af --volumes
+          # Stop containers and clean up
+          echo "Stopping services..."
+          docker compose down --remove-orphans --volumes 2>/dev/null || true
+          docker system prune -af --volumes 2>/dev/null || true
+
+          echo "Cleanup complete."

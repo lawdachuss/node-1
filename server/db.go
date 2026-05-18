@@ -1,9 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"time"
 
@@ -12,12 +15,23 @@ import (
 
 var db *sql.DB
 
-// InitDB initialises the PostgreSQL connection using DATABASE_URL.
-// Falls back to local files if DATABASE_URL is not set.
+// InitDB initialises the PostgreSQL connection using DATABASE_URL (from env,
+// not Config — it is not a CLI flag). Falls back to Supabase REST API if
+// DATABASE_URL is not set but SUPABASE_URL/SUPABASE_API_KEY are. Falls back
+// to local files if neither direct DB nor Supabase REST is available.
 func InitDB() error {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		fmt.Println(" INFO [db] DATABASE_URL not set — using local files as fallback")
+		if supabaseRestURL() != "" && supabaseRestAPIKey() != "" {
+			fmt.Println(" INFO [db] DATABASE_URL not set — using Supabase REST API as fallback")
+			// Verify the app_settings table is accessible via REST
+			if err := checkAppSettingsTable(); err != nil {
+				fmt.Printf(" WARN [db] app_settings table not reachable via REST API: %v\n", err)
+				fmt.Println(" WARN [db] ensure you have run the Supabase SQL migration (see supabase/migrations/)")
+			}
+		} else {
+			fmt.Println(" INFO [db] DATABASE_URL not set — using local files as fallback")
+		}
 		return nil
 	}
 
@@ -119,6 +133,157 @@ type channelConfig struct {
 	CreatedAt   int64  `json:"created_at"`
 }
 
+// supabaseRestURL returns the Supabase REST API base URL.
+func supabaseRestURL() string {
+	if Config == nil || Config.SupabaseURL == "" {
+		return ""
+	}
+	return Config.SupabaseURL + "/rest/v1"
+}
+
+// supabaseRestAPIKey returns the Supabase anon/key.
+func supabaseRestAPIKey() string {
+	if Config == nil {
+		return ""
+	}
+	return Config.SupabaseAPIKey
+}
+
+// checkAppSettingsTable verifies the app_settings table is reachable via the
+// Supabase REST API. Returns nil on success, an error describing the problem
+// if the table cannot be queried.
+func checkAppSettingsTable() error {
+	baseURL := supabaseRestURL()
+	apiKey := supabaseRestAPIKey()
+	if baseURL == "" || apiKey == "" {
+		return fmt.Errorf("Supabase not configured")
+	}
+
+	req, err := http.NewRequest("GET",
+		baseURL+"/app_settings?key=eq.__healthcheck__&select=key&limit=1", nil)
+	if err != nil {
+		return fmt.Errorf("create health check request: %w", err)
+	}
+	req.Header.Set("apikey", apiKey)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("health check request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 404 {
+		// 404 from /rest/v1/app_settings means the table does not exist
+		return fmt.Errorf("app_settings table not found (HTTP 404)")
+	}
+	if resp.StatusCode == 401 || resp.StatusCode == 403 {
+		return fmt.Errorf("authentication failed (HTTP %d) — check SUPABASE_API_KEY and RLS policies", resp.StatusCode)
+	}
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("unexpected response (HTTP %d): %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+// saveChannelsViaRestAPI stores the channels JSON blob in the app_settings
+// table via the Supabase REST API. Used as a fallback when direct PostgreSQL
+// is not available.
+func saveChannelsViaRestAPI(data []byte) error {
+	baseURL := supabaseRestURL()
+	apiKey := supabaseRestAPIKey()
+	if baseURL == "" || apiKey == "" {
+		return fmt.Errorf("SUPABASE_URL or SUPABASE_API_KEY not set")
+	}
+
+	// The value must be a JSON array wrapped as a JSONB value.
+	// Supabase REST API expects the raw JSON for a JSONB column.
+	var rawJSON json.RawMessage
+	if err := json.Unmarshal(data, &rawJSON); err != nil {
+		return fmt.Errorf("parse channels json for rest: %w", err)
+	}
+
+	body := map[string]interface{}{
+		"key":   "dvr_channels",
+		"value": rawJSON,
+	}
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("marshal rest body: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", baseURL+"/app_settings", bytes.NewReader(bodyBytes))
+	if err != nil {
+		return fmt.Errorf("create rest request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("apikey", apiKey)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Prefer", "resolution=merge-duplicates")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("rest request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("rest api returned status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+	return nil
+}
+
+// loadChannelsViaRestAPI loads the channels JSON blob from the app_settings
+// table via the Supabase REST API.
+func loadChannelsViaRestAPI() []byte {
+	baseURL := supabaseRestURL()
+	apiKey := supabaseRestAPIKey()
+	if baseURL == "" || apiKey == "" {
+		return nil
+	}
+
+	req, err := http.NewRequest("GET", baseURL+"/app_settings?key=eq.dvr_channels&select=value", nil)
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("apikey", apiKey)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil
+	}
+
+	// Response is an array like [{"value": [...]}]
+	var entries []struct {
+		Value json.RawMessage `json:"value"`
+	}
+	if err := json.Unmarshal(body, &entries); err != nil {
+		return nil
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+
+	// entries[0].Value contains the channels JSON array as raw JSON bytes
+	return []byte(string(entries[0].Value))
+}
+
 // SaveChannelsToDB upserts the channel list to PostgreSQL and writes to local file.
 func SaveChannelsToDB(data []byte) error {
 	var configs []channelConfig
@@ -127,11 +292,15 @@ func SaveChannelsToDB(data []byte) error {
 	}
 
 	// Always write to local file as fallback
-	if err := WriteConfFile("channels.json", data); err != nil {
-		fmt.Printf("[WARN] could not save channels to local file: %v\n", err)
+	if localErr := WriteConfFile("channels.json", data); localErr != nil {
+		fmt.Printf("[WARN] could not save channels to local file: %v\n", localErr)
 	}
 
 	if db == nil {
+		// Try Supabase REST API as fallback
+		if restErr := saveChannelsViaRestAPI(data); restErr != nil {
+			fmt.Printf("[WARN] could not save channels via Supabase REST API: %v\n", restErr)
+		}
 		return nil
 	}
 
@@ -195,6 +364,11 @@ func LoadChannelsFromDB() []byte {
 		}
 	}
 
+	// Try Supabase REST API as fallback (when DATABASE_URL is not set)
+	if restData := loadChannelsViaRestAPI(); restData != nil {
+		return restData
+	}
+
 	// Fall back to local file
 	if local := ReadConfFile("channels.json"); local != nil {
 		return local
@@ -208,6 +382,10 @@ func LoadChannelsFromDB() []byte {
 // SaveSettingsToDB upserts a settings JSON blob into app_settings.
 func SaveSettingsToDB(data []byte) error {
 	if db == nil {
+		// Try Supabase REST API as fallback
+		if restErr := saveJSONSettingViaRestAPI("dvr_settings", data); restErr != nil {
+			fmt.Printf("[WARN] could not save settings via Supabase REST API: %v\n", restErr)
+		}
 		return nil
 	}
 	_, err := db.Exec(`
@@ -224,15 +402,15 @@ func SaveSettingsToDB(data []byte) error {
 
 // LoadSettingsFromDB fetches the settings blob from app_settings.
 func LoadSettingsFromDB() []byte {
-	if db == nil {
-		return nil
+	if db != nil {
+		var raw []byte
+		err := db.QueryRow(`SELECT value FROM app_settings WHERE key = 'dvr_settings'`).Scan(&raw)
+		if err == nil {
+			return raw
+		}
 	}
-	var raw []byte
-	err := db.QueryRow(`SELECT value FROM app_settings WHERE key = 'dvr_settings'`).Scan(&raw)
-	if err != nil {
-		return nil
-	}
-	return raw
+	// Try Supabase REST API as fallback
+	return loadJSONSettingViaRestAPI("dvr_settings")
 }
 
 // ─── Recordings ──────────────────────────────────────────────────────────────
@@ -262,8 +440,96 @@ type recEntryShape struct {
 	Filesize     int64             `json:"filesize"`
 }
 
+func saveJSONSettingViaRestAPI(key string, data []byte) error {
+	baseURL := supabaseRestURL()
+	apiKey := supabaseRestAPIKey()
+	if baseURL == "" || apiKey == "" {
+		return fmt.Errorf("SUPABASE_URL or SUPABASE_API_KEY not set")
+	}
+
+	var rawJSON json.RawMessage
+	if err := json.Unmarshal(data, &rawJSON); err != nil {
+		return fmt.Errorf("parse json for rest: %w", err)
+	}
+
+	body := map[string]interface{}{
+		"key":   key,
+		"value": rawJSON,
+	}
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("marshal rest body: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", baseURL+"/app_settings", bytes.NewReader(bodyBytes))
+	if err != nil {
+		return fmt.Errorf("create rest request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("apikey", apiKey)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Prefer", "resolution=merge-duplicates")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("rest request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("rest api returned status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+	return nil
+}
+
+func loadJSONSettingViaRestAPI(key string) []byte {
+	baseURL := supabaseRestURL()
+	apiKey := supabaseRestAPIKey()
+	if baseURL == "" || apiKey == "" {
+		return nil
+	}
+
+	req, err := http.NewRequest("GET", baseURL+"/app_settings?key=eq."+key+"&select=value", nil)
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("apikey", apiKey)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil
+	}
+
+	var entries []struct {
+		Value json.RawMessage `json:"value"`
+	}
+	if err := json.Unmarshal(body, &entries); err != nil {
+		return nil
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	return []byte(string(entries[0].Value))
+}
+
 func SaveRecordingsJSONToDB(data []byte) error {
 	if db == nil {
+		// Try Supabase REST API as fallback
+		if restErr := saveJSONSettingViaRestAPI("recordings_db", data); restErr != nil {
+			fmt.Printf("[WARN] could not save recordings via Supabase REST API: %v\n", restErr)
+		}
 		return nil
 	}
 	_, err := db.Exec(`
@@ -280,38 +546,32 @@ func SaveRecordingsJSONToDB(data []byte) error {
 
 // SaveRecordingsToDB syncs the recordings JSON blob to PostgreSQL.
 func SaveRecordingsToDB(data []byte) error {
-	if db == nil {
-		return nil
-	}
 	return SaveRecordingsJSONToDB(data)
 }
 
 func LoadRecordingsJSONFromDB() []byte {
-	if db == nil {
-		return nil
+	if db != nil {
+		var raw []byte
+		err := db.QueryRow(`SELECT value FROM app_settings WHERE key = 'recordings_db'`).Scan(&raw)
+		if err == nil {
+			return raw
+		}
 	}
-	var raw []byte
-	err := db.QueryRow(`SELECT value FROM app_settings WHERE key = 'recordings_db'`).Scan(&raw)
-	if err != nil {
-		return nil
-	}
-	return raw
+	// Try Supabase REST API as fallback
+	return loadJSONSettingViaRestAPI("recordings_db")
 }
 
 // LoadRecordingsFromDB fetches the recordings JSON blob from PostgreSQL.
 func LoadRecordingsFromDB() []byte {
-	if db == nil {
-		return nil
-	}
 	return LoadRecordingsJSONFromDB()
 }
 
 // ─── Tunnels ──────────────────────────────────────────────────────────────────
 
-func SaveTunnelToDB(url string, runID int) error {
+func SaveTunnelToDB(tunnelURL string, runID int) error {
 	// Always write to local file as fallback
 	tunnelData := map[string]interface{}{
-		"url":    url,
+		"url":    tunnelURL,
 		"run_id": runID,
 	}
 	if data, err := json.MarshalIndent(tunnelData, "", "  "); err == nil {
@@ -320,16 +580,22 @@ func SaveTunnelToDB(url string, runID int) error {
 		}
 	}
 
-	if db == nil {
-		return nil
+	tunnelJSON := fmt.Sprintf(`"%s"`, tunnelURL)
+	if db != nil {
+		_, err := db.Exec(`
+			INSERT INTO app_settings (key, value, updated_at)
+			VALUES ('tunnel_url', $1, NOW())
+			ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+			tunnelJSON,
+		)
+		return err
 	}
-	_, err := db.Exec(`
-		INSERT INTO app_settings (key, value, updated_at)
-		VALUES ('tunnel_url', $1, NOW())
-		ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
-		fmt.Sprintf(`"%s"`, url),
-	)
-	return err
+
+	// Try Supabase REST API as fallback
+	if restErr := saveJSONSettingViaRestAPI("tunnel_url", []byte(tunnelJSON)); restErr != nil {
+		fmt.Printf("[WARN] could not save tunnel via Supabase REST API: %v\n", restErr)
+	}
+	return nil
 }
 
 // LoadCurrentTunnel reads the tunnel URL from Supabase first,
@@ -343,6 +609,14 @@ func LoadCurrentTunnel() (string, error) {
 			if err := json.Unmarshal(raw, &tunnelURL); err == nil && tunnelURL != "" {
 				return tunnelURL, nil
 			}
+		}
+	}
+
+	// Try Supabase REST API as fallback
+	if restData := loadJSONSettingViaRestAPI("tunnel_url"); restData != nil {
+		var tunnelURL string
+		if err := json.Unmarshal(restData, &tunnelURL); err == nil && tunnelURL != "" {
+			return tunnelURL, nil
 		}
 	}
 

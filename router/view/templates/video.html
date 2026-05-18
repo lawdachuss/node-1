@@ -358,10 +358,11 @@
             </a>
             {{ end }}
             {{ range $host, $link := .Links }}
-            <a href="{{ $link }}" target="_blank" rel="noopener" class="host-badge">
+            <button onclick="embedHost('{{ $host }}')" class="host-badge"
+                    style="border:none;cursor:pointer;font-family:inherit">
                 <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
                 {{ $host }}
-            </a>
+            </button>
             {{ end }}
             {{ if .FullPath }}
             <form action="/delete_video" method="POST" onsubmit="return confirm('Permanently delete {{ .Filename | js }}?')">
@@ -481,6 +482,71 @@
 </div><!-- /page-content -->
 
 <script>
+// ── Host players data ──
+var hostPlayers = {{ .HostPlayersJSON }};
+
+function embedHost(hostName) {
+    var player = hostPlayers.find(function(p) { return p.host === hostName; });
+    if (!player) return false;
+    if (player.embedUrl) {
+        var ps = document.getElementById('player-section');
+        if (!ps) return false;
+        ps.innerHTML = '<div id="player-container" style="border-radius:16px;overflow:hidden;position:relative;padding-top:56.25%">' +
+            '<iframe src="' + player.embedUrl + '" allowfullscreen style="position:absolute;top:0;left:0;width:100%;height:100%" scrolling="no" frameborder="0" referrerpolicy="origin-when-cross-origin"></iframe>' +
+            '</div>';
+        saveLastHost(hostName);
+        return true;
+    }
+    if (player.videoUrl) {
+        var ps = document.getElementById('player-section');
+        if (!ps) return false;
+        ps.innerHTML = '<div id="player-container" data-state="loading">' +
+            '<div id="loading-spinner" style="min-height:300px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;color:#52525b">' +
+            '<svg class="w-10 h-10 animate-spin text-zinc-700" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>' +
+            '<span class="text-sm text-zinc-600">Loading video…</span></div>' +
+            '<video id="video-player" controls preload="metadata" class="hidden" onloadeddata="playerLoaded()" onerror="playerError()" crossorigin="anonymous">' +
+            '<source src="' + player.videoUrl + '" type="video/mp4" />' +
+            '</video>' +
+            '<div id="error-message" class="hidden flex-col items-center justify-center py-16 text-zinc-500">' +
+            '<svg class="w-12 h-12 mb-3" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4m0 4h.01"/></svg>' +
+            '<p class="text-sm mb-4">Could not load video directly.</p>' +
+            '<button onclick="retryVideo()" class="action-btn action-btn-ghost text-xs">Retry</button></div>' +
+            '</div>';
+        saveLastHost(hostName);
+        return true;
+    }
+    window.open(player.link, '_blank');
+    return false;
+}
+
+function saveLastHost(host) {
+    try { localStorage.setItem('lastHost_' + '{{ .Filename }}', host); } catch(e) {}
+}
+
+function restoreLastHost() {
+    try {
+        var saved = localStorage.getItem('lastHost_' + '{{ .Filename }}');
+        if (saved && hostPlayers.length) {
+            var found = hostPlayers.some(function(p) { return p.host === saved && (p.embedUrl || p.videoUrl); });
+            if (found) { embedHost(saved); return true; }
+        }
+    } catch(e) {}
+    return false;
+}
+
+// Restore last used host on page load (overrides default player)
+// Only auto-embed when there is no local file and no initial embed rendered
+{{ if and (not .FullPath) (not .EmbedURL) }}
+document.addEventListener('DOMContentLoaded', function() {
+    setTimeout(function() {
+        if (!restoreLastHost() && hostPlayers.length) {
+            var first = hostPlayers.find(function(p) { return p.embedUrl || p.videoUrl; });
+            if (first) embedHost(first.host);
+        }
+    }, 100);
+});
+{{ end }}
+
 // ── Dark mode ──
 function toggleDarkMode() {
     var isDark = document.documentElement.classList.toggle('dark');

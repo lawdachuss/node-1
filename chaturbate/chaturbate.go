@@ -219,20 +219,40 @@ func FetchStream(ctx context.Context, client *internal.Req, username string, roo
                 return nil, "", fmt.Errorf("failed to parse POST API response: %w", err)
         }
 
-        // Cache room metadata from POST API
-        if roomInfo != nil {
-                roomInfo.RoomTitle = resp.RoomTitle
-                roomInfo.Tags = resp.Tags
-                roomInfo.NumUsers = resp.NumUsers
-        }
+	// Cache room metadata from POST API
+	if roomInfo != nil {
+		roomInfo.RoomTitle = resp.RoomTitle
+		roomInfo.Tags = resp.Tags
+		roomInfo.NumUsers = resp.NumUsers
+	}
 
-        // Handle room status
-        switch resp.RoomStatus {
-        case StatusPrivate:
-                return nil, resp.RoomStatus, internal.ErrPrivateStream
-        case StatusAway, StatusOffline:
-                return nil, resp.RoomStatus, internal.ErrChannelOffline
-        }
+	// Enrich metadata from the GET API (chatvideocontext) which reliably
+	// returns tags, room_title, and num_users even when the POST endpoint
+	// only returns the HLS URL.
+	if getResp, getErr := fetchAPIResponse(ctx, client, username); getErr == nil {
+		if roomInfo != nil {
+			if getResp.RoomTitle != "" {
+				roomInfo.RoomTitle = getResp.RoomTitle
+			}
+			if len(getResp.Tags) > 0 {
+				roomInfo.Tags = getResp.Tags
+			}
+			if getResp.NumUsers > 0 {
+				roomInfo.NumUsers = getResp.NumUsers
+			}
+		}
+		if resp.RoomStatus == "" && getResp.RoomStatus != "" {
+			resp.RoomStatus = getResp.RoomStatus
+		}
+	}
+
+	// Handle room status
+	switch resp.RoomStatus {
+	case StatusPrivate:
+		return nil, resp.RoomStatus, internal.ErrPrivateStream
+	case StatusAway, StatusOffline:
+		return nil, resp.RoomStatus, internal.ErrChannelOffline
+	}
 
         // If POST API returned a public room but no HLS source, fall back to GET API.
         // This happens when Chaturbate requires cookies/auth for the POST endpoint.

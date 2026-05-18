@@ -124,32 +124,38 @@ func (m *Manager) LoadConfig() error {
 		return nil
 	}
 
-        var config []*entity.ChannelConfig
-        if err := json.Unmarshal(b, &config); err != nil {
-                return fmt.Errorf("unmarshal: %w", err)
-        }
+	var config []*entity.ChannelConfig
+	if err := json.Unmarshal(b, &config); err != nil {
+		return fmt.Errorf("unmarshal: %w", err)
+	}
 
-        seq := 0
-        for _, conf := range config {
-                ch := channel.New(conf)
-                m.Channels.Store(conf.Username, ch)
+	if len(config) == 0 {
+		return nil
+	}
 
-                // Automatically resume all channels on startup
-                if ch.Config.IsPaused {
-                        ch.Info("channel was paused, automatically resuming on startup")
-                        ch.Config.IsPaused = false
-                }
-                go ch.Resume(seq)
-                seq++
-        }
-        
-        // Save the updated config to persist the resumed state
-        if err := m.SaveConfig(); err != nil {
-                return fmt.Errorf("save config after auto-resume: %w", err)
-        }
+	seq := 0
+	for _, conf := range config {
+		ch := channel.New(conf)
+		m.Channels.Store(conf.Username, ch)
 
-        // Generate thumbnails for any existing videos that don't have one yet
-        go m.ScanThumbnails()
+		// Automatically resume all channels on startup
+		if ch.Config.IsPaused {
+			ch.Info("channel was paused, automatically resuming on startup")
+			ch.Config.IsPaused = false
+		}
+		go ch.Resume(seq)
+		seq++
+	}
+
+	// Save the updated config to persist the resumed state
+	// Only save when channels were actually loaded to prevent overwriting
+	// the file with an empty config.
+	if err := m.SaveConfig(); err != nil {
+		return fmt.Errorf("save config after auto-resume: %w", err)
+	}
+
+	// Generate thumbnails for any existing videos that don't have one yet
+	go m.ScanThumbnails()
 
         return nil
 }

@@ -77,6 +77,8 @@
         }
         .host-badge:hover { background: rgba(16,185,129,0.2); }
         .tag-badge { font-size: 9px; font-weight: 600; padding: 2px 8px; border-radius: 20px; background: rgba(139,92,246,0.1); color: #a78bfa; border: 1px solid rgba(139,92,246,0.2); }
+        .sprite-slideshow { animation: sprite-scroll 2s steps(9) infinite; }
+        @keyframes sprite-scroll { to { background-position: -900% 0%; } }
     </style>
 </head>
 <body>
@@ -182,7 +184,7 @@
         <!-- Video grid -->
         <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
             {{ range .Videos }}
-            <div class="video-card"
+            <div class="video-card group"
                  data-filename="{{ .Filename }}"
                  data-username="{{ .Username }}"
                  onclick="window.location.href='/video?path=videos%2F{{ .Filename | urlquery }}'">

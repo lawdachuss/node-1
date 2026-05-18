@@ -193,6 +193,18 @@ func main() {
 				EnvVars: []string{"FLARESOLVERR_URL"},
 				Value:   "",
 			},
+			&cli.StringFlag{
+				Name:    "supabase-url",
+				Usage:   "Supabase project URL for remote data persistence (REST API fallback)",
+				EnvVars: []string{"SUPABASE_URL"},
+				Value:   "",
+			},
+			&cli.StringFlag{
+				Name:    "supabase-api-key",
+				Usage:   "Supabase anon/public API key for REST API fallback",
+				EnvVars: []string{"SUPABASE_API_KEY"},
+				Value:   "",
+			},
                 },
                 Action: start,
         }

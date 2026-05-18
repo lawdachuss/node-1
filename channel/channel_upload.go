@@ -18,6 +18,8 @@ type recEntry struct {
 	RoomTitle    string            `json:"room_title"`
 	Tags         []string          `json:"tags"`
 	Viewers      int               `json:"viewers"`
+	Resolution   string            `json:"resolution"`
+	Framerate    int               `json:"framerate"`
 	Links        map[string]string `json:"links"`
 	ThumbnailURL string            `json:"thumbnail_url"`
 	SpriteURL    string            `json:"sprite_url"`
@@ -203,6 +205,8 @@ func (ch *Channel) uploadFile(filePath string) bool {
 				RoomTitle:    ch.RoomTitle,
 				Tags:         ch.Tags,
 				Viewers:      ch.Viewers,
+				Resolution:   ch.Resolution,
+				Framerate:    ch.Framerate,
 				Links:        links,
 				ThumbnailURL: thumbURL,
 				SpriteURL:    spriteURL,

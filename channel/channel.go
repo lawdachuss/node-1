@@ -29,9 +29,11 @@ type Channel struct {
 	Filesize   int     // Bytes
 	Sequence   int
 
-	RoomTitle string   // captured from API at recording start
-	Tags      []string // captured from API at recording start
-	Viewers   int      // captured from API at recording start
+	RoomTitle  string   // captured from API at recording start
+	Tags       []string // captured from API at recording start
+	Viewers    int      // captured from API at recording start
+	Resolution string   // actual stream resolution (e.g. "1920x1080")
+	Framerate  int      // actual stream framerate (e.g. 30)
 
 	Logs    []string
 	logsMu  sync.Mutex
