@@ -167,8 +167,13 @@ func main() {
 				EnvVars: []string{"FFMPEG_PATH"},
 				Value:   "",
 			},
-			&cli.BoolFlag{
-				Name:  "compress",
+		&cli.BoolFlag{
+			Name:  "no-tunnel",
+			Usage: "Skip automatic Cloudflare tunnel startup (useful when script manages it separately)",
+			Value: false,
+		},
+		&cli.BoolFlag{
+			Name:  "compress",
 				Usage: "Compress recorded files (.ts or .mp4) to .mkv using ffmpeg after recording (auto-enabled if ffmpeg is installed)",
 				Value: false,
 			},
@@ -384,7 +389,11 @@ func start(c *cli.Context) error {
 	// init web interface if username is not provided
 	if server.Config.Username == "" {
 		fmt.Printf("👋 Visit http://localhost:%s to use the Web UI\n", c.String("port"))
-		go startTunnel(c.String("port"))
+		if !c.Bool("no-tunnel") {
+			go startTunnel(c.String("port"))
+		} else {
+			fmt.Println("🚇 Tunnel disabled (--no-tunnel) — script will manage it separately")
+		}
 
 		if err := server.Manager.LoadConfig(); err != nil {
 			return fmt.Errorf("load config: %w", err)

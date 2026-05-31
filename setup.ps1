@@ -129,15 +129,46 @@ Write-Host "╚═════════════════════�
 Write-Host ""
 
 if (-not $NoAppStart) {
-    Write-Host "🚀 Starting chaturbate-dvr with Cloudflare tunnel..." -ForegroundColor Cyan
+    Write-Host "🚀 Starting chaturbate-dvr (local only, no tunnel)..." -ForegroundColor Cyan
     Write-Host "   Local:  http://localhost:8080" -ForegroundColor White
-    Write-Host "   (Tunnel URL will appear below once connected)" -ForegroundColor Gray
-    Write-Host "   Press Ctrl+C to stop" -ForegroundColor Gray
     Write-Host ""
 
-    $dvrProc = Start-Process -FilePath "$ProjectDir\chaturbate-dvr.exe" -NoNewWindow -PassThru
+    $dvrProc = Start-Process -FilePath "$ProjectDir\chaturbate-dvr.exe" -ArgumentList "--no-tunnel" -NoNewWindow -PassThru
+
+    Start-Sleep -Seconds 3
+
+    # ── Start Cloudflare tunnel in a NEW terminal window ──────────────
+    Write-Host "🚇 Starting Cloudflare tunnel in a new window..." -ForegroundColor Cyan
+    $tunnelScript = @'
+$logFile = "$env:TEMP\cloudflared_tunnel_url.txt"
+$p = Start-Process -FilePath "cloudflared" -ArgumentList "tunnel --url http://localhost:8080 --protocol http2" -NoNewWindow -RedirectStandardError $logFile -PassThru
+Write-Host "`n🌍 Waiting for tunnel URL..." -ForegroundColor Yellow
+$timeout = 30
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$url = $null
+while ($sw.Elapsed.TotalSeconds -lt $timeout) {
+    Start-Sleep -Milliseconds 500
+    if (Test-Path $logFile) {
+        $content = Get-Content -Path $logFile -Raw
+        if ($content -match 'https://[a-zA-Z0-9-]+\.trycloudflare\.com') {
+            $url = $matches[0]
+            break
+        }
+    }
+}
+if ($url) {
+    Write-Host "`n🌍 Public: $url" -ForegroundColor Green
+    Write-Host "   Press Ctrl+C to stop the tunnel`n" -ForegroundColor Gray
+} else {
+    Write-Host "`n⚠️  Tunnel URL not detected within $timeout seconds" -ForegroundColor Yellow
+    Write-Host "   Check $logFile for details" -ForegroundColor Gray
+}
+$p.WaitForExit()
+'@
+    Start-Process -FilePath "powershell" -ArgumentList "-NoExit", "-Command", $tunnelScript -WindowStyle Normal
+
     $dvrProc.WaitForExit()
 } else {
-    Write-Host "Run '.\chaturbate-dvr.exe' to start the app" -ForegroundColor Yellow
-    Write-Host "The tunnel starts automatically for remote access" -ForegroundColor Gray
+    Write-Host "Run '.\chaturbate-dvr.exe --no-tunnel' to start the app" -ForegroundColor Yellow
+    Write-Host "Then start the tunnel separately with: cloudflared tunnel --url http://localhost:8080" -ForegroundColor Gray
 }
