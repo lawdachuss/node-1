@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <link rel="stylesheet" href="/static/styles/app.css" />
+    <link rel="stylesheet" href="/static/styles/app.css?v=4" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link rel="dns-prefetch" href="https://img2.pixhost.to" />
@@ -36,19 +36,18 @@
         }
         .search-input {
             background: rgba(255,255,255,0.04);
-            border: 1px solid rgba(255,255,255,0.06);
             border-radius: 12px;
             color: #e4e4e7;
             font-size: 13px;
-            padding: 9px 14px 9px 38px;
+            padding: 9px 14px 9px 42px;
             width: 100%;
-            transition: all 0.25s cubic-bezier(0.4,0,0.2,1);
+            transition: background 0.25s cubic-bezier(0.4,0,0.2,1), width 0.25s cubic-bezier(0.4,0,0.2,1);
         }
         @media (min-width: 640px) {
             .search-input { width: 240px; }
             .search-input:focus { width: 300px; }
         }
-        .search-input:focus { outline: none; background: rgba(255,255,255,0.06); border-color: rgba(212,160,83,0.4); box-shadow: 0 0 0 4px rgba(212,160,83,0.08), 0 0 20px rgba(212,160,83,0.05); }
+        .search-input:focus { outline: none; background: rgba(255,255,255,0.06); }
         .search-input::placeholder { color: #3f3f46; }
         .filter-btn {
             display: inline-flex; align-items: center; gap: 6px;
@@ -72,6 +71,16 @@
         .dropdown-item:hover { background: rgba(255,255,255,0.05); color: #e4e4e7; }
         .dropdown-item.active { color: #d4a053; background: rgba(212,160,83,0.08); }
         .group-header-line { background: rgba(255,255,255,0.04); }
+
+        /* ── Nav Button ── */
+        .nav-btn {
+            display: inline-flex; align-items: center; justify-content: center;
+            border-radius: 10px; cursor: pointer;
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(255,255,255,0.06);
+            color: #71717a; transition: all 0.2s;
+        }
+        .nav-btn:hover { background: rgba(255,255,255,0.08); color: #d4d4d8; border-color: rgba(255,255,255,0.1); }
 
         /* ── Video Card ── */
         .video-card {
@@ -257,12 +266,14 @@
         html:not(.dark) .uploaded-badge { background: rgba(16,185,129,0.12) !important; color: #059669 !important; border-color: rgba(16,185,129,0.25) !important; }
         html:not(.dark) .delete-btn { background: rgba(0,0,0,0.04); border-color: #e4e4e7; color: #71717a; }
         html:not(.dark) .dropdown-container { background: #ffffff; border-color: #e4e4e7; box-shadow: 0 8px 32px rgba(0,0,0,0.12); }
+        html:not(.dark) .nav-btn { background: rgba(0,0,0,0.04); border-color: #e4e4e7; color: #71717a; }
+        html:not(.dark) .nav-btn:hover { background: rgba(0,0,0,0.07); color: #18181b; border-color: #d4d4d8; }
         html:not(.dark) .dropdown-item { color: #52525b; }
         html:not(.dark) .dropdown-item:hover { background: #f4f4f5; color: #18181b; }
         html:not(.dark) .dropdown-item.active { color: #b45309; background: rgba(212,160,83,0.1); }
         html:not(.dark) .group-header-line { background: #f4f4f5; }
         html:not(.dark) [id="channel-filter-dropdown"] > button { background: rgba(0,0,0,0.04); border-color: #e4e4e7; color: #52525b; }
-        html:not(.dark) input[type="text"] { background: #ffffff !important; border-color: #e4e4e7 !important; color: #18181b !important; }
+        html:not(.dark) input[type="text"] { background: #ffffff !important; color: #18181b !important; }
         html:not(.dark) input[type="text"]::placeholder { color: #9ca3af; }
     </style>
 </head>
@@ -284,7 +295,7 @@
 
         <div class="flex items-center gap-2">
             <div class="relative w-full sm:w-auto">
-                <svg class="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-600 pointer-events-none" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+                <svg class="absolute left-3.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-600 pointer-events-none" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
                 <input type="text" id="search-input" class="search-input w-full sm:w-[240px]" placeholder="Search videos…" oninput="filterSearch(this.value)" />
             </div>
 
@@ -423,7 +434,7 @@
             <div class="flex items-center gap-2.5 shrink-0">
                 <div class="w-8 h-8 rounded-full flex items-center justify-center shrink-0 text-[11px] font-black text-white"
                      style="background:linear-gradient(135deg,#d4a053,#a07830)">
-                    {{ slice .Username 0 1 }}
+                    {{ if .Username }}{{ slice .Username 0 1 }}{{ else }}?{{ end }}
                 </div>
                 <div>
                     <a href="/channel?name={{ .Username }}" class="text-sm font-bold text-zinc-100 hover:text-amber-400 transition-colors font-['Outfit']">{{ .Username }}</a>

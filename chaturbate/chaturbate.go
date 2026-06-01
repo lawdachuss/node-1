@@ -126,9 +126,10 @@ func fetchAPIResponse(ctx context.Context, client *internal.Req, username string
 		return nil
 	},
 		retry.Context(ctx),
-		retry.Attempts(3),
+		retry.Attempts(5),
 		retry.Delay(1*time.Second),
-		retry.DelayType(retry.FixedDelay),
+		retry.MaxDelay(10*time.Second),
+		retry.DelayType(retry.BackOffDelay),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get API response: %w", err)
@@ -628,9 +629,10 @@ func (p *Playlist) processMediaPlaylist(ctx context.Context, client *internal.Re
 				return client.GetBytes(ctx, initURL)
 			},
 			retry.Context(ctx),
-			retry.Attempts(3),
-			retry.Delay(600*time.Millisecond),
-			retry.DelayType(retry.FixedDelay),
+			retry.Attempts(5),
+			retry.Delay(1*time.Second),
+			retry.MaxDelay(10*time.Second),
+			retry.DelayType(retry.BackOffDelay),
 		)
 		if initErr != nil {
 			return 0, fmt.Errorf("fetch init segment: %w", initErr)
@@ -658,9 +660,10 @@ func (p *Playlist) processMediaPlaylist(ctx context.Context, client *internal.Re
 				return client.GetBytes(ctx, segmentURL)
 			},
 			retry.Context(ctx),
-			retry.Attempts(3),
-			retry.Delay(600*time.Millisecond),
-			retry.DelayType(retry.FixedDelay),
+			retry.Attempts(5),
+			retry.Delay(1*time.Second),
+			retry.MaxDelay(10*time.Second),
+			retry.DelayType(retry.BackOffDelay),
 		)
 		if err != nil {
 			// Return the error instead of silently breaking.

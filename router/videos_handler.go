@@ -7,6 +7,7 @@ import (
         "path/filepath"
         "sort"
         "strings"
+        "sync"
         "time"
 
         "github.com/gin-gonic/gin"
@@ -14,6 +15,43 @@ import (
         "github.com/teacat/chaturbate-dvr/internal"
         "github.com/teacat/chaturbate-dvr/server"
 )
+
+// videosCache caches the full scanVideos() result to avoid repeated
+// filesystem walks and DB calls on every page load.
+var (
+        videosCacheMu   sync.RWMutex
+        cachedVideos    []*VideoEntry
+        cachedVideosAt  time.Time
+        videosCacheTTL  = 10 * time.Second
+)
+
+// InvalidateVideosCache forces the next /videos request to rescan.
+// Call this after a recording is saved or deleted.
+func InvalidateVideosCache() {
+        videosCacheMu.Lock()
+        cachedVideos = nil
+        cachedVideosAt = time.Time{}
+        videosCacheMu.Unlock()
+}
+
+func scanVideosCached() []*VideoEntry {
+        videosCacheMu.RLock()
+        if cachedVideos != nil && time.Since(cachedVideosAt) < videosCacheTTL {
+                result := cachedVideos
+                videosCacheMu.RUnlock()
+                return result
+        }
+        videosCacheMu.RUnlock()
+
+        result := scanVideos()
+
+        videosCacheMu.Lock()
+        cachedVideos = result
+        cachedVideosAt = time.Now()
+        videosCacheMu.Unlock()
+
+        return result
+}
 
 type RecordingEntry struct {
         Filename     string            `json:"filename"`
@@ -76,7 +114,7 @@ type VideosData struct {
 }
 
 func Videos(c *gin.Context) {
-        videos := scanVideos()
+        videos := scanVideosCached()
 
         // Filter by tag if provided
         tagFilter := c.Query("tag")
@@ -110,6 +148,7 @@ func Videos(c *gin.Context) {
                 recommended = sorted[:limit]
         }
 
+        c.Header("Cache-Control", "public, max-age=5")
         c.HTML(200, "videos.html", &VideosData{
                 Config:      server.Config,
                 Videos:      videos,
@@ -126,7 +165,7 @@ func ChannelVideos(c *gin.Context) {
                 return
         }
 
-        videos := scanVideos()
+        videos := scanVideosCached()
         filtered := make([]*VideoEntry, 0)
         for _, v := range videos {
                 if strings.EqualFold(v.Username, name) {

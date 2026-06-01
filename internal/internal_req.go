@@ -141,7 +141,7 @@ func (h *Req) Head(ctx context.Context, url string) (int, error) {
 
 // CreateRequest constructs an HTTP GET request with necessary headers.
 func CreateRequest(ctx context.Context, url string) (*http.Request, context.CancelFunc, error) {
-	ctx, cancel := context.WithTimeout(ctx, 20*time.Second) // increased from 10s: transient CDN latency on GH Actions runners was causing spurious timeouts on large segments
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second) // CDN edge servers can have high latency during peak hours
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {

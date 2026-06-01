@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <link rel="stylesheet" href="/static/styles/app.css" />
+    <link rel="stylesheet" href="/static/styles/app.css?v=4" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link rel="dns-prefetch" href="https://img2.pixhost.to" />
@@ -14,7 +14,7 @@
     <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32x32.png">
     <link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16x16.png">
     <link rel="manifest" href="/static/site.webmanifest">
-    <title>Chaturbate DVR</title>
+    <title>StreamBate</title>
     <script>
         (function() {
             if (localStorage.getItem('darkMode') === 'true' ||
@@ -26,6 +26,15 @@
     <style>
         body { background-color: var(--bg-body); }
         .sidebar-bg { background: var(--bg-surface-alt); }
+        .sidebar-btn {
+            background: var(--bg-button);
+            border: 1px solid var(--border-subtle);
+            color: var(--text-button);
+        }
+        .sidebar-btn:hover {
+            background: var(--bg-button-hover);
+            color: var(--text-button-hover);
+        }
         .main-bg { background: var(--bg-surface); }
         .panel-bg { background: rgba(18,18,22,0.95); }
         .log-bg { background: var(--bg-card); }
@@ -285,22 +294,29 @@
         <div class="absolute top-0 left-1/2 -translate-x-1/2 w-32 h-32 rounded-full bg-amber-600/5 blur-3xl pointer-events-none"></div>
 
         <!-- Header -->
-        <div class="relative px-4 pt-5 pb-4 border-b border-white/[0.05]">
-            <div class="flex items-center gap-2.5 mb-1">
+        <div class="relative px-4 pt-5 pb-4">
+            <div class="flex items-center gap-2.5 mb-3">
                 <div class="relative">
                     <span class="w-2 h-2 rounded-full bg-amber-500 brand-dot block shrink-0"></span>
                 </div>
-                <h1 class="text-[11px] font-black uppercase tracking-[0.2em] text-zinc-100">Chaturbate DVR</h1>
+                <h1 class="text-[11px] font-black uppercase tracking-[0.2em] text-[var(--text-primary)]">StreamBate</h1>
             </div>
-            <div class="text-[10px] text-zinc-600 uppercase tracking-wider mt-0.5 pl-4" id="recording-counter"></div>
+            <!-- Channel search -->
+            <div class="relative">
+                <svg class="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-[var(--text-muted)] pointer-events-none" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
+                    <circle cx="11" cy="11" r="7"/><path d="M18 18l-3.5-3.5"/>
+                </svg>
+                <input type="text" id="channel-search" placeholder="Search channels..."
+                       class="w-full text-[12px] pr-3 py-1.5 rounded-lg focus:outline-none"
+                       style="background:var(--bg-input);color:var(--text-primary);padding-left:2.25rem"
+                       oninput="filterChannels(this.value)" />
+            </div>
+            <div class="text-[10px] text-[var(--text-muted)] uppercase tracking-wider mt-2 pl-4" id="recording-counter"></div>
 
             <!-- Action buttons -->
             <div class="flex gap-2 mt-4">
                 <button onclick="document.getElementById('settings-dialog').showModal()"
-                        class="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 text-[11px] font-medium rounded-lg transition-all"
-                        style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.07);color:#71717a"
-                        onmouseenter="this.style.background='rgba(255,255,255,0.07)';this.style.color='#d4d4d8'"
-                        onmouseleave="this.style.background='rgba(255,255,255,0.04)';this.style.color='#71717a'">
+                        class="sidebar-btn flex-1 flex items-center justify-center gap-1.5 px-3 py-2 text-[11px] font-medium rounded-lg transition-all">
                     <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
                         <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/>
                     </svg>
@@ -685,6 +701,26 @@
 
 <script>
 // ════════════════════════════════════════════════════
+// CHANNEL SEARCH
+// ════════════════════════════════════════════════════
+function filterChannels(query) {
+    var q = query.toLowerCase().trim();
+    var items = document.querySelectorAll('.channel-item');
+    items.forEach(function(item) {
+        var username = (item.dataset.username || '').toLowerCase();
+        if (!q || username.indexOf(q) !== -1) {
+            item.style.display = '';
+        } else {
+            item.style.display = 'none';
+        }
+    });
+    // Also hide section labels when searching
+    document.querySelectorAll('[data-channel-section]').forEach(function(label) {
+        label.style.display = q ? 'none' : '';
+    });
+}
+
+// ════════════════════════════════════════════════════
 // DARK MODE
 // ════════════════════════════════════════════════════
 function toggleDarkMode() {
@@ -744,21 +780,29 @@ var LOG_MSG_RULES = [
     { re: /^channel resumed/i,                 type: 'play',      color: '#34d399' },
     { re: /^channel (?:paused|stopped)/i,      type: 'stop',      color: '#fb7185' },
     // Upload
-    { re: /^upload:/i,                         type: 'upload',    color: '#60a5fa' },
+    { re: /^upload:/i,                         type: 'upload',    color: '#7dd3fc' },
+    { re: /^upload (?:complete|started|failed|retrying)/i, type: 'upload', color: '#7dd3fc' },
+    { re: /^queued for upload/i,              type: 'upload',    color: '#7dd3fc' },
     // Compress
     { re: /^compress:/i,                       type: 'compress',  color: '#c084fc' },
+    { re: /^encoding/i,                        type: 'compress',  color: '#c084fc' },
     // Mux
     { re: /^mux:/i,                            type: 'mux',       color: '#22d3ee' },
+    { re: /^merging/i,                         type: 'mux',       color: '#22d3ee' },
     // Thumbnail / preview
     { re: /^thumbnail:/i,                      type: 'thumbnail', color: '#f472b6' },
     { re: /^preview:/i,                        type: 'thumbnail', color: '#f472b6' },
     { re: /^sprite:/i,                         type: 'thumbnail', color: '#f472b6' },
+    { re: /^generating (?:thumbnail|preview)/i, type: 'thumbnail', color: '#f472b6' },
     // File / output
     { re: /^delete:/i,                         type: 'delete',    color: '#f87171' },
+    { re: /^removed/i,                         type: 'delete',    color: '#f87171' },
     { re: /^output-dir:/i,                     type: 'file',      color: '#fbbf24' },
     { re: /^file:/i,                           type: 'file',      color: '#fbbf24' },
     { re: /^max filesize or duration/i,        type: 'file',      color: '#fbbf24' },
     { re: /^new file created/i,                type: 'file',      color: '#fbbf24' },
+    { re: /^saved/i,                           type: 'file',      color: '#fbbf24' },
+    { re: /^writing/i,                         type: 'file',      color: '#fbbf24' },
     // Status / stream quality
     { re: /^stream quality/i,                  type: 'status',    color: '#2dd4bf' },
     { re: /^channel status:/i,                 type: 'status',    color: '#2dd4bf' },
@@ -766,8 +810,18 @@ var LOG_MSG_RULES = [
     { re: /^status:/i,                         type: 'status',    color: '#2dd4bf' },
     { re: /^detected separate audio/i,         type: 'mux',       color: '#22d3ee' },
     { re: /^channel was paused/i,              type: 'status',    color: '#a78bfa' },
+    { re: /^connection/i,                      type: 'status',    color: '#2dd4bf' },
+    { re: /^reconnect/i,                       type: 'status',    color: '#fbbf24' },
+    { re: /^waiting for/i,                     type: 'status',    color: '#a1a1aa' },
+    { re: /^checking/i,                        type: 'status',    color: '#a1a1aa' },
+    { re: /^polling/i,                         type: 'status',    color: '#a1a1aa' },
+    { re: /^scanning/i,                        type: 'status',    color: '#2dd4bf' },
+    // Cloudflare
+    { re: /^cf[_ ]?clearance/i,                type: 'cf',        color: '#fb923c' },
+    { re: /^cloudflare/i,                      type: 'cf',        color: '#fb923c' },
+    { re: /^cookie/i,                          type: 'cf',        color: '#fb923c' },
     // Progress (suppress / dim)
-    { re: /^duration:/i,                       type: 'info',      color: '#3f3f46' },
+    { re: /^duration:/i,                       type: 'info',      color: '#52525b' },
 ];
 
 var LOG_LEVEL_STYLE = {
@@ -786,26 +840,62 @@ function getLogMeta(level, msg) {
             return { type: LOG_MSG_RULES[i].type, msgColor: LOG_MSG_RULES[i].color, levelStyle: ls };
         }
     }
-    return { type: 'info', msgColor: '#3a3a3f', levelStyle: ls };
+    return { type: 'info', msgColor: '#52525b', levelStyle: ls };
 }
 
-// Highlight keywords within a message string (returns HTML)
+// Highlight keywords within a message string (returns HTML).
+// IMPORTANT: bracket/host badges MUST be done first (before any other
+// replacement injects HTML containing ']'), otherwise later regexes
+// match across HTML attribute boundaries and corrupt the output.
 function highlightMsg(msg, baseColor) {
     // Escape HTML first
     var safe = msg.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+    // ── STEP 1: Bracket badges (must be first — other rules inject ']') ──
+    // Upload host names in brackets [GoFile], [VOE.sx] etc → per-host colored badge
+    var HOST_COLORS = {
+        'GoFile':     { fg: '#34d399', bg: 'rgba(52,211,153,0.1)'  },  // green
+        'VOE.sx':     { fg: '#f472b6', bg: 'rgba(244,114,182,0.1)' },  // pink
+        'VoeSX':      { fg: '#f472b6', bg: 'rgba(244,114,182,0.1)' },  // pink
+        'TurboViPlay':{ fg: '#a78bfa', bg: 'rgba(167,139,250,0.1)' },  // violet
+        'SendCM':     { fg: '#fb923c', bg: 'rgba(251,146,60,0.1)'  },  // orange
+        'Byse':       { fg: '#22d3ee', bg: 'rgba(34,211,238,0.1)'  },  // cyan
+        'GitHub':     { fg: '#e4e4e7', bg: 'rgba(228,228,231,0.08)'},  // white
+        'Streamtape': { fg: '#fbbf24', bg: 'rgba(251,191,36,0.1)'  },  // amber
+        'Mixdrop':    { fg: '#c084fc', bg: 'rgba(192,132,252,0.1)' },  // purple
+        'PixelDrain': { fg: '#60a5fa', bg: 'rgba(96,165,250,0.1)'  },  // blue
+    };
+    safe = safe.replace(/\[(GoFile|VOE\.sx|VoeSX|TurboViPlay|SendCM|Byse|GitHub|Streamtape|Mixdrop|PixelDrain)\]/g,
+        function(m, host) {
+            var c = HOST_COLORS[host] || { fg: '#94a3b8', bg: 'rgba(148,163,184,0.1)' };
+            return '<span style="color:' + c.fg + ';background:' + c.bg + ';padding:0 4px;border-radius:3px;font-size:10px;font-weight:600">[' + host + ']</span>';
+        });
+
+    // ── STEP 2: Everything else (safe — no ']' in injected HTML) ──
     // Backtick strings → orange mono
     safe = safe.replace(/`([^`]+)`/g, '<span style="color:#fb923c;font-family:ui-monospace,monospace;background:rgba(251,146,60,0.08);padding:0 3px;border-radius:3px">$1</span>');
-    // Upload host names in brackets [GoFile], [VOE.sx] etc → styled badge
-    safe = safe.replace(/\[(GoFile|VOE\.sx|VoeSX|TurboViPlay|SendCM|Byse|GitHub)\]/g,
-        '<span style="color:#94a3b8;background:rgba(148,163,184,0.1);padding:0 4px;border-radius:3px;font-size:10px;font-weight:600">[$1]</span>');
-    // Encoder names (NVENC, AMF, QSV, VideoToolbox, CPU) → highlighted
-    safe = safe.replace(/\b(NVENC|AMF|QSV|VideoToolbox|CPU|libx264|h264_nvenc|h264_amf|h264_qsv)\b/g,
+    // Status keywords → colored
+    safe = safe.replace(/\b(success(?:ful|fully)?|complete(?:d)?|done|finished)\b/gi,
+        '<span style="color:#34d399;font-weight:600">$1</span>');
+    safe = safe.replace(/\b(fail(?:ed|ing)?|error|err)\b/gi,
+        '<span style="color:#f87171;font-weight:600">$1</span>');
+    safe = safe.replace(/\b(warn(?:ing)?|caution)\b/gi,
+        '<span style="color:#fbbf24;font-weight:600">$1</span>');
+    safe = safe.replace(/\b(ignored)\b/gi,
+        '<span style="color:#a1a1aa;font-weight:600">$1</span>');
+    // Action keywords → teal
+    safe = safe.replace(/\b(start(?:ed|ing)?|stopp(?:ed|ing)?|creat(?:ed|ing)?|remov(?:ed|ing)?|delet(?:ed|ing)?|resum(?:ed|ing)?|paus(?:ed|ing)?|queu(?:ed|ing)?|upload(?:ed|ing)?|download(?:ed|ing)?|merg(?:ed|ing)?|encod(?:ed|ing)?|compress(?:ed|ing)?|finished|skipp(?:ed|ing)?)\b/gi,
+        '<span style="color:#2dd4bf;font-weight:600">$1</span>');
+    // Encoder/tech names → violet
+    safe = safe.replace(/\b(NVENC|AMF|QSV|VideoToolbox|CPU|libx264|h264_nvenc|h264_amf|h264_qsv|ffmpeg|ffprobe|streamlink|yt-dlp|hls|rtmp)\b/gi,
         '<span style="color:#c084fc;font-weight:600">$1</span>');
     // URLs → dim link-style
     safe = safe.replace(/(https?:\/\/[^\s<]+)/g,
         '<span style="color:#60a5fa;text-decoration:underline;text-underline-offset:2px;opacity:0.8">$1</span>');
     // File names (e.g. foo.mp4, bar.ts) → amber mono
-    safe = safe.replace(/\b([\w.\-]+\.(?:ts|mp4|mkv|webm|avi|mov))\b/g, '<span style="color:#fbbf24;font-family:ui-monospace,monospace">$1</span>');
+    safe = safe.replace(/\b([\w.\-]+\.(?:ts|mp4|mkv|webm|avi|mov|m3u8|jpg|png))\b/g, '<span style="color:#fbbf24;font-family:ui-monospace,monospace">$1</span>');
+    // Bitrate values (e.g. 4500 kbps, 2.5 Mbps) → pink
+    safe = safe.replace(/\b(\d+(?:\.\d+)?)\s*(kbps|mbps|bps)\b/gi, '<span style="color:#f472b6;font-weight:600">$1 $2</span>');
     // Sizes: 1.2 MB / 512 KB → cyan
     safe = safe.replace(/(\d+(?:\.\d+)?)\s*(KB|MB|GB|TB|B)\b/g, '<span style="color:#22d3ee;font-weight:600">$1 $2</span>');
     // Durations HH:MM:SS or MM:SS → cyan
@@ -813,7 +903,7 @@ function highlightMsg(msg, baseColor) {
     // Resolution Np (e.g. 1080p, 720p) → violet
     safe = safe.replace(/\b(\d{3,4})p\b/g, '<span style="color:#a78bfa;font-weight:600">$1p</span>');
     // FPS → violet
-    safe = safe.replace(/\b(\d+)\s*(?:fps|@\s*\d+fps)/g, function(m, n) { return '<span style="color:#a78bfa;font-weight:600">' + m + '</span>'; });
+    safe = safe.replace(/\b(\d+)\s*(?:fps|@\s*\d+fps)/g, function(m) { return '<span style="color:#a78bfa;font-weight:600">' + m + '</span>'; });
     // Viewer counts → teal
     safe = safe.replace(/\b(\d+)\s+viewers?\b/g, '<span style="color:#2dd4bf;font-weight:600">$1 viewers</span>');
     // Percentages → yellow
