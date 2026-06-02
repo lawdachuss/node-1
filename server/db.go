@@ -584,7 +584,7 @@ func LoadCurrentTunnel() (string, error) {
 // ─── Preview Links ────────────────────────────────────────────────────────────
 
 // SavePreviewLinks saves preview image URLs to Supabase
-func SavePreviewLinks(filename, thumbnailURL, spriteURL string) error {
+func SavePreviewLinks(filename, thumbnailURL, spriteURL, previewURL string) error {
 	client := GetDBClient()
 	if client == nil {
 		return fmt.Errorf("Supabase not configured")
@@ -594,6 +594,7 @@ func SavePreviewLinks(filename, thumbnailURL, spriteURL string) error {
 		Filename:     filename,
 		ThumbnailURL: thumbnailURL,
 		SpriteURL:    spriteURL,
+		PreviewURL:   previewURL,
 		UploadedAt:   time.Now().UTC().Format("2006-01-02T15:04:05Z"),
 	}
 
@@ -606,25 +607,25 @@ func SavePreviewLinks(filename, thumbnailURL, spriteURL string) error {
 }
 
 // LoadPreviewLinks loads preview image URLs from Supabase
-func LoadPreviewLinks(filename string) (thumbnailURL, spriteURL string) {
-        client := GetDBClient()
-        if client == nil {
-                return "", ""
-        }
+func LoadPreviewLinks(filename string) (thumbnailURL, spriteURL, previewURL string) {
+	client := GetDBClient()
+	if client == nil {
+		return "", "", ""
+	}
 
-        img, err := client.GetPreviewImage(filename)
-        if err != nil {
-                return "", ""
-        }
+	img, err := client.GetPreviewImage(filename)
+	if err != nil {
+		return "", "", ""
+	}
 
-        return img.ThumbnailURL, img.SpriteURL
+	return img.ThumbnailURL, img.SpriteURL, img.PreviewURL
 }
 
-// LoadAllPreviewLinks returns a map of filename -> [thumbnailURL, spriteURL] for all preview images.
+// LoadAllPreviewLinks returns a map of filename -> [thumbnailURL, spriteURL, previewURL] for all preview images.
 // Use this instead of calling LoadPreviewLinks in a loop to avoid N+1 queries.
-func LoadAllPreviewLinks() map[string][2]string {
+func LoadAllPreviewLinks() map[string][3]string {
 	if data := cacheGet("preview_links"); data != nil {
-		var result map[string][2]string
+		var result map[string][3]string
 		if err := json.Unmarshal(data, &result); err == nil {
 			return result
 		}
@@ -641,10 +642,10 @@ func LoadAllPreviewLinks() map[string][2]string {
 		return nil
 	}
 
-	result := make(map[string][2]string, len(images))
+	result := make(map[string][3]string, len(images))
 	for _, img := range images {
-		if img.Filename != "" && (img.ThumbnailURL != "" || img.SpriteURL != "") {
-			result[img.Filename] = [2]string{img.ThumbnailURL, img.SpriteURL}
+		if img.Filename != "" && (img.ThumbnailURL != "" || img.SpriteURL != "" || img.PreviewURL != "") {
+			result[img.Filename] = [3]string{img.ThumbnailURL, img.SpriteURL, img.PreviewURL}
 		}
 	}
 
@@ -673,15 +674,16 @@ func DeleteChannelsNotInDB(usernames []string) error {
         return client.DeleteChannelsNotIn(usernames)
 }
 
-// UpdateRecordingThumbnails patches the thumbnail_url and sprite_url on an
+// UpdateRecordingThumbnails patches the thumbnail_url, sprite_url and preview_url on an
 // existing recording row identified by filename.
-func UpdateRecordingThumbnails(filename, thumbnailURL, spriteURL string) error {
-	if thumbnailURL == "" && spriteURL == "" {
+func UpdateRecordingThumbnails(filename, thumbnailURL, spriteURL, previewURL string) error {
+	if thumbnailURL == "" && spriteURL == "" && previewURL == "" {
 		return nil
 	}
 	body, err := json.Marshal(map[string]string{
 		"thumbnail_url": thumbnailURL,
 		"sprite_url":    spriteURL,
+		"preview_url":   previewURL,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)

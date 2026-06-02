@@ -210,6 +210,6 @@ func (fw *FileWatcher) processFile(filePath string) {
 	log.Printf("[watcher] processing new file %s", base)
 
 	// Generate thumbnails and upload
-	thumbURL, spriteURL := channel.GenerateThumbnailForFile(filePath)
-	channel.UploadOrphanedFile(filePath, thumbURL, spriteURL)
+	thumbURL, spriteURL, previewURL := channel.GenerateThumbnailForFile(filePath)
+	channel.UploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL)
 }

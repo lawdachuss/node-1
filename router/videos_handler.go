@@ -54,19 +54,20 @@ func scanVideosCached() []*VideoEntry {
 }
 
 type RecordingEntry struct {
-        Filename     string            `json:"filename"`
-        FullPath     string            `json:"full_path,omitempty"`
-        Timestamp    string            `json:"timestamp"`
-        RoomTitle    string            `json:"room_title"`
-        Tags         []string          `json:"tags"`
-        Viewers      int               `json:"viewers"`
-        Resolution   string            `json:"resolution"`
-        Framerate    int               `json:"framerate"`
-        Links        map[string]string `json:"links"`
-        ThumbnailURL string            `json:"thumbnail_url"`
-        SpriteURL    string            `json:"sprite_url"`
-        EmbedURL     string            `json:"embed_url"`
-        Filesize     int64             `json:"filesize"`
+	Filename     string            `json:"filename"`
+	FullPath     string            `json:"full_path,omitempty"`
+	Timestamp    string            `json:"timestamp"`
+	RoomTitle    string            `json:"room_title"`
+	Tags         []string          `json:"tags"`
+	Viewers      int               `json:"viewers"`
+	Resolution   string            `json:"resolution"`
+	Framerate    int               `json:"framerate"`
+	Links        map[string]string `json:"links"`
+	ThumbnailURL string            `json:"thumbnail_url"`
+	SpriteURL    string            `json:"sprite_url"`
+	PreviewURL   string            `json:"preview_url"`
+	EmbedURL     string            `json:"embed_url"`
+	Filesize     int64             `json:"filesize"`
 }
 
 type ChannelRecordings struct {
@@ -80,22 +81,23 @@ type RecordingsDB struct {
 }
 
 type VideoEntry struct {
-        Username     string
-        Filename     string
-        FullPath     string
-        Size         string
-        ModTime      string
-        ModTimeSort  string
-        ThumbnailURL string
-        SpriteURL    string
-        IsOutputDir  bool
-        Links       map[string]string
-        Tags        []string
-        RoomTitle   string
-        Viewers     int
-        Gender      string
-        Resolution  string
-        Framerate   int
+	Username     string
+	Filename     string
+	FullPath     string
+	Size         string
+	ModTime      string
+	ModTimeSort  string
+	ThumbnailURL string
+	SpriteURL    string
+	PreviewURL   string
+	IsOutputDir  bool
+	Links       map[string]string
+	Tags        []string
+	RoomTitle   string
+	Viewers     int
+	Gender      string
+	Resolution  string
+	Framerate   int
 }
 
 type VideoGroup struct {
@@ -225,12 +227,15 @@ func scanVideos() []*VideoEntry {
                                                 e.Gender = chanData.Gender
                                                 e.Resolution = rec.Resolution
                                                 e.Framerate = rec.Framerate
-                                                if rec.ThumbnailURL != "" {
-                                                        e.ThumbnailURL = rec.ThumbnailURL
-                                                }
-                                                if rec.SpriteURL != "" {
-                                                        e.SpriteURL = rec.SpriteURL
-                                                }
+						if rec.ThumbnailURL != "" {
+							e.ThumbnailURL = rec.ThumbnailURL
+						}
+						if rec.SpriteURL != "" {
+							e.SpriteURL = rec.SpriteURL
+						}
+						if rec.PreviewURL != "" {
+							e.PreviewURL = rec.PreviewURL
+						}
                                         }
                                 }
                                 continue
@@ -242,40 +247,45 @@ func scanVideos() []*VideoEntry {
                         // For uploaded-only entries, supplement thumbnail/sprite from
                         // the preview_images table (previewLinks) if the recordings
                         // table has empty URLs (they are stored separately).
-                        thumbURL := rec.ThumbnailURL
-                        spriteURL := rec.SpriteURL
-                        if links, ok := previewLinks[filename]; ok {
-                                if thumbURL == "" && links[0] != "" {
-                                        thumbURL = links[0]
-                                }
-                                if spriteURL == "" && links[1] != "" {
-                                        spriteURL = links[1]
-                                }
-                        }
+			thumbURL := rec.ThumbnailURL
+			spriteURL := rec.SpriteURL
+			previewURL := rec.PreviewURL
+			if links, ok := previewLinks[filename]; ok {
+				if thumbURL == "" && links[0] != "" {
+					thumbURL = links[0]
+				}
+				if spriteURL == "" && links[1] != "" {
+					spriteURL = links[1]
+				}
+				if previewURL == "" && len(links) > 2 && links[2] != "" {
+					previewURL = links[2]
+				}
+			}
                         modTime := rec.Timestamp
                         if t, err := time.Parse(time.RFC3339, rec.Timestamp); err == nil {
                                 modTime = t.Format("2006-01-02 15:04")
                         } else if t, err := time.Parse("2006-01-02T15:04:05Z", rec.Timestamp); err == nil {
                                 modTime = t.Format("2006-01-02 15:04")
                         }
-                        entries = append(entries, &VideoEntry{
-                                Username:     username,
-                                Filename:     filename,
-                                FullPath:     "",
-                                Size:         fs,
-                                ModTime:      modTime,
-                                ModTimeSort:  rec.Timestamp,
-                                IsOutputDir:  false,
-                                Links:        rec.Links,
-                                Tags:         rec.Tags,
-                                RoomTitle:    rec.RoomTitle,
-                                Viewers:      rec.Viewers,
-                                Gender:       chanData.Gender,
-                                Resolution:   rec.Resolution,
-                                Framerate:    rec.Framerate,
-                                ThumbnailURL: thumbURL,
-                                SpriteURL:    spriteURL,
-                        })
+			entries = append(entries, &VideoEntry{
+				Username:     username,
+				Filename:     filename,
+				FullPath:     "",
+				Size:         fs,
+				ModTime:      modTime,
+				ModTimeSort:  rec.Timestamp,
+				IsOutputDir:  false,
+				Links:        rec.Links,
+				Tags:         rec.Tags,
+				RoomTitle:    rec.RoomTitle,
+				Viewers:      rec.Viewers,
+				Gender:       chanData.Gender,
+				Resolution:   rec.Resolution,
+				Framerate:    rec.Framerate,
+				ThumbnailURL: thumbURL,
+				SpriteURL:    spriteURL,
+				PreviewURL:   previewURL,
+			})
                 }
         }
 
@@ -300,7 +310,7 @@ func loadRecordings() *RecordingsDB {
         return &db
 }
 
-func walkDir(dir string, previewLinks map[string][2]string) []*VideoEntry {
+func walkDir(dir string, previewLinks map[string][3]string) []*VideoEntry {
         var entries []*VideoEntry
 
         d, err := os.Open(dir)
@@ -343,24 +353,28 @@ func walkDir(dir string, previewLinks map[string][2]string) []*VideoEntry {
                         isOutput = strings.HasPrefix(absPath, absOut)
                 }
 
-                // Look up preview URLs from preloaded map
-                var thumbURL, spriteURL string
-                if links, ok := previewLinks[item.Name()]; ok {
-                        thumbURL = links[0]
-                        spriteURL = links[1]
-                }
+		// Look up preview URLs from preloaded map
+		var thumbURL, spriteURL, previewURL string
+		if links, ok := previewLinks[item.Name()]; ok {
+			thumbURL = links[0]
+			spriteURL = links[1]
+			if len(links) > 2 {
+				previewURL = links[2]
+			}
+		}
 
-                entries = append(entries, &VideoEntry{
-                        Username:     username,
-                        Filename:     item.Name(),
-                        FullPath:     full,
-                        Size:         sizeStr,
-                        ModTime:      modTime,
-                        ModTimeSort:  item.ModTime().Format(time.RFC3339),
-                        ThumbnailURL: thumbURL,
-                        SpriteURL:    spriteURL,
-                        IsOutputDir:  isOutput,
-                })
+		entries = append(entries, &VideoEntry{
+			Username:     username,
+			Filename:     item.Name(),
+			FullPath:     full,
+			Size:         sizeStr,
+			ModTime:      modTime,
+			ModTimeSort:  item.ModTime().Format(time.RFC3339),
+			ThumbnailURL: thumbURL,
+			SpriteURL:    spriteURL,
+			PreviewURL:   previewURL,
+			IsOutputDir:  isOutput,
+		})
         }
 
         return entries

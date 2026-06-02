@@ -327,7 +327,7 @@ func main() {
 				}
 				log.Printf("  fixing recordings table for %s (thumb=%s, sprite=%s)",
 					p.Filename, p.ThumbnailURL, p.SpriteURL)
-				if err := server.UpdateRecordingThumbnails(p.Filename, p.ThumbnailURL, p.SpriteURL); err != nil {
+				if err := server.UpdateRecordingThumbnails(p.Filename, p.ThumbnailURL, p.SpriteURL, p.PreviewURL); err != nil {
 					log.Printf("  WARN: failed to update %s: %v", p.Filename, err)
 				} else {
 					log.Printf("  DONE: updated %s", p.Filename)
@@ -413,12 +413,12 @@ func main() {
 		log.Printf("  sprite: %s", spriteURL)
 
 		log.Printf("  saving to preview_images table...")
-		if err := server.SavePreviewLinks(r.Filename, thumbURL, spriteURL); err != nil {
+		if err := server.SavePreviewLinks(r.Filename, thumbURL, spriteURL, ""); err != nil {
 			log.Printf("  WARN: SavePreviewLinks failed: %v", err)
 		}
 
 		log.Printf("  updating recordings table...")
-		if err := server.UpdateRecordingThumbnails(r.Filename, thumbURL, spriteURL); err != nil {
+		if err := server.UpdateRecordingThumbnails(r.Filename, thumbURL, spriteURL, ""); err != nil {
 			log.Printf("  WARN: UpdateRecordingThumbnails failed: %v", err)
 		}
 

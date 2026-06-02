@@ -435,8 +435,8 @@ func VideoDetail(c *gin.Context) {
         stat, statErr := os.Stat(abs)
         fileOnDisk := statErr == nil
 
-        // Load preview URLs from Supabase
-        thumbURL, spriteURL := server.LoadPreviewLinks(filename)
+	// Load preview URLs from Supabase
+	thumbURL, spriteURL, previewURL := server.LoadPreviewLinks(filename)
 
         // Look up recording metadata from recordings DB
         db := loadRecordings()
@@ -447,9 +447,10 @@ func VideoDetail(c *gin.Context) {
         gender := ""
         filesize := int64(0)
         embedURL := ""
-        dbThumbnailURL := ""
-        dbSpriteURL := ""
-        timestamp := ""
+	dbThumbnailURL := ""
+	dbSpriteURL := ""
+	dbPreviewURL := ""
+	timestamp := ""
         resolution := ""
         framerate := 0
         var related []RecordingEntry
@@ -471,8 +472,9 @@ func VideoDetail(c *gin.Context) {
                                         if strings.Contains(strings.ToLower(embedURL), "byse.sx/e/") {
                                                 embedURL = ""
                                         }
-                                        dbThumbnailURL = rec.ThumbnailURL
-                                        dbSpriteURL = rec.SpriteURL
+					dbThumbnailURL = rec.ThumbnailURL
+					dbSpriteURL = rec.SpriteURL
+					dbPreviewURL = rec.PreviewURL
                                         timestamp = rec.Timestamp
                                         resolution = rec.Resolution
                                         framerate = rec.Framerate
@@ -497,18 +499,19 @@ func VideoDetail(c *gin.Context) {
                         if !strings.EqualFold(v.Username, username) {
                                 continue
                         }
-                        related = append(related, RecordingEntry{
-                                Filename:     v.Filename,
-                                FullPath:     v.FullPath,
-                                Timestamp:    v.ModTime,
-                                RoomTitle:    v.RoomTitle,
-                                Tags:         v.Tags,
-                                Viewers:      v.Viewers,
-                                Resolution:   v.Resolution,
-                                Framerate:    v.Framerate,
-                                ThumbnailURL: v.ThumbnailURL,
-                                SpriteURL:    v.SpriteURL,
-                        })
+			related = append(related, RecordingEntry{
+				Filename:     v.Filename,
+				FullPath:     v.FullPath,
+				Timestamp:    v.ModTime,
+				RoomTitle:    v.RoomTitle,
+				Tags:         v.Tags,
+				Viewers:      v.Viewers,
+				Resolution:   v.Resolution,
+				Framerate:    v.Framerate,
+				ThumbnailURL: v.ThumbnailURL,
+				SpriteURL:    v.SpriteURL,
+				PreviewURL:   v.PreviewURL,
+			})
                         if len(related) >= 8 {
                                 break
                         }
@@ -521,13 +524,16 @@ func VideoDetail(c *gin.Context) {
                 return
         }
 
-        // Fall back to recordings DB if preview_links table had empty URLs
-        if thumbURL == "" && dbThumbnailURL != "" {
-                thumbURL = dbThumbnailURL
-        }
-        if spriteURL == "" && dbSpriteURL != "" {
-                spriteURL = dbSpriteURL
-        }
+	// Fall back to recordings DB if preview_links table had empty URLs
+	if thumbURL == "" && dbThumbnailURL != "" {
+		thumbURL = dbThumbnailURL
+	}
+	if spriteURL == "" && dbSpriteURL != "" {
+		spriteURL = dbSpriteURL
+	}
+	if previewURL == "" && dbPreviewURL != "" {
+		previewURL = dbPreviewURL
+	}
 
         byseAPIKey := ""
         if server.Config != nil {
@@ -584,29 +590,30 @@ func VideoDetail(c *gin.Context) {
                 }
         }
 
-        c.HTML(200, "video.html", gin.H{
-                "Config":          server.Config,
-                "Filename":        filename,
-                "FullPath":        fullPath,
-                "VideoURL":        videoURL,
-                "Size":            size,
-                "ModTime":         modTime,
-                "Username":        username,
-                "ThumbnailURL":    thumbURL,
-                "SpriteURL":       spriteURL,
-                "MimeType":        mimeType,
-                "Links":           links,
-                "HostPlayers":     hostPlayers,
-                "HostPlayersJSON": hostPlayersJSON,
-                "Tags":            tags,
-                "RoomTitle":       roomTitle,
-                "Viewers":         viewers,
-                "Gender":          gender,
-                "Resolution":      resolution,
-                "Framerate":       framerate,
-                "Related":         related,
-                "EmbedURL":        embedURL,
-        })
+	c.HTML(200, "video.html", gin.H{
+		"Config":          server.Config,
+		"Filename":        filename,
+		"FullPath":        fullPath,
+		"VideoURL":        videoURL,
+		"Size":            size,
+		"ModTime":         modTime,
+		"Username":        username,
+		"ThumbnailURL":    thumbURL,
+		"SpriteURL":       spriteURL,
+		"PreviewURL":      previewURL,
+		"MimeType":        mimeType,
+		"Links":           links,
+		"HostPlayers":     hostPlayers,
+		"HostPlayersJSON": hostPlayersJSON,
+		"Tags":            tags,
+		"RoomTitle":       roomTitle,
+		"Viewers":         viewers,
+		"Gender":          gender,
+		"Resolution":      resolution,
+		"Framerate":       framerate,
+		"Related":         related,
+		"EmbedURL":        embedURL,
+	})
 }
 
 func buildHostPlayers(links map[string]string, byseAPIKey string) []hostPlayer {
@@ -931,8 +938,8 @@ func RetryOrphan(c *gin.Context) {
 					results[idx] = result{Path: p, Status: "failed", Error: fmt.Sprintf("panic: %v", r)}
 				}
 			}()
-			thumbURL, spriteURL := channel.GenerateThumbnailForFile(p)
-			if !channel.UploadOrphanedFile(p, thumbURL, spriteURL) {
+			thumbURL, spriteURL, previewURL := channel.GenerateThumbnailForFile(p)
+			if !channel.UploadOrphanedFile(p, thumbURL, spriteURL, previewURL) {
 				results[idx] = result{Path: p, Status: "failed", Error: "upload did not complete successfully"}
 				return
 			}

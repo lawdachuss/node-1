@@ -103,6 +103,7 @@ CREATE TABLE IF NOT EXISTS tunnels (
 -- Add instance_id column for existing tables (safe re-run)
 ALTER TABLE tunnels ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT 'default';
 ALTER TABLE recordings ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT 'default';
+ALTER TABLE recordings ADD COLUMN IF NOT EXISTS preview_url TEXT;
 ALTER TABLE upload_links ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT 'default';
 
 CREATE INDEX IF NOT EXISTS idx_tunnels_active ON tunnels(is_active, created_at DESC);
@@ -181,6 +182,7 @@ CREATE TABLE IF NOT EXISTS preview_images (
 );
 
 ALTER TABLE preview_images ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT 'default';
+ALTER TABLE preview_images ADD COLUMN IF NOT EXISTS preview_url TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_preview_images_recording_id ON preview_images(recording_id);
 CREATE INDEX IF NOT EXISTS idx_preview_images_filename ON preview_images(filename);

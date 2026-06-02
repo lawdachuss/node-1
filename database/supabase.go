@@ -480,6 +480,7 @@ type PreviewImage struct {
 	Filename     string `json:"filename"`
 	ThumbnailURL string `json:"thumbnail_url,omitempty"`
 	SpriteURL    string `json:"sprite_url,omitempty"`
+	PreviewURL   string `json:"preview_url,omitempty"`
 	InstanceID   string `json:"instance_id,omitempty"`
 	UploadedAt   string `json:"uploaded_at,omitempty"`
 }

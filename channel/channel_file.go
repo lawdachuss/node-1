@@ -263,8 +263,8 @@ func (ch *Channel) MoveToOutputDir(srcPath string) string {
 }
 
 func (ch *Channel) generatePreviewAndUpload(filePath string) {
-        thumbURL, spriteURL := ch.generateThumbnail(filePath)
-        ch.uploadFile(filePath, thumbURL, spriteURL)
+	thumbURL, spriteURL, previewURL := ch.generateThumbnail(filePath)
+	ch.uploadFile(filePath, thumbURL, spriteURL, previewURL)
 }
 
 // uniqueDestPath returns path if it does not exist, otherwise appends
@@ -518,8 +518,8 @@ func CleanupOrphanedFiles() {
 					return
 				}
 
-				thumbURL, spriteURL := GenerateThumbnailForFile(info.path)
-				UploadOrphanedFile(info.path, thumbURL, spriteURL)
+				thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(info.path)
+				UploadOrphanedFile(info.path, thumbURL, spriteURL, previewURL)
 				DeleteSidecarFiles(info.path)
 				_ = stem
 			}()
@@ -550,9 +550,9 @@ func CleanupOrphanedFiles() {
 				recoveryLogf(vInfo.name, "recovery: muxing orphaned split A/V pair %s", stem)
 				if err := muxVideoAudio(vInfo.path, aInfo.path, muxedPath); err != nil {
 					recoveryLogf(vInfo.name, "recovery: mux failed for %s: %v — uploading video-only", stem, err)
-					// Fall back to uploading just the video track
-					thumbURL, spriteURL := GenerateThumbnailForFile(vInfo.path)
-					UploadOrphanedFile(vInfo.path, thumbURL, spriteURL)
+				// Fall back to uploading just the video track
+				thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(vInfo.path)
+				UploadOrphanedFile(vInfo.path, thumbURL, spriteURL, previewURL)
 					DeleteSidecarFiles(vInfo.path)
 					return
 				}
@@ -562,8 +562,8 @@ func CleanupOrphanedFiles() {
 				os.Remove(aInfo.path)
 
 				// Generate thumbnails, upload, and clean up
-				thumbURL, spriteURL := GenerateThumbnailForFile(muxedPath)
-				UploadOrphanedFile(muxedPath, thumbURL, spriteURL)
+				thumbURL, spriteURL, previewURL := GenerateThumbnailForFile(muxedPath)
+				UploadOrphanedFile(muxedPath, thumbURL, spriteURL, previewURL)
 				DeleteSidecarFiles(muxedPath)
 				os.Remove(muxedPath)
 			}()
@@ -715,7 +715,7 @@ func configuredUploadHosts() []string {
 // If every configured host fails on the first attempt, it retries up to 2 more
 // times with a 60-second delay between attempts.  This handles transient network
 // or API outages that can occur when the app restarts after a crash.
-func UploadOrphanedFile(filePath, thumbURL, spriteURL string) bool {
+func UploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL string) bool {
 	cfg := server.Config
 	if cfg == nil {
 		return false
@@ -742,8 +742,8 @@ func UploadOrphanedFile(filePath, thumbURL, spriteURL string) bool {
 	}
 
 	// Save preview links first
-	if thumbURL != "" || spriteURL != "" {
-		if err := server.SavePreviewLinks(filename, thumbURL, spriteURL); err != nil {
+	if thumbURL != "" || spriteURL != "" || previewURL != "" {
+		if err := server.SavePreviewLinks(filename, thumbURL, spriteURL, previewURL); err != nil {
 			recoveryLogf(filename, "could not save preview links: %v", err)
 		}
 	}

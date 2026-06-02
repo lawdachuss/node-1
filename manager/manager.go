@@ -229,13 +229,13 @@ func (m *Manager) ScanThumbnails() {
 				return nil
 			}
 			// Only process files that are missing preview URLs in Supabase
-			thumbURL, spriteURL := server.LoadPreviewLinks(info.Name())
+			thumbURL, spriteURL, _ := server.LoadPreviewLinks(info.Name())
 			if thumbURL != "" && spriteURL != "" {
 				return nil
 			}
-			newThumb, newSprite := channel.GenerateThumbnailForFile(path)
-			if newThumb != "" || newSprite != "" {
-				if err := server.SavePreviewLinks(info.Name(), newThumb, newSprite); err != nil {
+			newThumb, newSprite, newPreview := channel.GenerateThumbnailForFile(path)
+			if newThumb != "" || newSprite != "" || newPreview != "" {
+				if err := server.SavePreviewLinks(info.Name(), newThumb, newSprite, newPreview); err != nil {
 					log.Printf("[thumb] failed to save preview links for %s: %v", info.Name(), err)
 				}
 			}
