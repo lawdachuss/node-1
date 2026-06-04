@@ -1,14 +1,39 @@
 package uploader
 
 import (
-        "bytes"
-        "fmt"
-        "io"
-        "mime/multipart"
-        "os"
-        "path/filepath"
-        "sync"
+	"bytes"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
 )
+
+// newNoProxyClient returns an http.Client that explicitly bypasses any
+// environment-configured proxy (ALL_PROXY / HTTP_PROXY / HTTPS_PROXY).
+// The Chaturbate DVR proxy setting is only meant for Chaturbate requests;
+// image/thumbnail upload services must reach the public internet directly.
+func newNoProxyClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			Proxy: nil, // never use environment proxy
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   10,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   15 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}
+}
 
 // multipartStream builds a multipart request body that streams the file without
 // loading it into RAM, while still setting an exact Content-Length so servers

@@ -83,7 +83,11 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		videoPath,
 	).Output()
 	if probeErr == nil {
-		dur, _ = strconv.ParseFloat(strings.TrimSpace(string(probeOut)), 64)
+		var parseErr error
+		dur, parseErr = strconv.ParseFloat(strings.TrimSpace(string(probeOut)), 64)
+		if parseErr != nil {
+			log.Printf("WARN: could not parse probe duration %q: %v", strings.TrimSpace(string(probeOut)), parseErr)
+		}
 	}
 
 	// Compute the interval so we get exactly spriteFrames frames spread

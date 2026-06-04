@@ -41,7 +41,7 @@ type FreeimageUploader struct {
 // NewFreeimageUploader creates a new freeimage.host uploader.
 func NewFreeimageUploader() *FreeimageUploader {
 	return &FreeimageUploader{
-		client: &http.Client{Timeout: 60 * time.Second},
+		client: newNoProxyClient(60 * time.Second),
 	}
 }
 

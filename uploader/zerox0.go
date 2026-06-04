@@ -19,7 +19,7 @@ type ZeroX0Uploader struct {
 // NewZeroX0Uploader creates a new 0x0.st uploader.
 func NewZeroX0Uploader() *ZeroX0Uploader {
 	return &ZeroX0Uploader{
-		client: &http.Client{Timeout: 60 * time.Second},
+		client: newNoProxyClient(60 * time.Second),
 	}
 }
 

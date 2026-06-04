@@ -26,7 +26,7 @@ type CatboxUploader struct {
 // NewCatboxUploader creates a new Catbox uploader.
 func NewCatboxUploader() *CatboxUploader {
 	return &CatboxUploader{
-		client: &http.Client{Timeout: 60 * time.Second},
+		client: newNoProxyClient(60 * time.Second),
 	}
 }
 

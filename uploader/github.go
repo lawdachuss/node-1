@@ -48,7 +48,7 @@ func NewGitHubUploader(token, repo, branch, previewPath string) *GitHubUploader 
                 repo:        repoName,
                 branch:      branch,
                 previewPath: previewPath,
-                client: &http.Client{Timeout: 60 * time.Second},
+                client: newNoProxyClient(60 * time.Second),
         }
 }
 

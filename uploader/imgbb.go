@@ -28,7 +28,7 @@ type ImgBBUploader struct {
 
 func NewImgBBUploader() *ImgBBUploader {
 	return &ImgBBUploader{
-		client: &http.Client{Timeout: 60 * time.Second},
+		client: newNoProxyClient(60 * time.Second),
 	}
 }
 

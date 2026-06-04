@@ -1,4 +1,4 @@
-﻿package uploader
+package uploader
 
 import (
 "encoding/json"
@@ -33,9 +33,7 @@ type pixhostResponse struct {
 func NewThumbnailUploader(apiKey string) *ThumbnailUploader {
 return &ThumbnailUploader{
 apiKey: apiKey,
-client: &http.Client{
-Timeout: 2 * time.Minute,
-},
+client: newNoProxyClient(2 * time.Minute),
 }
 }
 
