@@ -397,7 +397,7 @@
     <main id="main-content" class="flex-1 flex flex-col overflow-hidden relative" style="background:var(--bg-surface)" {{ if .Channels }}sse-connect="/updates?stream=updates"{{ end }}>
 
         <!-- Floating Session Clock -->
-        <div id="session-floating" style="position:absolute;top:12px;right:16px;z-index:50">
+        <div id="session-floating" style="position:absolute;bottom:12px;right:16px;z-index:50">
             <button id="session-badge" onclick="toggleSessionCard()"
                 style="display:flex;align-items:center;gap:8px;padding:6px 12px;border-radius:10px;background:rgba(0,0,0,0.75);border:1px solid rgba(255,255,255,0.1);color:#e4e4e7;cursor:pointer;font-family:ui-monospace,monospace;font-size:12px">
                 <svg style="width:14px;height:14px;flex-shrink:0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
