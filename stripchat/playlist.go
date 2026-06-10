@@ -189,9 +189,14 @@ func (p *Playlist) processMediaPlaylist(ctx context.Context, client *internal.Re
 			func() ([]byte, error) {
 				data, err := client.GetBytesWithTimeout(ctx, initURL, 120*time.Second)
 				if err != nil {
-					if strings.Contains(err.Error(), "unexpected HTTP 404") ||
-						strings.Contains(err.Error(), "unexpected HTTP 403") {
-						return nil, retry.Unrecoverable(err)
+					if strings.Contains(err.Error(), "read body: unexpected EOF") {
+						data, err = client.GetBytesWithTimeout(ctx, initURL, 120*time.Second)
+					}
+					if err != nil {
+						if strings.Contains(err.Error(), "unexpected HTTP 404") ||
+							strings.Contains(err.Error(), "unexpected HTTP 403") {
+							return nil, retry.Unrecoverable(err)
+						}
 					}
 				}
 				return data, err
@@ -227,9 +232,14 @@ func (p *Playlist) processMediaPlaylist(ctx context.Context, client *internal.Re
 			func() ([]byte, error) {
 				data, err := client.GetBytesWithTimeout(ctx, segmentURL, 120*time.Second)
 				if err != nil {
-					if strings.Contains(err.Error(), "unexpected HTTP 404") ||
-						strings.Contains(err.Error(), "unexpected HTTP 403") {
-						return nil, retry.Unrecoverable(err)
+					if strings.Contains(err.Error(), "read body: unexpected EOF") {
+						data, err = client.GetBytesWithTimeout(ctx, segmentURL, 120*time.Second)
+					}
+					if err != nil {
+						if strings.Contains(err.Error(), "unexpected HTTP 404") ||
+							strings.Contains(err.Error(), "unexpected HTTP 403") {
+							return nil, retry.Unrecoverable(err)
+						}
 					}
 				}
 				return data, err
