@@ -196,6 +196,13 @@ var cdnHostSuffixes = []string{
 	".live.mmcdn.com",
 }
 
+// proxyBypassHosts lists hosts that should never use the proxy.
+// Stripchat doesn't need a Netherlands proxy — it has no age verification.
+var proxyBypassHosts = []string{
+	"stripchat.com",
+	".stripchat.com",
+}
+
 func isCDNHost(host string) bool {
 	host = strings.ToLower(host)
 	for _, suffix := range cdnHostSuffixes {
@@ -206,10 +213,20 @@ func isCDNHost(host string) bool {
 	return false
 }
 
+func isProxyBypassHost(host string) bool {
+	host = strings.ToLower(host)
+	for _, h := range proxyBypassHosts {
+		if host == h || strings.HasSuffix(host, h) {
+			return true
+		}
+	}
+	return false
+}
+
 // roundTripOnce executes a single request attempt using the current httpcloak
 // client. No proxy rotation — used by warmup functions (best-effort).
 func (t *httpcloakTransport) roundTripOnce(req *http.Request) (*http.Response, error) {
-	if req.URL.Scheme == "http" || isCDNHost(req.URL.Host) {
+	if req.URL.Scheme == "http" || isCDNHost(req.URL.Host) || isProxyBypassHost(req.URL.Host) {
 		return http.DefaultTransport.RoundTrip(req)
 	}
 
@@ -274,7 +291,7 @@ func (t *httpcloakTransport) roundTripOnce(req *http.Request) (*http.Response, e
 // entirely. API requests use httpcloak with the SOCKS5 proxy, and
 // automatically rotate to the next proxy on connection failure.
 func (t *httpcloakTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL.Scheme == "http" || isCDNHost(req.URL.Host) {
+	if req.URL.Scheme == "http" || isCDNHost(req.URL.Host) || isProxyBypassHost(req.URL.Host) {
 		return http.DefaultTransport.RoundTrip(req)
 	}
 
