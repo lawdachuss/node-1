@@ -164,7 +164,7 @@ func main() {
 			&cli.StringFlag{
 				Name:    "proxy-url",
 				Usage:   "HTTP/SOCKS5 proxy URL for Chaturbate requests",
-				EnvVars: []string{"PROXY_URL", "PROXY_SERVER"},
+				EnvVars: []string{"PROXY_URL", "PROXY_SERVER", "ALL_PROXY", "all_proxy", "SOCKS_PROXY"},
 				Value:   "",
 			},
 			&cli.StringFlag{
