@@ -505,19 +505,6 @@ func (p *Pipeline) stageCleanup(ch *Channel) error {
 	return nil
 }
 
-func (p *Pipeline) hasAllConfiguredHosts() bool {
-	hosts := configuredUploadHosts()
-	if len(hosts) == 0 {
-		return false
-	}
-	for _, host := range hosts {
-		if p.Links[host] == "" {
-			return false
-		}
-	}
-	return true
-}
-
 // PipelineQueue manages a per-channel ordered queue of pipelines.
 // Pipelines are processed sequentially (one at a time per channel).
 type PipelineQueue struct {
