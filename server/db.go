@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -860,55 +859,6 @@ func DeleteVideoCompletely(filename string) error {
 
 	cacheClear()
 	return nil
-}
-
-// DeleteShortVideos finds all recordings with duration <= maxDuration seconds and
-// deletes them from the database (recording, upload_links, preview_images).
-// If deleteLocal is true, also removes the local file from disk.
-// Returns the count of deleted recordings and a list of deleted filenames.
-func DeleteShortVideos(maxDuration float64, deleteLocal bool) (int, []string, error) {
-	client := GetDBClient()
-	if client == nil {
-		return 0, nil, fmt.Errorf("Supabase not configured")
-	}
-
-	recordings, err := client.GetRecordingsByMaxDuration(maxDuration)
-	if err != nil {
-		return 0, nil, fmt.Errorf("query short videos: %w", err)
-	}
-
-	var deleted []string
-	for _, rec := range recordings {
-		if rec.Duration == 0 {
-			// Skip recordings where duration is unset (0 = default/unknown).
-			continue
-		}
-
-		if deleteLocal {
-			// Find and delete the local file.
-			for _, dir := range []string{"videos", Config.OutputDir} {
-				if dir == "" {
-					continue
-				}
-				localPath := filepath.Join(dir, rec.Filename)
-				if st, err := os.Stat(localPath); err == nil && !st.IsDir() {
-					if err := os.Remove(localPath); err != nil {
-						fmt.Printf("[WARN] cleanup: failed to remove local file %s: %v\n", localPath, err)
-					}
-					break
-				}
-			}
-		}
-
-		if err := DeleteVideoCompletely(rec.Filename); err != nil {
-			fmt.Printf("[WARN] cleanup: failed to delete %s from DB: %v\n", rec.Filename, err)
-			continue
-		}
-		deleted = append(deleted, rec.Filename)
-		fmt.Printf("[INFO] cleanup: deleted short video %s (duration=%.1fs)\n", rec.Filename, rec.Duration)
-	}
-
-	return len(deleted), deleted, nil
 }
 
 // ─── Upload Journal ───────────────────────────────────────────────────────────

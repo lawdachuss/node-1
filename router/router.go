@@ -100,9 +100,6 @@ func SetupViews(r *gin.Engine) {
 	// Session control API
 	r.POST("/api/session/stop", TriggerSessionStop)
 
-	// Database cleanup API
-	r.POST("/api/cleanup_short_videos", CleanupShortVideos)
-
 }
 
 // LoadHTMLFromEmbedFS loads specific HTML templates from an embedded filesystem and registers them with Gin.

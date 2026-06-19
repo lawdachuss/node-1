@@ -1084,30 +1084,3 @@ func DeleteOrphans(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, resp)
 }
-
-func CleanupShortVideos(c *gin.Context) {
-	var req struct {
-		MaxDuration float64 `json:"max_duration"`
-		DeleteLocal bool    `json:"delete_local"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	if req.MaxDuration <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "max_duration must be > 0"})
-		return
-	}
-
-	count, deleted, err := server.DeleteShortVideos(req.MaxDuration, req.DeleteLocal)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"deleted":   deleted,
-		"count":     count,
-		"max_duration": req.MaxDuration,
-	})
-}

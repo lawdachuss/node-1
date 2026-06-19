@@ -345,13 +345,6 @@ func (c *Client) GetAllRecordings() ([]Recording, error) {
 	return recordings, err
 }
 
-// GetRecordingsByMaxDuration retrieves all recordings with duration <= maxDur seconds.
-func (c *Client) GetRecordingsByMaxDuration(maxDur float64) ([]Recording, error) {
-	var recordings []Recording
-	err := c.get(fmt.Sprintf("/recordings?duration=lte.%v&order=timestamp.desc&limit=50000", maxDur), &recordings)
-	return recordings, err
-}
-
 // DeleteRecording removes a recording
 func (c *Client) DeleteRecording(filename string) error {
 	return c.delete(fmt.Sprintf("/recordings?filename=eq.%s", url.QueryEscape(filename)))
