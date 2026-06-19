@@ -321,6 +321,7 @@ func isSidecar(name string) bool {
 		strings.HasSuffix(name, ".sprite.webp") ||
 		strings.HasSuffix(name, ".sprite.jpg") ||
 		strings.HasSuffix(name, ".preview.webp") ||
+		strings.HasSuffix(name, ".preview.mp4") ||
 		strings.HasSuffix(name, ".thumb") ||
 		strings.HasSuffix(name, ".sprite") ||
 		strings.HasSuffix(name, ".video.mp4") ||
@@ -684,7 +685,8 @@ func CleanupOrphanedFiles() {
 			case (ext == ".mp4" || ext == ".mkv" || ext == ".ts") &&
 				!strings.Contains(name, ".video.") &&
 				!strings.Contains(name, ".audio.") &&
-				!strings.Contains(name, ".muxed."):
+				!strings.Contains(name, ".muxed.") &&
+				!strings.Contains(name, ".preview."):
 				stem := strings.TrimSuffix(name, filepath.Ext(name))
 				mainVideos[stem] = fileInfo{path, name}
 			}
@@ -798,7 +800,7 @@ func CleanupOrphanedFiles() {
 		processAllPendingSegments()
 
 		// Clean up orphaned sidecar files whose main video no longer exists
-		sidecarExts := []string{".thumb.webp", ".thumb.jpg", ".sprite.webp", ".sprite.jpg", ".preview.webp", ".thumb", ".sprite"}
+		sidecarExts := []string{".thumb.webp", ".thumb.jpg", ".sprite.webp", ".sprite.jpg", ".preview.webp", ".preview.mp4", ".thumb", ".sprite"}
 		for _, e := range entries {
 			if e.IsDir() {
 				continue
@@ -828,7 +830,7 @@ func CleanupOrphanedFiles() {
 
 // DeleteSidecarFiles removes preview sidecar files associated with a video path.
 func DeleteSidecarFiles(videoPath string) {
-	for _, suffix := range []string{".thumb.webp", ".thumb.jpg", ".sprite.webp", ".sprite.jpg", ".preview.webp", ".thumb", ".sprite"} {
+	for _, suffix := range []string{".thumb.webp", ".thumb.jpg", ".sprite.webp", ".sprite.jpg", ".preview.webp", ".preview.mp4", ".thumb", ".sprite"} {
 		os.Remove(videoPath + suffix)
 	}
 }
@@ -1289,8 +1291,15 @@ func VideoDurationSeconds(videoPath string) (float64, error) {
 }
 
 // mergeVideos concatenates multiple video files into a single output using the
-// ffmpeg concat demuxer.  All source files must share the same codec parameters
-// (same encoding, resolution, etc.) for a plain stream-copy to work.
+// ffmpeg concat demuxer, then normalizes timestamps.  All source files must
+// share the same codec parameters (same encoding, resolution, etc.) for a
+// plain stream-copy to work.
+//
+// The post-merge normalization is critical: pending segments are raw fMP4 with
+// absolute server timestamps (e.g. PTS=5044s) from LL-HLS streams.  The concat
+// demuxer copies packets verbatim, so the merged output inherits those broken
+// timestamps -> laggy playback, wrong duration, corrupt seeking.
+// A fast stream-copy remux with -fflags +genpts regenerates PTS from DTS.
 func mergeVideos(inputs []string, outputPath string) error {
 	listFile, err := os.CreateTemp("", "concat-*.txt")
 	if err != nil {
@@ -1318,20 +1327,40 @@ func mergeVideos(inputs []string, outputPath string) error {
 	config.AcquireFFmpegHeavy()
 	defer config.ReleaseFFmpegHeavy()
 
-	cmd := config.FFmpegCommandContext(ctx,
+	// Step 1: Concat merge (stream copy).
+	if err := config.FFmpegCommandContext(ctx,
+		"-y",
 		"-f", "concat",
 		"-safe", "0",
 		"-i", listFile.Name(),
 		"-c", "copy",
+		"-fflags", "+genpts",
 		"-movflags", "+faststart",
 		outputPath,
-	)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		if len(output) > 0 {
-			return fmt.Errorf("merge video: %s: %s", err, string(output))
-		}
+	).Run(); err != nil {
+		os.Remove(outputPath)
 		return fmt.Errorf("merge video: %w", err)
+	}
+
+	// Step 2: Normalize timestamps.  The concat step preserves the input
+	// segments' original fMP4 absolute timestamps (e.g. PTS=5044s from
+	// LL-HLS).  A stream-copy remux with -fflags +genpts regenerates clean
+	// PTS values starting from 0, so the output plays correctly everywhere.
+	tmpPath := outputPath + ".normalized.mp4"
+	if err := config.FFmpegCommandContext(ctx,
+		"-y",
+		"-i", outputPath,
+		"-c", "copy",
+		"-fflags", "+genpts",
+		"-movflags", "+faststart",
+		tmpPath,
+	).Run(); err != nil {
+		os.Remove(tmpPath)
+		// If normalization fails, return the concat output as-is (best-effort).
+		return nil
+	}
+	if err := os.Rename(tmpPath, outputPath); err != nil {
+		os.Remove(tmpPath)
 	}
 	return nil
 }
@@ -1400,7 +1429,26 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 		mErr := mergeVideos(allInputs, mergedPath)
 		if mErr != nil {
 			os.Remove(mergedPath) // clean up partial output
-			ch.Error("min-duration: merge failed: %v — uploading current video separately", mErr)
+			ch.Error("min-duration: merge failed: %v — uploading current video separately, clearing pending segments", mErr)
+			// Remove the stale pending segments so they don't accumulate.
+			for _, s := range mergeInputs {
+				os.Remove(s)
+			}
+			return false
+		}
+
+		// Verify the merged output duration — fMP4 timestamp issues can
+		// cause the concat merge to produce a valid file that is shorter
+		// than the sum of its parts.
+		mergedDur, probeErr := VideoDurationSeconds(mergedPath)
+		if probeErr != nil || mergedDur < float64(minDur)*0.9 {
+			ch.Warn("min-duration: merged output for %s is %.1fs (expected >= %ds) — uploading current video separately",
+				filepath.Base(mergedPath), mergedDur, minDur)
+			os.Remove(mergedPath)
+			// Remove the stale pending segments.
+			for _, s := range mergeInputs {
+				os.Remove(s)
+			}
 			return false
 		}
 
@@ -1413,10 +1461,10 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string) bool {
 		pendingDirMu.Unlock()
 
 		if ch.Config.Compress {
-			ch.Info("min-duration: merged -> %s, compressing before upload", filepath.Base(mergedPath))
+			ch.Info("min-duration: merged -> %s (%.1fs), compressing before upload", filepath.Base(mergedPath), mergedDur)
 			ch.CompressFile(mergedPath)
 		} else {
-			ch.Info("min-duration: merged -> %s, proceeding with upload", filepath.Base(mergedPath))
+			ch.Info("min-duration: merged -> %s (%.1fs), proceeding with upload", filepath.Base(mergedPath), mergedDur)
 			ch.MoveToOutputDir(mergedPath)
 		}
 		return true

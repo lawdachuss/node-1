@@ -377,7 +377,7 @@
                  onclick="location.href=this.dataset.videoHref">
                 <div class="card-thumb">
                     {{ if .ThumbnailURL }}<img src="{{ .ThumbnailURL }}" alt="" loading="lazy" decoding="async" />{{ end }}
-                    {{ if .PreviewURL }}<div class="sprite-overlay"><img src="{{ .PreviewURL }}" alt="" class="preview-gif" /></div>{{ else if .SpriteURL }}<div class="sprite-overlay"><div class="sprite-anim"></div></div>{{ end }}
+                    {{ if .PreviewURL }}<div class="sprite-overlay"><video src="{{ .PreviewURL }}" class="preview-gif" autoplay muted loop playsinline></video></div>{{ else if .SpriteURL }}<div class="sprite-overlay"><div class="sprite-anim"></div></div>{{ end }}
                     <div class="play-btn-wrap"><div class="play-btn"><svg fill="currentColor" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21"/></svg></div></div>
                     <div class="card-badges">
                         <div class="flex flex-wrap gap-1">
@@ -471,7 +471,7 @@
                     {{ end }}
 
                     {{ if .PreviewURL }}
-                    <div class="sprite-overlay"><img src="{{ .PreviewURL }}" alt="" class="preview-gif" /></div>
+                    <div class="sprite-overlay"><video src="{{ .PreviewURL }}" class="preview-gif" autoplay muted loop playsinline></video></div>
                     {{ else if .SpriteURL }}
                     <div class="sprite-overlay">
                         <div class="sprite-anim"></div>

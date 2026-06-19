@@ -72,6 +72,12 @@ func GenerateThumbnailForFile(videoPath string) (thumbURL, spriteURL, previewURL
 //
 // Using separate contexts prevents one task from being killed prematurely
 // when a long video causes another to exceed a shared short timeout.
+// fileExists returns true if the path exists and is a regular file.
+func fileExists(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && !fi.IsDir()
+}
+
 func generateThumbnailForFile(videoPath string, info, errFn func(string, ...interface{})) (thumbURL, spriteURL, previewURL string) {
 	ext := strings.ToLower(filepath.Ext(videoPath))
 	if ext != ".mp4" && ext != ".mkv" && ext != ".ts" {
@@ -270,14 +276,21 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		defer previewCancel()
 
 		previewMP4 := videoPath + ".preview.mp4"
-		defer os.Remove(previewMP4)
+		// Remove on final return, but NOT if ffmpeg failed — leave the file
+		// on disk so a later restart or manual retry can pick it up.
+		var previewGenerated bool
+		defer func() {
+			if previewGenerated {
+				os.Remove(previewMP4)
+			}
+		}()
 
 		config.AcquireFFmpeg()
 		defer config.ReleaseFFmpeg()
 
 		var err error
-		if dur <= previewDuration {
-			// Short video — no segmenting needed, just scale.
+		if dur <= previewDuration || dur <= 0 {
+			// Short or unmeasurable video — no segmenting needed, just scale.
 			err = config.FFmpegCommandContext(previewCtx,
 				"-y",
 				"-i", videoPath,
@@ -332,6 +345,33 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 				"-an",
 				previewMP4,
 			).Run()
+
+			// If the complex filter_complex failed, fall back to a simple
+			// single-clip preview from the middle of the video.  The
+			// filter_complex can silently produce no output on some videos
+			// (e.g. when the video stream has unusual timing), causing the
+			// uploader to fail with "file not found" even though ffmpeg
+			// exited 0.
+			if err != nil || !fileExists(previewMP4) {
+				if err != nil {
+					errFn("preview: complex filter failed for %s: %v, trying simple fallback", baseName, err)
+				} else {
+					errFn("preview: complex filter produced no output for %s, trying simple fallback", baseName)
+				}
+				err = config.FFmpegCommandContext(previewCtx,
+					"-y",
+					"-ss", fmt.Sprintf("%.2f", dur*0.3),
+					"-i", videoPath,
+					"-t", fmt.Sprintf("%.2f", previewDuration),
+					"-vf", fmt.Sprintf("scale=%d:-2:flags=lanczos", previewWidth),
+					"-c:v", "libx264",
+					"-preset", "fast",
+					"-crf", "23",
+					"-movflags", "+faststart",
+					"-an",
+					previewMP4,
+				).Run()
+			}
 		}
 
 		if err != nil {
@@ -339,6 +379,14 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 			previewDone <- ""
 			return
 		}
+
+		if !fileExists(previewMP4) {
+			errFn("preview: ffmpeg exited successfully but produced no output file for %s", baseName)
+			previewDone <- ""
+			return
+		}
+
+		previewGenerated = true
 
 		catboxUploader := uploader.NewCatboxUploader()
 		pixeldrainUploader := uploader.NewPixelDrainUploader(os.Getenv("PIXELDRAIN_API_KEY"))

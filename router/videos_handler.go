@@ -334,7 +334,7 @@ func walkDir(dir string, previewLinks map[string][3]string) []*VideoEntry {
                 if !videoExts[ext] {
                         continue
                 }
-                if strings.HasSuffix(item.Name(), ".video.mp4") || strings.HasSuffix(item.Name(), ".audio.mp4") {
+                if strings.HasSuffix(item.Name(), ".video.mp4") || strings.HasSuffix(item.Name(), ".audio.mp4") || strings.HasSuffix(item.Name(), ".preview.mp4") {
                         continue
                 }
 

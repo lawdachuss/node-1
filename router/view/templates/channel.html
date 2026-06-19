@@ -205,7 +205,7 @@
                 <img src="{{ .ThumbnailURL }}" alt="" loading="lazy" />
                 {{ end }}
                 {{ if .PreviewURL }}
-                <div class="sprite-overlay"><img src="{{ .PreviewURL }}" alt="" class="preview-gif" /></div>
+                <div class="sprite-overlay"><video src="{{ .PreviewURL }}" class="preview-gif" autoplay muted loop playsinline></video></div>
                 {{ else if .SpriteURL }}
                 <div class="sprite-overlay">
                     <div class="sprite-anim"></div>
