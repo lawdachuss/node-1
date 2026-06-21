@@ -270,7 +270,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 	//   60 min:  12 clips × 0.5s = 6s (5 min between clips)
 	//
 	// Uploaded to Catbox.moe (free, permanent, CDN-backed) with PixelDrain
-	// as fallback — both return direct file URLs suitable for embedding.
+	// and GoFile as fallbacks.
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -285,8 +285,6 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		defer previewCancel()
 
 		previewMP4 := videoPath + ".preview.mp4"
-		// Remove on final return, but NOT if ffmpeg failed — leave the file
-		// on disk so a later restart or manual retry can pick it up.
 		var previewGenerated bool
 		defer func() {
 			if previewGenerated {
@@ -294,104 +292,24 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 			}
 		}()
 
-		// waitForPreviewFile polls with backoff until the preview file is
-		// confirmed to exist.  On Windows, an AV scanner (Defender, etc.) can
-		// briefly hold an exclusive lock on a newly-created file, causing
-		// os.Stat to return ERROR_FILE_NOT_FOUND even though ffmpeg exited
-		// successfully.  Retrying with a short delay resolves this.
 		waitForPreviewFile := func() bool {
-			for delay := 0; delay < 5; delay++ {
+			for delay := 0; delay < 8; delay++ {
 				if fileExists(previewMP4) {
 					return true
 				}
-				time.Sleep(time.Duration(50*(1<<delay)) * time.Millisecond) // 50, 100, 200, 400, 800 ms
+				time.Sleep(time.Duration(50*(1<<delay)) * time.Millisecond)
 			}
 			return false
 		}
 
-		config.AcquireFFmpeg()
-		defer config.ReleaseFFmpeg()
-
-		var err error
-		if dur <= previewDuration || dur <= 0 {
-			// Short or unmeasurable video — no segmenting needed, just scale.
-			err = config.FFmpegCommandContext(previewCtx,
-				"-y",
-				"-i", videoPath,
-				"-vf", fmt.Sprintf("scale=%d:-2:flags=lanczos", previewWidth),
-				"-c:v", "libx264",
-				"-preset", "fast",
-				"-crf", "23",
-				"-movflags", "+faststart",
-				"-an",
-				previewMP4,
-			).Run()
-		} else {
-			// Build a filter_complex that extracts clips and stitches them.
-			segDuration := previewDuration / float64(previewSegments)
-			step := dur / float64(previewSegments)
-
-			var filterParts []string
-			var concatInputs []string
-
-			for i := 0; i < previewSegments; i++ {
-				midpoint := step * (float64(i) + 0.5)
-				start := midpoint - segDuration/2
-
-				if start+segDuration > dur {
-					start = dur - segDuration
-				}
-				if start < 0 {
-					start = 0
-				}
-
-				label := fmt.Sprintf("v%d", i)
-				filterParts = append(filterParts, fmt.Sprintf(
-					"[0:v]trim=start=%.3f:duration=%.3f,setpts=PTS-STARTPTS,scale=%d:-2:flags=lanczos[%s]",
-					start, segDuration, previewWidth, label,
-				))
-				concatInputs = append(concatInputs, fmt.Sprintf("[%s]", label))
-			}
-
-			filterComplex := strings.Join(filterParts, ";") + ";" +
-				strings.Join(concatInputs, "") +
-				fmt.Sprintf("concat=n=%d:v=1:a=0[out]", previewSegments)
-
-			err = config.FFmpegCommandContext(previewCtx,
-				"-y",
-				"-i", videoPath,
-				"-filter_complex", filterComplex,
-				"-map", "[out]",
-				"-c:v", "libx264",
-				"-preset", "fast",
-				"-crf", "23",
-				"-movflags", "+faststart",
-				"-an",
-				previewMP4,
-			).Run()
-
-			// If the complex filter_complex failed, fall back to a simple
-			// single-clip preview from the middle of the video.  The
-			// filter_complex can silently produce no output on some videos
-			// (e.g. when the video stream has unusual timing), causing the
-			// uploader to fail with "file not found" even though ffmpeg
-			// exited 0.
-			//
-			// Use a fresh context so the fallback gets its own 5-minute
-			// timeout instead of inheriting the nearly-expired previewCtx.
-			if err != nil || !fileExists(previewMP4) {
-				if err != nil {
-					errFn("preview: complex filter failed for %s: %v, trying simple fallback", baseName, err)
-				} else {
-					errFn("preview: complex filter produced no output for %s, trying simple fallback", baseName)
-				}
-				fallbackCtx, fallbackCancel := context.WithTimeout(context.Background(), 5*time.Minute)
-				defer fallbackCancel()
-				err = config.FFmpegCommandContext(fallbackCtx,
+		// generatePreview runs ffmpeg with filter_complex + simple fallback.
+		// Returns true if the preview file was successfully created.
+		generatePreview := func(ctx context.Context) bool {
+			var err error
+			if dur <= previewDuration || dur <= 0 {
+				err = config.FFmpegCommandContext(ctx,
 					"-y",
-					"-ss", fmt.Sprintf("%.2f", dur*0.3),
 					"-i", videoPath,
-					"-t", fmt.Sprintf("%.2f", previewDuration),
 					"-vf", fmt.Sprintf("scale=%d:-2:flags=lanczos", previewWidth),
 					"-c:v", "libx264",
 					"-preset", "fast",
@@ -400,37 +318,152 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 					"-an",
 					previewMP4,
 				).Run()
+			} else {
+				segDuration := previewDuration / float64(previewSegments)
+				step := dur / float64(previewSegments)
+
+				var filterParts []string
+				var concatInputs []string
+
+				for i := 0; i < previewSegments; i++ {
+					midpoint := step * (float64(i) + 0.5)
+					start := midpoint - segDuration/2
+
+					if start+segDuration > dur {
+						start = dur - segDuration
+					}
+					if start < 0 {
+						start = 0
+					}
+
+					label := fmt.Sprintf("v%d", i)
+					filterParts = append(filterParts, fmt.Sprintf(
+						"[0:v]trim=start=%.3f:duration=%.3f,setpts=PTS-STARTPTS,scale=%d:-2:flags=lanczos[%s]",
+						start, segDuration, previewWidth, label,
+					))
+					concatInputs = append(concatInputs, fmt.Sprintf("[%s]", label))
+				}
+
+				filterComplex := strings.Join(filterParts, ";") + ";" +
+					strings.Join(concatInputs, "") +
+					fmt.Sprintf("concat=n=%d:v=1:a=0[out]", previewSegments)
+
+				err = config.FFmpegCommandContext(ctx,
+					"-y",
+					"-i", videoPath,
+					"-filter_complex", filterComplex,
+					"-map", "[out]",
+					"-c:v", "libx264",
+					"-preset", "fast",
+					"-crf", "23",
+					"-movflags", "+faststart",
+					"-an",
+					previewMP4,
+				).Run()
+
+				if err != nil || !fileExists(previewMP4) {
+					if err != nil {
+						errFn("preview: complex filter failed for %s: %v, trying simple fallback", baseName, err)
+					} else {
+						errFn("preview: complex filter produced no output for %s, trying simple fallback", baseName)
+					}
+					fallbackCtx, fallbackCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+					defer fallbackCancel()
+					err = config.FFmpegCommandContext(fallbackCtx,
+						"-y",
+						"-ss", fmt.Sprintf("%.2f", dur*0.3),
+						"-i", videoPath,
+						"-t", fmt.Sprintf("%.2f", previewDuration),
+						"-vf", fmt.Sprintf("scale=%d:-2:flags=lanczos", previewWidth),
+						"-c:v", "libx264",
+						"-preset", "fast",
+						"-crf", "23",
+						"-movflags", "+faststart",
+						"-an",
+						previewMP4,
+					).Run()
+				}
 			}
+
+			if err != nil {
+				errFn("preview: ffmpeg failed for %s: %v", baseName, err)
+				return false
+			}
+
+			if !waitForPreviewFile() {
+				errFn("preview: ffmpeg exited successfully but produced no output file for %s", baseName)
+				return false
+			}
+
+			return true
 		}
 
-		if err != nil {
-			errFn("preview: failed for %s: %v", baseName, err)
+		config.AcquireFFmpeg()
+		previewOK := generatePreview(previewCtx)
+		config.ReleaseFFmpeg()
+		if !previewOK {
 			previewDone <- ""
 			return
 		}
-
-		if !waitForPreviewFile() {
-			errFn("preview: ffmpeg exited successfully but produced no output file for %s", baseName)
-			previewDone <- ""
-			return
-		}
-
 		previewGenerated = true
 
 		catboxUploader := uploader.NewCatboxUploader()
 		pixeldrainUploader := uploader.NewPixelDrainUploader(os.Getenv("PIXELDRAIN_API_KEY"))
+		lobfileUploader := uploader.NewLobFileUploader(os.Getenv("LOBFILE_API_KEY"))
 
-		remoteURL, uploadErr := catboxUploader.Upload(previewMP4)
-		if uploadErr != nil {
-			errFn("preview: catbox failed for %s: %v, trying PixelDrain fallback", baseName, uploadErr)
+		var remoteURL string
+		var uploadErr error
+
+		maxPreviewAttempts := 2
+		for attempt := 0; attempt < maxPreviewAttempts; attempt++ {
+			if attempt > 0 {
+				info("preview: regenerating %s (attempt %d/%d)", baseName, attempt+1, maxPreviewAttempts)
+				config.AcquireFFmpeg()
+				regenCtx, regenCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+				ok := generatePreview(regenCtx)
+				regenCancel()
+				config.ReleaseFFmpeg()
+				if !ok {
+					uploadErr = fmt.Errorf("preview regeneration failed")
+					break
+				}
+			}
+
+			// Try hosts in order: Catbox → PixelDrain → LobFile
+			remoteURL, uploadErr = catboxUploader.Upload(previewMP4)
+			if uploadErr == nil {
+				break
+			}
+			errFn("preview: catbox failed for %s: %v, trying PixelDrain", baseName, uploadErr)
+
 			remoteURL, uploadErr = pixeldrainUploader.Upload(previewMP4)
+			if uploadErr == nil {
+				break
+			}
+			errFn("preview: PixelDrain failed for %s: %v, trying LobFile", baseName, uploadErr)
+
+			remoteURL, uploadErr = lobfileUploader.Upload(previewMP4)
+			if uploadErr == nil {
+				break
+			}
+			errFn("preview: LobFile failed for %s: %v", baseName, uploadErr)
+
+			errStr := uploadErr.Error()
+			if strings.Contains(errStr, "no such file") ||
+				strings.Contains(errStr, "cannot find") ||
+				strings.Contains(errStr, "stat file") ||
+				strings.Contains(errStr, "open file") {
+				continue
+			}
+
+			break
 		}
 
 		if uploadErr == nil {
 			info("preview: ✓ %s", baseName)
 			previewDone <- remoteURL
 		} else {
-			errFn("preview: all hosts failed for %s: %v", baseName, uploadErr)
+			errFn("preview: Catbox, PixelDrain, and LobFile all failed for %s: %v", baseName, uploadErr)
 			previewDone <- ""
 		}
 	}()

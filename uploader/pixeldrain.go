@@ -139,6 +139,11 @@ func isRetryablePixelDrainError(err error) bool {
 		return true
 	}
 
+	// File stat/open errors — retry (AV scanner race on Windows)
+	if strings.Contains(errStr, "stat file") || strings.Contains(errStr, "open file") {
+		return true
+	}
+
 	// Network-level failures — retry
 	if strings.Contains(errStr, "send request") || strings.Contains(errStr, "read response") {
 		return true

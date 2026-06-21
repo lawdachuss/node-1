@@ -49,9 +49,9 @@ func NewCatboxUploader() *CatboxUploader {
 func (u *CatboxUploader) Upload(filePath string) (string, error) {
 	var lastErr error
 
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < 5; attempt++ {
 		if attempt > 0 {
-			backoff := time.Duration(1<<uint(attempt)) * time.Second // 2s, 4s
+			backoff := time.Duration(1<<uint(attempt)) * time.Second // 2s, 4s, 8s, 16s
 			time.Sleep(backoff)
 		}
 
@@ -63,7 +63,7 @@ func (u *CatboxUploader) Upload(filePath string) (string, error) {
 		lastErr = err
 
 		// Only retry on transient errors: network/IO failures or server errors.
-		// Client-side errors (file not found, bad response format) are fatal.
+		// Client-side errors (bad response format) are fatal.
 		if isRetryableCatboxError(err) {
 			continue
 		}
@@ -71,7 +71,7 @@ func (u *CatboxUploader) Upload(filePath string) (string, error) {
 		return "", err
 	}
 
-	return "", fmt.Errorf("catbox: all 3 attempts failed, last: %w", lastErr)
+	return "", fmt.Errorf("catbox: all %d attempts failed, last: %w", 5, lastErr)
 }
 
 // uploadOnce performs a single upload attempt without retry logic.

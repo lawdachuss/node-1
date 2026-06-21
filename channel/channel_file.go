@@ -858,9 +858,17 @@ func CleanupOrphanedFiles() {
 }
 
 // DeleteSidecarFiles removes preview sidecar files associated with a video path.
+// Skips .preview.mp4 if the video is currently in-flight (being uploaded) to
+// prevent a race between DeleteSidecarFiles and the preview upload goroutine.
 func DeleteSidecarFiles(videoPath string) {
-	for _, suffix := range []string{".thumb.webp", ".thumb.jpg", ".sprite.webp", ".sprite.jpg", ".preview.webp", ".preview.mp4", ".thumb", ".sprite"} {
+	for _, suffix := range []string{".thumb.webp", ".thumb.jpg", ".sprite.webp", ".sprite.jpg", ".preview.webp", ".thumb", ".sprite"} {
 		os.Remove(videoPath + suffix)
+	}
+	// Only delete .preview.mp4 when the video is NOT in-flight — the preview
+	// upload goroutine checks this file's existence before uploading and would
+	// fail with "file not found" if DeleteSidecarFiles raced ahead of it.
+	if !IsUploadInFlight(videoPath) {
+		os.Remove(videoPath + ".preview.mp4")
 	}
 }
 
