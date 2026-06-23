@@ -362,10 +362,10 @@ jobs:
           if (-not $success) { Write-Error "RDP port 3389 not reachable on $env:TAILSCALE_IP after 100s"; exit 1 }
           Write-Host "[OK] RDP reachable via Tailscale."
 
-      - name: Clone MiniDelectableService to D:\
+      - name: Clone node-3 to D:\
         shell: powershell
         run: |
-          $repoDir = "D:\repos\MiniDelectableService"
+          $repoDir = "D:\repos\node-3"
           New-Item -ItemType Directory -Force -Path "D:\repos" | Out-Null
           if (Test-Path $repoDir) { Remove-Item -Recurse -Force $repoDir }
           Write-Host "Using checked-out repo code (commit: $(git rev-parse --short HEAD))..."
@@ -381,7 +381,7 @@ jobs:
         env:
           MINI_ENV: ${{ secrets.env }}
         run: |
-          $repoDir = "D:\repos\MiniDelectableService"
+          $repoDir = "D:\repos\node-3"
           if (-not (Test-Path $repoDir)) { Write-Error "Repo not found"; exit 1 }
           if (-not [string]::IsNullOrWhiteSpace($env:MINI_ENV)) {
             [System.IO.File]::WriteAllText("$repoDir\.env", $env:MINI_ENV, (New-Object System.Text.UTF8Encoding($false)))
@@ -434,7 +434,7 @@ jobs:
         env:
           MINI_ENV: ${{ secrets.env }}
         run: |
-          $repoDir = "D:\repos\MiniDelectableService"
+          $repoDir = "D:\repos\node-3"
           if (-not (Test-Path $repoDir)) { Write-Error "Repo not found"; exit 1 }
 
           if ([string]::IsNullOrWhiteSpace($env:MINI_ENV)) {
@@ -839,7 +839,7 @@ jobs:
           CHANNEL_POOL_MODE: ${{ secrets.CHANNEL_POOL_MODE }}
           NODE_ID: ${{ secrets.NODE_ID }}
         run: |
-          $repoDir = "D:\repos\MiniDelectableService"
+          $repoDir = "D:\repos\node-3"
           $dvrExe = "$repoDir\chaturbate-dvr.exe"
           $videosDir = "D:\videos"
           $cloudflaredPath = "$repoDir\cloudflared.exe"
