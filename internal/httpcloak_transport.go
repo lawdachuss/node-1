@@ -182,7 +182,8 @@ func isProxyError(err error) bool {
 		strings.Contains(msg, "connect to SOCKS5 proxy") ||
 		strings.Contains(msg, "i/o timeout") ||
 		strings.Contains(msg, "connection refused") ||
-		strings.Contains(msg, "no reachable proxy")
+		strings.Contains(msg, "no reachable proxy") ||
+		strings.Contains(msg, "tls_handshake")
 }
 
 // cdnHostSuffixes lists CDN hostname suffixes that serve HLS segments

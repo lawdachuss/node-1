@@ -140,19 +140,19 @@ jobs:
             )
           }
 
-          $selected = $null
-          $selectedIp = $null
-          $fallbackProxy = $null
-          $fallbackIp = $null
+          $maxProxies = 5
+          $workingProxies = @()
+          $fallbackProxies = @()
           $tested = 0
           $lastLogAt = 0
 
           log ""
-          log "=== Testing proxies (prefer NL/IN, accept any as last resort) ==="
+          log "=== Testing proxies (collecting $maxProxies working NL/IN proxies) ==="
           foreach ($p in $allProxies) {
+            if ($workingProxies.Count -ge $maxProxies) { break }
             $tested++
             if ($tested -ge $lastLogAt + 100) {
-              log "  Tested $tested/$($allProxies.Count) proxies..."
+              log "  Tested $tested/$($allProxies.Count) proxies... ($($workingProxies.Count) working so far)"
               $lastLogAt = $tested
             }
             $ip = Test-Proxy $p
@@ -164,30 +164,22 @@ jobs:
                 $loc = $locRaw | ConvertFrom-Json -ErrorAction Stop
                 $country = $loc.country
                 if ($country -eq "NL" -or $country -eq "IN") {
-                  $selected = $p
-                  $selectedIp = $ip
-                  log ""
-                  log "WORKING: $p"
-                  log "   IP: $ip / Country: $country ($($loc.org))"
-                  break
+                  $workingProxies += @{ url = $p; ip = $ip; country = $country; org = $loc.org }
+                  log "WORKING #$($workingProxies.Count): $p (IP: $ip / $country - $($loc.org))"
                 }
               }
             } catch {}
-            if (-not $fallbackProxy) {
-              $fallbackProxy = $p
-              $fallbackIp = $ip
-              log "  Fallback candidate: $p (IP: $ip) - will use if no NL/IN found"
+            if ($fallbackProxies.Count -eq 0) {
+              $fallbackProxies += @{ url = $p; ip = $ip }
             }
           }
 
-          if (-not $selected -and $fallbackProxy) {
-            $selected = $fallbackProxy
-            $selectedIp = $fallbackIp
-            log ""
-            log "No NL/IN proxy found - using fallback: $selected (IP: $selectedIp)"
+          if ($workingProxies.Count -eq 0 -and $fallbackProxies.Count -gt 0) {
+            log "No NL/IN proxies found - using fallback: $($fallbackProxies[0].url) (IP: $($fallbackProxies[0].ip))"
+            $workingProxies = $fallbackProxies
           }
 
-          if (-not $selected) {
+          if ($workingProxies.Count -eq 0) {
             Write-Error "No working SOCKS5 proxy found after testing all sources."
             log ""
             log "TROUBLESHOOTING:"
@@ -201,26 +193,35 @@ jobs:
             exit 1
           }
 
-          $regionLabel = ""
+          log ""
+          log "=== Collected $($workingProxies.Count) working proxies ==="
+
+          # Set primary proxy vars (ALL_PROXY uses first proxy)
+          $primary = $workingProxies[0].url
+          $primaryIp = $workingProxies[0].ip
+          $primaryCountry = $workingProxies[0].country
+
+          # Build comma-separated PROXY_URL for Go DVR rotation
+          $proxyUrlList = ($workingProxies | ForEach-Object { $_.url }) -join ","
+          echo "PROXY_URL=$proxyUrlList" >> $env:GITHUB_ENV
+          echo "ALL_PROXY=$primary" >> $env:GITHUB_ENV
+          echo "all_proxy=$primary" >> $env:GITHUB_ENV
+          echo "SOCKS_PROXY=$primary" >> $env:GITHUB_ENV
+
+          & git config --global http.proxy $primary
+          & git config --global https.proxy $primary
+          log "[OK] Git configured to use $primary"
+          log "[OK] PROXY_URL set with $($workingProxies.Count) proxies for rotation"
+          foreach ($wp in $workingProxies) {
+            log "  [$($wp.country)] $($wp.url) (IP: $($wp.ip) - $($wp.org))"
+          }
+
+          log ""
+          log "Verifying primary proxy egress..."
           try {
-            $loc = curl.exe -x $selected -s -m 8 https://ipinfo.io/json 2>$null | ConvertFrom-Json
-            $regionLabel = " / $($loc.country) - $($loc.org)"
-          } catch {}
-
-          echo "ALL_PROXY=$selected" >> $env:GITHUB_ENV
-          echo "all_proxy=$selected" >> $env:GITHUB_ENV
-          echo "SOCKS_PROXY=$selected" >> $env:GITHUB_ENV
-
-          & git config --global http.proxy $selected
-          & git config --global https.proxy $selected
-          log "[OK] Git configured to use $selected$regionLabel"
-          log "[OK] Proxy configured for Git operations"
-
-          log "Verifying proxy egress..."
-          try {
-            $ip = curl.exe -x $selected -s -m 10 https://api.ipify.org 2>$null
+            $ip = curl.exe -x $primary -s -m 10 https://api.ipify.org 2>$null
             $LASTEXITCODE = 0
-            $loc = curl.exe -x $selected -s -m 10 https://ipinfo.io/json 2>$null | ConvertFrom-Json
+            $loc = curl.exe -x $primary -s -m 10 https://ipinfo.io/json 2>$null | ConvertFrom-Json
             $LASTEXITCODE = 0
             log "Public IP: $ip / $($loc.country) - $($loc.org)"
           } catch { log "Verification failed: $_" }
@@ -517,8 +518,10 @@ jobs:
             "# and expects an HTTP proxy, not SOCKS5. The DVR uses PROXY_URL",
             "# (via httpcloak) which handles SOCKS5 natively.",
             "`$env:SOCKS_PROXY = `"$proxyUrl`"",
-            "`$env:PROXY_URL = `"$proxyUrl`"",
-            "`$env:PROXY_SERVER = `"$proxyUrl`"",
+            "# PROXY_URL is already set at workflow level with comma-separated list",
+            "# for automatic rotation. Only set if not already present.",
+            "if (-not `$env:PROXY_URL) { `$env:PROXY_URL = `"$proxyUrl`" }",
+            "if (-not `$env:PROXY_SERVER) { `$env:PROXY_SERVER = `"$proxyUrl`" }",
             "# Pooled mode env vars (distributed shards)",
             "`$env:CHANNEL_POOL_MODE = `"${{ secrets.CHANNEL_POOL_MODE }}`"",
             "`$env:NODE_ID = `"${{ secrets.NODE_ID }}`"",
@@ -851,6 +854,10 @@ jobs:
           Write-Host "=== Starting DVR ==="
           Set-Location $repoDir
           
+          Write-Host "[OK] PROXY_URL=$env:PROXY_URL"
+          Write-Host "[OK] ALL_PROXY=$env:ALL_PROXY"
+          Write-Host "[OK] $($env:PROXY_URL.Split(',').Count) proxies available for rotation"
+
           $backupHTTP = $env:HTTP_PROXY
           $backupHTTPS = $env:HTTPS_PROXY
           Remove-Item Env:HTTP_PROXY -ErrorAction SilentlyContinue
