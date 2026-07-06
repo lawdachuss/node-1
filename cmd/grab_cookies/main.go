@@ -26,11 +26,8 @@ func main() {
 	if userAgent == "" {
 		userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 	}
-	oldCookieStr := os.Getenv("COOKIES")
-
 	fmt.Println("=== Cookie Grabber ===")
 	fmt.Printf("User-Agent: %s\n", userAgent)
-	fmt.Printf("Existing cookies: %d chars\n", len(oldCookieStr))
 	fmt.Println()
 
 	// Use env PROXY_URL first (already tested by workflow), fall back to dynamic fetch
@@ -87,7 +84,7 @@ func main() {
 				return
 			}
 			fmt.Printf("  Proxy [%d/%d]: %s\n", idx+1, len(workingURLs), proxyURL)
-			cookies := tryHTTPCloak(ctx, proxyURL, userAgent, oldCookieStr)
+			cookies := tryHTTPCloak(ctx, proxyURL, userAgent)
 			if cookies == nil || done.Load() {
 				return
 			}
@@ -97,7 +94,7 @@ func main() {
 			fmt.Println("  Got cookies — saving and exiting")
 			done.Store(true)
 			cancel()
-			saveAndExit(cookies, oldCookieStr, userAgent)
+			saveAndExit(cookies, userAgent)
 		}(pi, p)
 	}
 	wg.Wait()
@@ -108,19 +105,14 @@ func main() {
 	}
 }
 
-func saveAndExit(cookies map[string]string, oldCookieStr, userAgent string) {
-	merged := parseCookies(oldCookieStr)
-	for k, v := range cookies {
-		merged[k] = v
-	}
-
+func saveAndExit(cookies map[string]string, userAgent string) {
 	var parts []string
-	for k, v := range merged {
+	for k, v := range cookies {
 		parts = append(parts, fmt.Sprintf("%s=%s", k, v))
 	}
-	newCookieStr := strings.Join(parts, "; ")
+	cookieStr := strings.Join(parts, "; ")
 
-	updateEnvFile(".env", "COOKIES", newCookieStr)
+	updateEnvFile(".env", "COOKIES", cookieStr)
 	if userAgent != "" {
 		updateEnvFile(".env", "USER_AGENT", userAgent)
 	}
@@ -128,16 +120,14 @@ func saveAndExit(cookies map[string]string, oldCookieStr, userAgent string) {
 	fmt.Println("\n=== COOKIES UPDATED ===")
 	if v, ok := cookies["cf_clearance"]; ok {
 		fmt.Printf("cf_clearance: fresh! (timestamp: %s)\n", extractTimestamp(v))
-	} else {
-		fmt.Println("cf_clearance: unchanged (still valid)")
 	}
 	if v, ok := cookies["__cf_bm"]; ok {
 		fmt.Printf("__cf_bm: fresh! (timestamp: %s)\n", extractTimestamp(v))
 	}
-	fmt.Printf("\nTotal cookies: %d\n", len(merged))
+	fmt.Printf("\nTotal cookies: %d\n", len(cookies))
 }
 
-func tryHTTPCloak(ctx context.Context, proxyURL, userAgent, cookieStr string) map[string]string {
+func tryHTTPCloak(ctx context.Context, proxyURL, userAgent string) map[string]string {
 	opts := []httpcloak.Option{
 		httpcloak.WithTimeout(15 * time.Second),
 	}
@@ -155,9 +145,6 @@ func tryHTTPCloak(ctx context.Context, proxyURL, userAgent, cookieStr string) ma
 	headers := map[string][]string{
 		"User-Agent": {userAgent},
 		"Accept":     {"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
-	}
-	if cookieStr != "" {
-		headers["Cookie"] = []string{cookieStr}
 	}
 
 	resp, err := client.Do(ctx, &httpcloak.Request{
