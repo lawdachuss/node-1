@@ -708,7 +708,7 @@ jobs:
             "Remove-Item Env:https_proxy -ErrorAction SilentlyContinue",
             "",
             "Write-Host `"[DVR Wrapper] Starting chaturbate-dvr.exe with $proxyLabel`"",
-            "Write-Host `"[DVR Wrapper] Proxy: $(if (`$env:PROXY_URL) { `$env:PROXY_URL } else { 'direct' })`"",
+            "Write-Host `"[DVR Wrapper] Proxy: $proxyUrl`"",
             "Write-Host `"[DVR Wrapper] Working Directory: $repoDir`"",
             "Write-Host `"[DVR Wrapper] Videos Directory: $videosDir`"",
             "Write-Host `"[DVR Wrapper] Time: `$(Get-Date)`"",
