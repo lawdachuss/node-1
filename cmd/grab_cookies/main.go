@@ -11,8 +11,6 @@ import (
 )
 
 func main() {
-	fmt.Println("=== Cookie Grabber (Scrapling) ===")
-	fmt.Println()
 	exitCode := 0
 	defer func() { os.Exit(exitCode) }()
 
