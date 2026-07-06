@@ -5,12 +5,11 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net/http"
-	"net/http/cookiejar"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sardanioss/httpcloak"
@@ -74,71 +73,89 @@ func main() {
 
 	// Track best attempt — if we get any cookies (even without fresh cf_clearance),
 	// save them so __cf_bm gets refreshed.
-	var bestCookies map[string]string
+	var bestCookies atomic.Value // stores map[string]string
+	var bestMu sync.Mutex
 
-	// Phase 1: httpcloak without old cookies — try each proxy
-	fmt.Println("[1/3] httpcloak (no cookies)...")
+	// Phase 1: httpcloak without old cookies — test all proxies in parallel
+	fmt.Println("[1/2] httpcloak (no cookies)...")
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	var wg sync.WaitGroup
+	done := atomic.Bool{}
 	for pi, p := range workingURLs {
-		fmt.Printf("  Proxy [%d/%d]: %s\n", pi+1, len(workingURLs), p)
-		for attempt := 0; attempt < 3; attempt++ {
-			cookies := tryHTTPCloak(p, userAgent, "")
-			if cookies != nil {
-				if v, ok := cookies["cf_clearance"]; ok && v != "" {
-					fmt.Println("  Fresh cf_clearance obtained!")
-					saveAndExit(cookies, oldCookieStr, userAgent)
-					return
-				}
-				if bestCookies == nil {
-					bestCookies = cookies
-				}
-				break
+		wg.Add(1)
+		go func(idx int, proxyURL string) {
+			defer wg.Done()
+			if done.Load() {
+				return
 			}
-			if attempt < 2 {
-				fmt.Printf("    Retrying (%d/3)...\n", attempt+2)
-				time.Sleep(3 * time.Second)
+			fmt.Printf("  Proxy [%d/%d]: %s\n", idx+1, len(workingURLs), proxyURL)
+			cookies := tryHTTPCloak(ctx, proxyURL, userAgent, "")
+			if cookies == nil {
+				return
 			}
-		}
+			bestMu.Lock()
+			if bestCookies.Load() == nil {
+				bestCookies.Store(cookies)
+			}
+			if v, ok := cookies["cf_clearance"]; ok && v != "" {
+				fmt.Println("  Fresh cf_clearance obtained!")
+				bestMu.Unlock()
+				done.Store(true)
+				saveAndExit(cookies, oldCookieStr, userAgent)
+				return
+			}
+			bestMu.Unlock()
+		}(pi, p)
+	}
+	wg.Wait()
+	if done.Load() {
+		return
 	}
 
 	// Phase 2: httpcloak with old cookies (better chance of getting cf_clearance)
-	if bestCookies == nil || bestCookies["cf_clearance"] == "" {
-		fmt.Println("[2/3] httpcloak (with existing cookies)...")
+	bc, _ := bestCookies.Load().(map[string]string)
+	if bc == nil || bc["cf_clearance"] == "" {
+		fmt.Println("[2/2] httpcloak (with existing cookies)...")
+		ctx2, cancel2 := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel2()
+		done.Store(false)
 		for pi, p := range workingURLs {
-			fmt.Printf("  Proxy [%d/%d]: %s\n", pi+1, len(workingURLs), p)
-			for attempt := 0; attempt < 3; attempt++ {
-				cookies := tryHTTPCloak(p, userAgent, oldCookieStr)
-				if cookies != nil {
-					if v, ok := cookies["cf_clearance"]; ok && v != "" {
-						fmt.Println("  Fresh cf_clearance obtained!")
-						saveAndExit(cookies, oldCookieStr, userAgent)
-						return
-					}
-					if bestCookies == nil {
-						bestCookies = cookies
-					}
-					break
+			wg.Add(1)
+			go func(idx int, proxyURL string) {
+				defer wg.Done()
+				if done.Load() {
+					return
 				}
-				if attempt < 2 {
-					fmt.Printf("    Retrying (%d/3)...\n", attempt+2)
-					time.Sleep(3 * time.Second)
+				fmt.Printf("  Proxy [%d/%d]: %s\n", idx+1, len(workingURLs), proxyURL)
+				cookies := tryHTTPCloak(ctx2, proxyURL, userAgent, oldCookieStr)
+				if cookies == nil {
+					return
 				}
-			}
+				bestMu.Lock()
+				if bestCookies.Load() == nil {
+					bestCookies.Store(cookies)
+				}
+				if v, ok := cookies["cf_clearance"]; ok && v != "" {
+					fmt.Println("  Fresh cf_clearance obtained!")
+					bestMu.Unlock()
+					done.Store(true)
+					saveAndExit(cookies, oldCookieStr, userAgent)
+					return
+				}
+				bestMu.Unlock()
+			}(pi, p)
+		}
+		wg.Wait()
+		if done.Load() {
+			return
 		}
 	}
 
-	// Phase 3: Go default client (HTTP proxy only)
-	fmt.Println("[3/3] Go default HTTP client...")
-	for _, p := range workingURLs {
-		cookies := tryDefaultClient(p, userAgent, oldCookieStr)
-		if cookies != nil {
-			bestCookies = cookies
-			break
-		}
-	}
-
-	if bestCookies != nil {
+	bc, _ = bestCookies.Load().(map[string]string)
+	if bc != nil {
 		fmt.Println("\nNo fresh cf_clearance from Cloudflare (old one still valid), but refreshing __cf_bm and other session cookies")
-		saveAndExit(bestCookies, oldCookieStr, userAgent)
+		saveAndExit(bc, oldCookieStr, userAgent)
 		return
 	}
 
@@ -175,9 +192,9 @@ func saveAndExit(cookies map[string]string, oldCookieStr, userAgent string) {
 	fmt.Printf("\nTotal cookies: %d\n", len(merged))
 }
 
-func tryHTTPCloak(proxyURL, userAgent, cookieStr string) map[string]string {
+func tryHTTPCloak(ctx context.Context, proxyURL, userAgent, cookieStr string) map[string]string {
 	opts := []httpcloak.Option{
-		httpcloak.WithTimeout(60 * time.Second),
+		httpcloak.WithTimeout(30 * time.Second),
 	}
 	if proxyURL != "" {
 		opts = append(opts, httpcloak.WithProxy(proxyURL))
@@ -199,16 +216,16 @@ func tryHTTPCloak(proxyURL, userAgent, cookieStr string) map[string]string {
 		headers["Cookie"] = []string{cookieStr}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
 	resp, err := client.Do(ctx, &httpcloak.Request{
 		Method:  "GET",
 		URL:     "https://chaturbate.com",
 		Headers: headers,
-		Timeout: 60 * time.Second,
+		Timeout: 30 * time.Second,
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		fmt.Printf("  httpcloak error: %v\n", err)
 		return nil
 	}
@@ -231,8 +248,7 @@ func tryHTTPCloak(proxyURL, userAgent, cookieStr string) map[string]string {
 	// If no cf_clearance, try a second URL to trigger challenge
 	if _, has := cookies["cf_clearance"]; !has || cookies["cf_clearance"] == "" {
 		fmt.Println("  No cf_clearance — visiting auth page to trigger challenge...")
-		time.Sleep(2 * time.Second)
-		c2 := visitURL(client, userAgent, cookieStr, "https://chaturbate.com/auth/login/?next=/")
+		c2 := visitURL(ctx, client, userAgent, cookieStr, "https://chaturbate.com/auth/login/?next=/")
 		if c2 != nil {
 			for k, v := range c2 {
 				if k == "cf_clearance" && v != "" {
@@ -246,7 +262,7 @@ func tryHTTPCloak(proxyURL, userAgent, cookieStr string) map[string]string {
 	return cookies
 }
 
-func visitURL(client *httpcloak.Client, userAgent, cookieStr, targetURL string) map[string]string {
+func visitURL(ctx context.Context, client *httpcloak.Client, userAgent, cookieStr, targetURL string) map[string]string {
 	headers := map[string][]string{
 		"User-Agent": {userAgent},
 		"Accept":     {"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
@@ -254,8 +270,6 @@ func visitURL(client *httpcloak.Client, userAgent, cookieStr, targetURL string) 
 	if cookieStr != "" {
 		headers["Cookie"] = []string{cookieStr}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	resp, err := client.Do(ctx, &httpcloak.Request{
 		Method:  "GET",
 		URL:     targetURL,
@@ -290,75 +304,6 @@ func extractCookies(headers map[string][]string) map[string]string {
 		}
 	}
 	return cookies
-}
-
-func tryDefaultClient(proxyURL, userAgent, cookieStr string) map[string]string {
-	jar, _ := cookiejar.New(nil)
-	tr := &http.Transport{
-		MaxIdleConns:      1,
-		IdleConnTimeout:   30 * time.Second,
-		DisableKeepAlives: true,
-	}
-
-	if strings.HasPrefix(proxyURL, "http://") || strings.HasPrefix(proxyURL, "https://") {
-		proxyURLParsed, err := url.Parse(proxyURL)
-		if err == nil {
-			tr.Proxy = http.ProxyURL(proxyURLParsed)
-		}
-	} else if strings.HasPrefix(proxyURL, "socks5://") || strings.HasPrefix(proxyURL, "socks5h://") {
-		fmt.Println("  SOCKS5 not supported by Go default transport")
-		return nil
-	}
-
-	client := &http.Client{
-		Timeout:   60 * time.Second,
-		Transport: tr,
-		Jar:       jar,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return nil
-		},
-	}
-
-	req, err := http.NewRequest("GET", "https://chaturbate.com", nil)
-	if err != nil {
-		return nil
-	}
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
-	if cookieStr != "" {
-		req.Header.Set("Cookie", cookieStr)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Printf("  default client error: %v\n", err)
-		return nil
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-	fmt.Printf("  Status: %d\n", resp.StatusCode)
-
-	cookies := make(map[string]string)
-	for _, c := range jar.Cookies(req.URL) {
-		cookies[c.Name] = c.Value
-	}
-	for _, setCookie := range resp.Header.Values("Set-Cookie") {
-		if idx := strings.Index(setCookie, "="); idx > 0 {
-			name := setCookie[:idx]
-			rest := setCookie[idx+1:]
-			if idx2 := strings.Index(rest, ";"); idx2 > 0 {
-				cookies[name] = rest[:idx2]
-			} else {
-				cookies[name] = rest
-			}
-		}
-	}
-	if len(cookies) > 0 {
-		fmt.Printf("  Got %d cookies\n", len(cookies))
-		return cookies
-	}
-	return nil
 }
 
 // getProxyURLs returns all proxy URLs from the environment.
