@@ -472,8 +472,19 @@ jobs:
       - name: Install Scrapling (Python Cloudflare bypass)
         shell: powershell
         run: |
-          pip install "scrapling[fetchers]" 2>&1 | Out-String
-          python -m scrapling install 2>&1 | Out-String
+          # Unset proxy vars - pip doesn't support SOCKS5
+          $savedAll = $env:ALL_PROXY; Remove-Item Env:ALL_PROXY -ErrorAction SilentlyContinue
+          $savedHttp = $env:HTTP_PROXY; Remove-Item Env:HTTP_PROXY -ErrorAction SilentlyContinue
+          $savedHttps = $env:HTTPS_PROXY; Remove-Item Env:HTTPS_PROXY -ErrorAction SilentlyContinue
+          Remove-Item Env:all_proxy,Env:http_proxy,Env:https_proxy -ErrorAction SilentlyContinue
+          pip install "scrapling[fetchers]"
+          if ($LASTEXITCODE -ne 0) { throw "pip install scrapling failed" }
+          python -m playwright install chromium
+          if ($LASTEXITCODE -ne 0) { Write-Warning "playwright install chromium failed" }
+          # Restore proxy vars
+          if ($savedAll) { $env:ALL_PROXY = $savedAll; $env:all_proxy = $savedAll }
+          if ($savedHttp) { $env:HTTP_PROXY = $savedHttp }
+          if ($savedHttps) { $env:HTTPS_PROXY = $savedHttps }
           Write-Host "[OK] Scrapling installed"
 
       - name: Refresh Chaturbate Cookies via Go Grabber (through SOCKS5 proxy)
