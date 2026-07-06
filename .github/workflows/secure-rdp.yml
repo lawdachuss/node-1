@@ -469,6 +469,13 @@ jobs:
         with:
           go-version: '1.26'
 
+      - name: Install Scrapling (Python Cloudflare bypass)
+        shell: powershell
+        run: |
+          pip install scrapling[fetchers] 2>&1
+          scrapling install 2>&1
+          Write-Host "[OK] Scrapling installed"
+
       - name: Refresh Chaturbate Cookies via Go Grabber (through SOCKS5 proxy)
         shell: powershell
         env:

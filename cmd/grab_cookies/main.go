@@ -2,21 +2,17 @@ package main
 
 import (
 	"bufio"
-	"context"
+	"encoding/json"
 	"fmt"
-	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
-
-	"github.com/sardanioss/httpcloak"
-	"github.com/teacat/chaturbate-dvr/internal/proxy"
 )
 
 func main() {
+	fmt.Println("=== Cookie Grabber (Scrapling) ===")
+	fmt.Println()
 	exitCode := 0
 	defer func() { os.Exit(exitCode) }()
 
@@ -26,83 +22,98 @@ func main() {
 	if userAgent == "" {
 		userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 	}
-	fmt.Println("=== Cookie Grabber ===")
-	fmt.Printf("User-Agent: %s\n", userAgent)
+
+	fmt.Println("=== Cookie Grabber (Scrapling) ===")
 	fmt.Println()
 
-	// Use env PROXY_URL first (already tested by workflow), fall back to dynamic fetch
+	// Get proxy — use PROXY_URL from env first
+	proxyURL := ""
 	envProxies := getProxyURLs()
-	var proxies []proxy.ProxyResult
 	if len(envProxies) > 0 {
-		fmt.Printf("Using %d proxies from PROXY_URL\n", len(envProxies))
-		for _, p := range envProxies {
-			proxies = append(proxies, proxy.ProxyResult{URL: p, OK: true})
-		}
+		proxyURL = envProxies[0]
+		fmt.Printf("Proxy: %s\n", proxyURL)
 	} else {
-		fmt.Println("Fetching SOCKS5 proxies from public lists...")
-		ctx := context.Background()
-		var err error
-		proxies, err = proxy.FetchProxies(ctx, 5)
-		if err != nil {
-			fmt.Printf("  [FAIL] No dynamic proxies found: %v\n", err)
-			exitCode = 1
-			return
-		}
-		fmt.Printf("Using %d dynamically discovered proxies\n", len(proxies))
-	}
-	for i, p := range proxies {
-		fmt.Printf("  [%d] %s [%s]\n", i+1, p.URL, p.Country)
-	}
-	fmt.Println()
-
-	// Build working proxy URL list
-	var workingURLs []string
-	for _, p := range proxies {
-		if p.OK {
-			workingURLs = append(workingURLs, p.URL)
-		}
-	}
-	if len(workingURLs) == 0 {
-		fmt.Println("\n[FAIL] No working proxies found — cannot bypass face-id verification")
+		fmt.Println("No PROXY_URL set")
 		exitCode = 1
 		return
 	}
 
-	// Test all proxies in parallel. Stop on first success — we just need
-	// fresh __cf_bm; old cf_clearance is preserved from .env.
-	fmt.Println("[1/1] Fetching cookies (parallel, stop on first success)...")
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := atomic.Bool{}
-	var wg sync.WaitGroup
-	var result atomic.Value // stores map[string]string
-	for pi, p := range workingURLs {
-		wg.Add(1)
-		go func(idx int, proxyURL string) {
-			defer wg.Done()
-			if done.Load() {
-				return
-			}
-			fmt.Printf("  Proxy [%d/%d]: %s\n", idx+1, len(workingURLs), proxyURL)
-			cookies := tryHTTPCloak(ctx, proxyURL, userAgent)
-			if cookies == nil || done.Load() {
-				return
-			}
-			if result.Load() == nil {
-				result.Store(cookies)
-			}
-			fmt.Println("  Got cookies — saving and exiting")
-			done.Store(true)
-			cancel()
-			saveAndExit(cookies, userAgent)
-		}(pi, p)
-	}
-	wg.Wait()
-
-	if result.Load() == nil {
-		fmt.Println("\n[FAIL] Could not obtain cookies from any method")
+	// Write Python script to temp file
+	tmpFile, err := os.CreateTemp("", "grab_cookies_*.py")
+	if err != nil {
+		fmt.Printf("[FAIL] Cannot create temp script: %v\n", err)
 		exitCode = 1
+		return
 	}
+	tmpPath := tmpFile.Name()
+	tmpFile.WriteString(pythonScript)
+	tmpFile.Close()
+	defer os.Remove(tmpPath)
+
+	// Run Scrapling
+	fmt.Println("Running Scrapling browser (solving Cloudflare challenge)...")
+	cmd := exec.Command("python", tmpPath, proxyURL)
+	stdout := &strings.Builder{}
+	stderr := &strings.Builder{}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	err = cmd.Run()
+	if stderr.Len() > 0 {
+		for _, line := range strings.Split(strings.TrimSpace(stderr.String()), "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" {
+				fmt.Printf("  %s\n", line)
+			}
+		}
+	}
+	outStr := stdout.String()
+
+	// Find JSON in output (Scrapling may print log lines before the JSON)
+	jsonStart := strings.Index(outStr, "{")
+	if jsonStart >= 0 {
+		outStr = outStr[jsonStart:]
+	} else {
+		jsonStart = strings.Index(outStr, "[")
+		if jsonStart >= 0 {
+			// Might be an error array
+			outStr = outStr[jsonStart:]
+		}
+	}
+
+	var result struct {
+		Success bool              `json:"success"`
+		Cookies map[string]string `json:"cookies"`
+		Status  int               `json:"status"`
+	}
+	if json.Unmarshal([]byte(outStr), &result) != nil || !result.Success {
+		fmt.Printf("[FAIL] Scrapling failed\n  Raw: %s\n", strings.TrimSpace(outStr))
+		exitCode = 1
+		return
+	}
+
+	if !result.Success || len(result.Cookies) == 0 {
+		fmt.Println("[FAIL] Scrapling returned no cookies")
+		exitCode = 1
+		return
+	}
+
+	fmt.Printf("Status: %d\n", result.Status)
+	fmt.Printf("Got %d cookies\n", len(result.Cookies))
+	if v, ok := result.Cookies["cf_clearance"]; ok {
+		fmt.Printf("cf_clearance: fresh! (length: %d)\n", len(v))
+	}
+	if v, ok := result.Cookies["__cf_bm"]; ok {
+		fmt.Printf("__cf_bm: fresh! (length: %d)\n", len(v))
+	}
+
+	// Must have cf_clearance — exit 1 if missing so workflow restores old secret
+	if v, ok := result.Cookies["cf_clearance"]; !ok || v == "" {
+		fmt.Println("[FAIL] No cf_clearance — preserving old cookies from secret")
+		exitCode = 1
+		return
+	}
+
+	saveAndExit(result.Cookies, userAgent)
 }
 
 func saveAndExit(cookies map[string]string, userAgent string) {
@@ -118,84 +129,10 @@ func saveAndExit(cookies map[string]string, userAgent string) {
 	}
 
 	fmt.Println("\n=== COOKIES UPDATED ===")
-	if v, ok := cookies["cf_clearance"]; ok {
-		fmt.Printf("cf_clearance: fresh! (timestamp: %s)\n", extractTimestamp(v))
-	}
-	if v, ok := cookies["__cf_bm"]; ok {
-		fmt.Printf("__cf_bm: fresh! (timestamp: %s)\n", extractTimestamp(v))
-	}
-	fmt.Printf("\nTotal cookies: %d\n", len(cookies))
-}
-
-func tryHTTPCloak(ctx context.Context, proxyURL, userAgent string) map[string]string {
-	opts := []httpcloak.Option{
-		httpcloak.WithTimeout(15 * time.Second),
-	}
-	if proxyURL != "" {
-		opts = append(opts, httpcloak.WithProxy(proxyURL))
-	} else {
-		fmt.Println("  No proxy configured, trying direct...")
-	}
-
-	client := httpcloak.New("chrome-146-windows", opts...)
-	if c, ok := interface{}(client).(interface{ Close() error }); ok {
-		defer c.Close()
-	}
-
-	headers := map[string][]string{
-		"User-Agent": {userAgent},
-		"Accept":     {"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
-	}
-
-	resp, err := client.Do(ctx, &httpcloak.Request{
-		Method:  "GET",
-		URL:     "https://chaturbate.com",
-		Headers: headers,
-		Timeout: 15 * time.Second,
-	})
-	if err != nil {
-		return nil
-	}
-	fmt.Printf("  Status: %d\n", resp.StatusCode)
-	_, _ = io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-
-	cookies := extractCookies(resp.Headers)
-	if len(cookies) == 0 {
-		return nil
-	}
-
-	fmt.Printf("  Got %d cookies\n", len(cookies))
-	for k, v := range cookies {
-		if k == "cf_clearance" || k == "__cf_bm" {
-			fmt.Printf("    %s = ...%s (ts: %s)\n", k, truncate(v, 20), extractTimestamp(v))
-		}
-	}
-	return cookies
-}
-
-func extractCookies(headers map[string][]string) map[string]string {
-	cookies := make(map[string]string)
-	for key, vals := range headers {
-		if strings.EqualFold(key, "Set-Cookie") {
-			for _, setCookie := range vals {
-				if idx := strings.Index(setCookie, "="); idx > 0 {
-					name := setCookie[:idx]
-					rest := setCookie[idx+1:]
-					if idx2 := strings.Index(rest, ";"); idx2 > 0 {
-						cookies[name] = rest[:idx2]
-					} else {
-						cookies[name] = rest
-					}
-				}
-			}
-		}
-	}
-	return cookies
+	fmt.Printf("Total cookies: %d\n", len(cookies))
 }
 
 // getProxyURLs returns all proxy URLs from the environment.
-// Supports PROXY_URL (comma-separated for failover), falling back to ALL_PROXY.
 func getProxyURLs() []string {
 	raw := os.Getenv("PROXY_URL")
 	if raw == "" {
@@ -215,48 +152,6 @@ func getProxyURLs() []string {
 }
 
 // ─── helpers ───────────────────────────────────────────────
-
-func parseCookies(s string) map[string]string {
-	m := make(map[string]string)
-	for _, pair := range strings.Split(s, ";") {
-		pair = strings.TrimSpace(pair)
-		if idx := strings.Index(pair, "="); idx > 0 {
-			m[pair[:idx]] = pair[idx+1:]
-		}
-	}
-	return m
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[len(s)-n:]
-}
-
-func extractTimestamp(cfClearance string) string {
-	idx := strings.Index(cfClearance, "-")
-	if idx < 0 {
-		return "unknown"
-	}
-	tsStr := cfClearance[idx+1:]
-	if idx2 := strings.Index(tsStr, "-"); idx2 >= 0 {
-		tsStr = tsStr[:idx2]
-	}
-	return fmt.Sprintf("%s (%s)", tsStr, time.Unix(parseInt64(tsStr), 0).Format(time.RFC3339))
-}
-
-func parseInt64(s string) int64 {
-	var n int64
-	for i := 0; i < len(s); i++ {
-		if s[i] >= '0' && s[i] <= '9' {
-			n = n*10 + int64(s[i]-'0')
-		} else {
-			break
-		}
-	}
-	return n
-}
 
 func loadDotEnv(path string) {
 	f, err := os.Open(path)
@@ -324,3 +219,25 @@ func updateEnvFile(path, key, value string) {
 	}
 	fmt.Printf("  [OK] Updated %s in %s\n", key, path)
 }
+
+const pythonScript = `"""Grab cookies from chaturbate.com using Scrapling's StealthyFetcher."""
+import json,sys,os,logging
+logging.getLogger().setLevel(logging.CRITICAL)
+from scrapling.fetchers import StealthyFetcher
+proxy=sys.argv[1] if len(sys.argv)>1 else None
+try:
+ resp=StealthyFetcher.fetch("https://chaturbate.com",headless=True,network_idle=True,solve_cloudflare=True,timeout=90000,proxy=proxy,load_dom=True)
+ cookies={}
+ if isinstance(resp.cookies,tuple):
+  for c in resp.cookies:
+   if isinstance(c,dict)and"name"in c:
+    cookies[c["name"]]=c["value"]
+   elif isinstance(c,dict):
+    cookies.update(c)
+ elif isinstance(resp.cookies,dict):
+  cookies=dict(resp.cookies)
+ print(json.dumps({"success":True,"cookies":cookies,"status":resp.status}))
+except Exception as e:
+ print(json.dumps({"success":False,"error":str(e)}))
+ sys.exit(1)
+`

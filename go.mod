@@ -13,7 +13,7 @@ require (
 	github.com/sardanioss/httpcloak v1.6.6
 	github.com/urfave/cli/v2 v2.27.6
 	golang.org/x/net v0.48.0
-	golang.org/x/sys v0.39.0
+	golang.org/x/sys v0.42.0
 )
 
 require (
