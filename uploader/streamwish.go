@@ -14,8 +14,9 @@ const (
 )
 
 type StreamWishUploader struct {
-	keys   *keyRing
-	client *http.Client
+	keys         *keyRing
+	client       *http.Client
+	cachedServer string // cached upload server URL to skip getUploadServer on retries
 }
 
 func NewStreamWishUploader(apiKeys []string) *StreamWishUploader {
@@ -133,9 +134,14 @@ func (u *StreamWishUploader) getUploadServer(apiKey string) (string, error) {
 }
 
 func (u *StreamWishUploader) uploadFile(filePath string, progress ProgressFunc, apiKey string) (string, error) {
-	uploadServer, err := u.getUploadServer(apiKey)
-	if err != nil {
-		return "", fmt.Errorf("get upload server: %w", err)
+	uploadServer := u.cachedServer
+	if uploadServer == "" {
+		var err error
+		uploadServer, err = u.getUploadServer(apiKey)
+		if err != nil {
+			return "", fmt.Errorf("get upload server: %w", err)
+		}
+		u.cachedServer = uploadServer
 	}
 
 	body, contentLen, contentType, file, err := multipartStreamWithProgress(

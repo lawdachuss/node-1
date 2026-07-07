@@ -54,8 +54,9 @@ func newNoProxyClient(timeout time.Duration) *http.Client {
 			DialContext:         dialWithTuning(30 * time.Second),
 			MaxIdleConns:        200,
 			MaxIdleConnsPerHost: 50,
-			IdleConnTimeout:     120 * time.Second,
-			TLSHandshakeTimeout: 15 * time.Second,
+			IdleConnTimeout:       120 * time.Second,
+			TLSHandshakeTimeout:   15 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
 		},
 	}
 }
@@ -79,6 +80,7 @@ func newDefaultClient(timeout time.Duration) *http.Client {
 		IdleConnTimeout:       120 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
 		DialContext:           dialWithTuning(30 * time.Second),
 	}
 
