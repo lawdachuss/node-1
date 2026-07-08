@@ -22,7 +22,7 @@ type VidHideUploader struct {
 func NewVidHideUploader(apiKeys []string) *VidHideUploader {
 	return &VidHideUploader{
 		keys:   newKeyRing(apiKeys),
-		client: newDefaultClient(120 * time.Minute),
+		client: newDirectClient(120 * time.Minute),
 	}
 }
 

@@ -22,7 +22,7 @@ type StreamWishUploader struct {
 func NewStreamWishUploader(apiKeys []string) *StreamWishUploader {
 	return &StreamWishUploader{
 		keys:   newKeyRing(apiKeys),
-		client: newDefaultClient(120 * time.Minute),
+		client: newDirectClient(120 * time.Minute),
 	}
 }
 

@@ -133,6 +133,25 @@ func newDefaultClient(timeout time.Duration) *http.Client {
 	}
 }
 
+// newDirectClient creates an HTTP client with NO proxy at all. Use for hosts
+// whose CDN endpoints are unreachable through the configured proxy (e.g.
+// StreamWish, VidHide on Hetzner-only CDNs).
+func newDirectClient(timeout time.Duration) *http.Client {
+	transport := &http.Transport{
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   50,
+		IdleConnTimeout:       120 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		DialContext:           dialWithTuning(30 * time.Second),
+	}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+	}
+}
+
 // multipartStream builds a multipart request body that streams the file without
 // loading it into RAM, while still setting an exact Content-Length so servers
 // that reject chunked transfer encoding (Streamtape, Mixdrop) work.
