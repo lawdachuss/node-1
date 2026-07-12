@@ -432,7 +432,19 @@ func (ch *Channel) Resume(_ int) {
 	// CancelFunc(), so the old Monitor is on its way out.  Waiting avoids
 	// a TOCTOU race where Resume() runs before the Monitor goroutine's defer
 	// has a chance to finish cleanup, leaving the channel without any Monitor.
-	ch.monitorWg.Wait()
+	// Bounded: if the old Monitor is hung (e.g. on a stalled proxy/CDN request
+	// that ignores context cancellation), never block the HTTP handler forever
+	// — start the new Monitor anyway and let the stale one exit on its own.
+	waitDone := make(chan struct{})
+	go func() {
+		ch.monitorWg.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+	case <-time.After(20 * time.Second):
+		ch.Warn("resume: previous monitor did not exit within 20s (likely hung on a stalled proxy/CDN request); starting new monitor anyway")
+	}
 
 	ch.Config.IsPaused.Store(false)
 	ch.Update()

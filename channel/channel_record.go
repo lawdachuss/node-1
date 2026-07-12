@@ -255,6 +255,8 @@ func (ch *Channel) watchWithGraceCB(ctx context.Context, client *internal.Req, p
 	ch.Info("recording: segment fetch interrupted (%s); %s grace period starts", origErr, defaultGracePeriod)
 
 	deadline := time.Now().Add(defaultGracePeriod)
+	fetchCtx, fetchCancel := context.WithTimeout(ctx, 60*time.Second)
+	defer fetchCancel()
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
@@ -262,13 +264,13 @@ func (ch *Channel) watchWithGraceCB(ctx context.Context, client *internal.Req, p
 		case <-time.After(pollInterval):
 		}
 
-		info, apiErr := siteImpl.FetchStream(ctx, client, ch.Config.Username)
+		info, apiErr := siteImpl.FetchStream(fetchCtx, client, ch.Config.Username)
 		if apiErr != nil {
 			ch.Info("recording: API still unavailable (%s); %s remaining", apiErr, time.Until(deadline).Round(time.Second))
 			continue
 		}
 
-		newPlaylist, apiErr := chaturbate.FetchPlaylist(ctx, info.HLSSource, ch.Config.Resolution, ch.Config.Framerate)
+		newPlaylist, apiErr := chaturbate.FetchPlaylist(fetchCtx, info.HLSSource, ch.Config.Resolution, ch.Config.Framerate)
 		if apiErr != nil {
 			continue
 		}
@@ -304,11 +306,14 @@ func (ch *Channel) watchLoopCB(ctx context.Context, client *internal.Req, p *cha
 			return err
 		}
 		ch.Info("recording: CDN session expired — fetching fresh playlist URL")
-		info, apiErr := siteImpl.FetchStream(ctx, client, ch.Config.Username)
+		fetchCtx, fetchCancel := context.WithTimeout(ctx, 60*time.Second)
+		info, apiErr := siteImpl.FetchStream(fetchCtx, client, ch.Config.Username)
 		if apiErr != nil {
+			fetchCancel()
 			return apiErr
 		}
-		newPlaylist, apiErr := chaturbate.FetchPlaylist(ctx, info.HLSSource, ch.Config.Resolution, ch.Config.Framerate)
+		newPlaylist, apiErr := chaturbate.FetchPlaylist(fetchCtx, info.HLSSource, ch.Config.Resolution, ch.Config.Framerate)
+		fetchCancel()
 		if apiErr != nil {
 			return apiErr
 		}
