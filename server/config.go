@@ -28,7 +28,6 @@ type persistedSettings struct {
 	SeekStreamingKey string `json:"seekstreaming_key,omitempty"`
 	VidHideAPIKey    string `json:"vidhide_api_key,omitempty"`
 	StreamWishAPIKey string `json:"streamwish_api_key,omitempty"`
-	DoodStreamAPIKey string `json:"doodstream_api_key,omitempty"`
 	UpnshareKeys     string `json:"upnshare_keys,omitempty"`
 	StripchatPDKey   string `json:"stripchat_pdkey,omitempty"`
 }
@@ -50,7 +49,6 @@ func SaveSettings() error {
 		SeekStreamingKey: Config.SeekStreamingKey,
 		VidHideAPIKey:    strings.Join(Config.VidHideAPIKeys, ","),
 		StreamWishAPIKey: strings.Join(Config.StreamWishAPIKeys, ","),
-		DoodStreamAPIKey: strings.Join(Config.DoodStreamAPIKeys, ","),
 		UpnshareKeys:     strings.Join(Config.UpnshareKeys, ","),
 		StripchatPDKey:   Config.StripchatPDKey,
 	}
@@ -119,9 +117,6 @@ func LoadSettings() error {
 	if s.StreamWishAPIKey != "" {
 		Config.StreamWishAPIKeys = splitCS(s.StreamWishAPIKey)
 	}
-	if s.DoodStreamAPIKey != "" {
-		Config.DoodStreamAPIKeys = splitCS(s.DoodStreamAPIKey)
-	}
 	if s.UpnshareKeys != "" {
 		Config.UpnshareKeys = splitCS(s.UpnshareKeys)
 	}
@@ -129,7 +124,7 @@ func LoadSettings() error {
 		Config.StripchatPDKey = s.StripchatPDKey
 	}
 
-	fmt.Printf("[startup] after LoadSettings: doodstream keys=%q upnshare keys=%q\n", Config.DoodStreamAPIKeys, Config.UpnshareKeys)
+	fmt.Printf("[startup] after LoadSettings: upnshare keys=%q\n", Config.UpnshareKeys)
 
 	// Parse Config.Cookies back into individual fields if they are empty.
 	if Config.Cookies != "" {
@@ -172,7 +167,7 @@ func extractCookie(cookieStr, name string) string {
 }
 
 // UpdateUploaderCredentials updates upload service credentials and protects concurrent access with a mutex.
-func UpdateUploaderCredentials(voeSXAPIKey, streamtapeLogin, streamtapeKey, mixdropEmail, mixdropToken, seekStreamingKey, vidHideAPIKey, streamWishAPIKey, doodStreamAPIKey, upnshareKey string) {
+func UpdateUploaderCredentials(voeSXAPIKey, streamtapeLogin, streamtapeKey, mixdropEmail, mixdropToken, seekStreamingKey, vidHideAPIKey, streamWishAPIKey, upnshareKey string) {
 	ConfigMu.Lock()
 	if voeSXAPIKey != "" {
 		Config.VoeSXAPIKey = voeSXAPIKey
@@ -197,9 +192,6 @@ func UpdateUploaderCredentials(voeSXAPIKey, streamtapeLogin, streamtapeKey, mixd
 	}
 	if streamWishAPIKey != "" {
 		Config.StreamWishAPIKeys = splitCS(streamWishAPIKey)
-	}
-	if doodStreamAPIKey != "" {
-		Config.DoodStreamAPIKeys = splitCS(doodStreamAPIKey)
 	}
 	if upnshareKey != "" {
 		Config.UpnshareKeys = splitCS(upnshareKey)

@@ -325,12 +325,6 @@ func main() {
 				Value:   "",
 			},
 			&cli.StringFlag{
-				Name:    "doodstream-api-key",
-				Usage:   "API key for DoodStream uploads",
-				EnvVars: []string{"DOODSTREAM_API_KEY"},
-				Value:   "",
-			},
-			&cli.StringFlag{
 				Name:    "supabase-url",
 				Usage:   "Supabase project URL for remote data persistence (REST API fallback)",
 				EnvVars: []string{"SUPABASE_URL"},
@@ -395,9 +389,9 @@ func start(c *cli.Context) error {
 		return fmt.Errorf("new config: %w", err)
 	}
 	fmt.Printf("[startup] config loaded in %v\n", time.Since(started).Round(time.Millisecond))
-	fmt.Printf("[startup] upload keys — streamwish=%d vidhide=%d upnshare=%d doodstream=%d\n",
+	fmt.Printf("[startup] upload keys — streamwish=%d vidhide=%d upnshare=%d\n",
 		len(server.Config.StreamWishAPIKeys), len(server.Config.VidHideAPIKeys),
-		len(server.Config.UpnshareKeys), len(server.Config.DoodStreamAPIKeys))
+		len(server.Config.UpnshareKeys))
 
 	// Load cookies from Supabase if available (overrides .env)
 	if server.Config.SupabaseURL != "" && server.Config.SupabaseAPIKey != "" {

@@ -408,7 +408,6 @@ type UpdateConfigRequest struct {
 	VidHideAPIKey    string `json:"vidhide_api_key" form:"vidhide_api_key"`
 	StreamWishAPIKey string `json:"streamwish_api_key" form:"streamwish_api_key"`
 	UpnshareKey       string `json:"upnshare_key" form:"upnshare_key"`
-	DoodStreamAPIKey  string `json:"doodstream_api_key" form:"doodstream_api_key"`
 	StripchatPDKey    string `json:"stripchat_pdkey" form:"stripchat_pdkey"`
 }
 
@@ -475,9 +474,9 @@ func UpdateConfig(c *gin.Context) {
 
 	// Update uploader credentials
 	if req.VoeSXAPIKey != "" || req.StreamtapeLogin != "" || req.StreamtapeKey != "" || req.MixdropEmail != "" || req.MixdropToken != "" ||
-		req.SeekStreamingKey != "" || req.VidHideAPIKey != "" || req.StreamWishAPIKey != "" || req.UpnshareKey != "" || req.DoodStreamAPIKey != "" {
+		req.SeekStreamingKey != "" || req.VidHideAPIKey != "" || req.StreamWishAPIKey != "" || req.UpnshareKey != "" {
 		server.UpdateUploaderCredentials(req.VoeSXAPIKey, req.StreamtapeLogin, req.StreamtapeKey, req.MixdropEmail, req.MixdropToken,
-			req.SeekStreamingKey, req.VidHideAPIKey, req.StreamWishAPIKey, req.DoodStreamAPIKey, req.UpnshareKey)
+			req.SeekStreamingKey, req.VidHideAPIKey, req.StreamWishAPIKey, req.UpnshareKey)
 	}
 
 	if err := server.SaveSettings(); err != nil {

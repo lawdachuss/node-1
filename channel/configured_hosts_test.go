@@ -28,7 +28,6 @@ func TestConfiguredUploadHostsIncludesSeekStreaming(t *testing.T) {
 		VidHideAPIKeys:     []string{"vh-key"},
 		StreamWishAPIKeys:  []string{"sw-key"},
 		UpnshareKeys:       []string{"us-key"},
-		DoodStreamAPIKeys:  []string{"ds-key"},
 	}
 
 	hosts := configuredUploadHosts()
@@ -40,7 +39,7 @@ func TestConfiguredUploadHostsIncludesSeekStreaming(t *testing.T) {
 		}
 		return false
 	}
-	for _, want := range []string{"GoFile", "VOE.sx", "Streamtape", "Mixdrop", "SeekStreaming", "VidHide", "StreamWish", "DoodStream", "UPnShare"} {
+	for _, want := range []string{"GoFile", "VOE.sx", "Streamtape", "Mixdrop", "SeekStreaming", "VidHide", "StreamWish", "UPnShare"} {
 		if !has(want) {
 			t.Errorf("configuredUploadHosts() missing %q; got %v", want, hosts)
 		}

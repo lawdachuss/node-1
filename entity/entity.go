@@ -205,7 +205,6 @@ type Config struct {
 	SeekStreamingKey string
 	VidHideAPIKeys     []string
 	StreamWishAPIKeys  []string
-	DoodStreamAPIKeys  []string
 	UpnshareKeys       []string
 
 	SupabaseURL    string

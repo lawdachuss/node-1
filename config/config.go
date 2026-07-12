@@ -246,7 +246,6 @@ func New(c *cli.Context) (*entity.Config, error) {
 		SeekStreamingKey:        c.String("seekstreaming-key"),
 		VidHideAPIKeys:          splitCS(c.String("vidhide-api-key")),
 		StreamWishAPIKeys:       splitCS(c.String("streamwish-api-key")),
-		DoodStreamAPIKeys:       splitCS(c.String("doodstream-api-key")),
 		UpnshareKeys:            splitCS(c.String("upnshare-key")),
 
 		SupabaseURL:    c.String("supabase-url"),

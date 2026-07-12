@@ -126,7 +126,6 @@ func main() {
 		VidHideAPIKeys:    splitCS(os.Getenv("VIDHIDE_API_KEY")),
 		StreamWishAPIKeys: splitCS(os.Getenv("STREAMWISH_API_KEY")),
 		UpnshareKeys:      splitCS(os.Getenv("UPNSHARE_KEY")),
-		DoodStreamAPIKeys: splitCS(os.Getenv("DOODSTREAM_API_KEY")),
 	}
 
 	// Log presence (masked) of uploader credentials to help debugging without leaking secrets.
@@ -137,14 +136,13 @@ func main() {
 			}
 			return fmt.Sprintf("<len=%d>", len(s))
 		}
-		log.Printf("uploader creds: MixdropEmail=%t MixdropToken=%s StreamtapeLogin=%t StreamtapeKey=%s SeekStreaming=%s VidHide=%s StreamWish=%s Upnshare=%s DoodStream=%s",
+		log.Printf("uploader creds: MixdropEmail=%t MixdropToken=%s StreamtapeLogin=%t StreamtapeKey=%s SeekStreaming=%s VidHide=%s StreamWish=%s Upnshare=%s",
 			server.Config.MixdropEmail != "", mask(server.Config.MixdropToken),
 			server.Config.StreamtapeLogin != "", mask(server.Config.StreamtapeKey),
 			mask(server.Config.SeekStreamingKey),
 			mask(strings.Join(server.Config.VidHideAPIKeys, ",")),
 			mask(strings.Join(server.Config.StreamWishAPIKeys, ",")),
 			mask(strings.Join(server.Config.UpnshareKeys, ",")),
-			mask(strings.Join(server.Config.DoodStreamAPIKeys, ",")),
 		)
 	}
 
@@ -217,7 +215,6 @@ func main() {
 			server.Config.SeekStreamingKey,
 			server.Config.VidHideAPIKeys,
 			server.Config.StreamWishAPIKeys,
-			server.Config.DoodStreamAPIKeys,
 			&scriptLogger{},
 			server.Config.UpnshareKeys,
 		)

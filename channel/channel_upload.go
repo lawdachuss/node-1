@@ -40,8 +40,6 @@ func embedURLFromLink(host, link string) string {
 		}
 	case "UPnShare":
 		return link
-	case "DoodStream":
-		return link
 	}
 	return ""
 }
@@ -103,7 +101,6 @@ func (ch *Channel) uploadFile(filePath string, thumbURL, spriteURL, previewURL s
 		cfg.SeekStreamingKey,
 		cfg.VidHideAPIKeys,
 		cfg.StreamWishAPIKeys,
-		cfg.DoodStreamAPIKeys,
 		ch, // Channel implements uploader.Logger
 		cfg.UpnshareKeys,
 	)

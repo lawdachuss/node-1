@@ -1145,7 +1145,6 @@ func configuredUploadHosts() []string {
 		cfg.SeekStreamingKey,
 		cfg.VidHideAPIKeys,
 		cfg.StreamWishAPIKeys,
-		cfg.DoodStreamAPIKeys,
 		nil,
 		cfg.UpnshareKeys,
 	)
@@ -1214,7 +1213,6 @@ func UploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL string) bool {
 		cfg.SeekStreamingKey,
 		cfg.VidHideAPIKeys,
 		cfg.StreamWishAPIKeys,
-		cfg.DoodStreamAPIKeys,
 		nil, // no logger for orphan recovery
 		cfg.UpnshareKeys,
 	)
