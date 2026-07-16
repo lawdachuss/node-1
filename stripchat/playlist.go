@@ -187,10 +187,10 @@ func (p *Playlist) processMediaPlaylist(ctx context.Context, client *internal.Re
 		initURL := appendPKey(resolveURL(playlistURL, playlist.Map.URI), p.PKey)
 		initData, initErr := retry.DoWithData(
 			func() ([]byte, error) {
-				data, err := client.GetBytesWithTimeout(ctx, initURL, 120*time.Second)
+				data, err := client.GetBytesWithTimeout(ctx, initURL, 30*time.Second)
 				if err != nil {
 					if strings.Contains(err.Error(), "read body: unexpected EOF") {
-						data, err = client.GetBytesWithTimeout(ctx, initURL, 120*time.Second)
+						data, err = client.GetBytesWithTimeout(ctx, initURL, 30*time.Second)
 					}
 					if err != nil {
 						if strings.Contains(err.Error(), "unexpected HTTP 404") ||
@@ -202,9 +202,9 @@ func (p *Playlist) processMediaPlaylist(ctx context.Context, client *internal.Re
 				return data, err
 			},
 			retry.Context(ctx),
-			retry.Attempts(5),
-			retry.Delay(1*time.Second),
-			retry.MaxDelay(10*time.Second),
+			retry.Attempts(3),
+			retry.Delay(500*time.Millisecond),
+			retry.MaxDelay(5*time.Second),
 			retry.DelayType(retry.BackOffDelay),
 		)
 		if initErr != nil {
@@ -230,10 +230,10 @@ func (p *Playlist) processMediaPlaylist(ctx context.Context, client *internal.Re
 		segmentURL := appendPKey(resolveURL(playlistURL, v.URI), p.PKey)
 		resp, err := retry.DoWithData(
 			func() ([]byte, error) {
-				data, err := client.GetBytesWithTimeout(ctx, segmentURL, 120*time.Second)
+				data, err := client.GetBytesWithTimeout(ctx, segmentURL, 30*time.Second)
 				if err != nil {
 					if strings.Contains(err.Error(), "read body: unexpected EOF") {
-						data, err = client.GetBytesWithTimeout(ctx, segmentURL, 120*time.Second)
+						data, err = client.GetBytesWithTimeout(ctx, segmentURL, 30*time.Second)
 					}
 					if err != nil {
 						if strings.Contains(err.Error(), "unexpected HTTP 404") ||
@@ -245,9 +245,9 @@ func (p *Playlist) processMediaPlaylist(ctx context.Context, client *internal.Re
 				return data, err
 			},
 			retry.Context(ctx),
-			retry.Attempts(5),
-			retry.Delay(1*time.Second),
-			retry.MaxDelay(10*time.Second),
+			retry.Attempts(3),
+			retry.Delay(500*time.Millisecond),
+			retry.MaxDelay(5*time.Second),
 			retry.DelayType(retry.BackOffDelay),
 		)
 		if err != nil {

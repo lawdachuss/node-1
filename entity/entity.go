@@ -46,6 +46,13 @@ const (
 	EventLog    Event = "log"
 )
 
+// MinMaxDuration is the minimum allowed value for MaxDuration (in minutes).
+// Setting MaxDuration below this floor is clamped up to ensure file rotation
+// never produces segments shorter than this many minutes. A value of 0 still
+// disables rotation entirely, but any explicitly set value below the floor is
+// raised to the minimum.
+const MinMaxDuration = 5
+
 // ChannelConfig represents the configuration for a channel.
 type ChannelConfig struct {
 	IsPaused                atomic.Bool `json:"-"`
@@ -72,6 +79,8 @@ func (c *ChannelConfig) Sanitize() {
 	}
 	if c.MaxDuration == 0 {
 		c.MaxDuration = 60
+	} else if c.MaxDuration > 0 && c.MaxDuration < MinMaxDuration {
+		c.MaxDuration = MinMaxDuration
 	}
 	if c.Pattern == "" {
 		c.Pattern = "videos/{{.Username}}_{{.Year}}-{{.Month}}-{{.Day}}_{{.Hour}}-{{.Minute}}-{{.Second}}{{if .Sequence}}_{{.Sequence}}{{end}}"

@@ -101,6 +101,55 @@ type Manager struct {
 	sessionMu       sync.Mutex
 	sessionStarted  bool
 	sessionStopped  bool // set by StopSession to permanently stop the loop
+
+	// cooldowns prevents channels from being immediately re-created after a
+	// forced stop (e.g. CDN/proxy hang that caused WaitMonitor to time out).
+	// Without a cooldown, the coordinator's reconciliation loop restarts the
+	// channel on the next cycle, hitting the same broken CDN edge and creating
+	// a vicious stop-start loop that produces short recordings.
+	// Map key: username, value: time.Time until which re-creation is blocked.
+	cooldowns   map[string]time.Time
+	cooldownsMu sync.Mutex
+}
+
+// setCooldown records a restart cooldown for the given username.
+// If forced is true, the cooldown is 5 minutes (hung CDN/proxy likely still
+// broken); otherwise it is a brief 30-second debounce to prevent thundering
+// herd restarts from the reconciliation loop.
+func (m *Manager) setCooldown(username string, forced bool) {
+	m.cooldownsMu.Lock()
+	defer m.cooldownsMu.Unlock()
+	if m.cooldowns == nil {
+		m.cooldowns = make(map[string]time.Time)
+	}
+	var dur time.Duration
+	if forced {
+		dur = 5 * time.Minute
+	} else {
+		dur = 30 * time.Second
+	}
+	m.cooldowns[username] = time.Now().Add(dur)
+	log.Printf("[manager] cooldown set for %q: %s (forced=%v)", username, dur, forced)
+}
+
+// inCooldown checks whether the given username is currently in cooldown.
+// Returns the remaining duration and whether the cooldown is active.
+func (m *Manager) inCooldown(username string) (time.Duration, bool) {
+	m.cooldownsMu.Lock()
+	defer m.cooldownsMu.Unlock()
+	if m.cooldowns == nil {
+		return 0, false
+	}
+	until, ok := m.cooldowns[username]
+	if !ok {
+		return 0, false
+	}
+	remaining := time.Until(until)
+	if remaining <= 0 {
+		delete(m.cooldowns, username)
+		return 0, false
+	}
+	return remaining, true
 }
 
 // StopSession permanently stops the session loop so it won't restart
@@ -389,9 +438,20 @@ func (m *Manager) migrateLegacyChannels(client *database.Client) (int, error) {
 
 // CreateChannelFromAssignment implements coordinator.ChannelManager.
 // Creates a channel from a channel_assignments row (claimed by coordinator).
+// If the channel is in cooldown (from a recent forced stop), the creation
+// is deferred until the cooldown expires to prevent vicious restart loops.
 func (m *Manager) CreateChannelFromAssignment(ca *database.ChannelAssignment) error {
 	conf := coordinator.ConfigFromAssignment(ca)
 	conf.Sanitize()
+
+	// Check restart cooldown — if the channel was force-stopped recently, wait
+	// for the cooldown to expire before creating a new Monitor.  Without this,
+	// a broken CDN edge would trigger stop→restart cycles on every 60s
+	// reconciliation tick, producing short recordings and failing immediately.
+	if remaining, ok := m.inCooldown(conf.Username); ok {
+		log.Printf("[manager] channel %q is in cooldown (%v remaining) — deferring creation", conf.Username, remaining)
+		return fmt.Errorf("channel %q in cooldown (%v remaining)", conf.Username, remaining)
+	}
 
 	// If a previous instance of this channel is still draining its uploads
 	// after a reassignment, wait for it to finish before starting a new one so
@@ -427,12 +487,15 @@ func (m *Manager) CreateChannelFromAssignment(ca *database.ChannelAssignment) er
 
 // RemoveChannelForReassignment implements coordinator.ChannelManager.
 // Removes a channel from this node when it's been reassigned to another node.
+// If the stop was forced (WaitMonitor timeout), sets a restart cooldown to
+// prevent the reconciliation loop from immediately re-creating the channel.
 func (m *Manager) RemoveChannelForReassignment(username string) error {
 	thing, ok := m.Channels.Load(username)
 	if !ok {
 		return nil
 	}
 
+	ch := thing.(*channel.Channel)
 	m.Channels.Delete(username)
 
 	wg := &sync.WaitGroup{}
@@ -441,7 +504,10 @@ func (m *Manager) RemoveChannelForReassignment(username string) error {
 	go func() {
 		defer m.draining.Delete(username)
 		defer wg.Done()
-		thing.(*channel.Channel).Stop()
+		ch.Stop()
+		if ch.WasForcedStop() {
+			m.setCooldown(username, true)
+		}
 	}()
 	return nil
 }
@@ -494,9 +560,17 @@ func (m *Manager) ScanThumbnails() {
 	}
 }
 
-// CreateChannel starts monitoring an M3U8 stream
+// CreateChannel starts monitoring an M3U8 stream.
+// If the channel is in cooldown (from a recent forced stop), creation is
+// rejected to prevent immediate restart cycles.
 func (m *Manager) CreateChannel(conf *entity.ChannelConfig, shouldSave bool) error {
 	conf.Sanitize()
+
+	// Check restart cooldown — if the channel was force-stopped recently,
+	// reject the creation so the broken CDN/proxy can recover.
+	if remaining, ok := m.inCooldown(conf.Username); ok {
+		return fmt.Errorf("channel %q is in cooldown (%v remaining) — try again later", conf.Username, remaining)
+	}
 
 	// In pooled mode, create the assignment and try to claim for this node
 	if server.IsPooledMode() && m.Coordinator != nil {
@@ -563,8 +637,13 @@ func (m *Manager) StopChannel(username string) error {
 	fmt.Printf(" INFO [manager] channel %q deleted and persisted to Supabase\n", username)
 
 	// Step 4: non-blocking cleanup — stop the ffmpeg process.
+	// If the stop was forced (WaitMonitor timeout), set a restart cooldown
+	// to prevent immediate re-creation.
 	go func() {
 		ch.Stop()
+		if ch.WasForcedStop() {
+			m.setCooldown(username, true)
+		}
 	}()
 
 	return nil

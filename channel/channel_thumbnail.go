@@ -306,7 +306,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 			// (tile takes a single input, so concat is required first.)
 			fp = append(fp, fmt.Sprintf("%s%s", strings.Join(tileIns, ""),
 				fmt.Sprintf("concat=n=%d:v=1:a=0,tile=%dx%d", spriteFrames, spriteCols, spriteRows)))
-			args = append(args, "-filter_complex", strings.Join(fp, ";"), "-frames:v", "1", "-update", "1", "-q:v", "5", spriteJPG)
+			args = append(args, "-filter_complex", strings.Join(fp, ";"), "-frames:v", "1", "-c:v", "mjpeg", "-update", "1", "-q:v", "5", spriteJPG)
 			stderr, err = runFFmpeg(spriteCtx, args...)
 		} else {
 			// Duration unknown: fall back to sequential fps extraction.
@@ -434,7 +434,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 					"-i", videoPath,
 					"-t", fmt.Sprintf("%.2f", previewDuration),
 					"-vf", fmt.Sprintf("scale=%d:-2:flags=lanczos,fps=30", previewWidth),
-					"-r", "30",
+					"-vsync", "vfr",
 					"-c:v", "libx264",
 					"-preset", "fast",
 					"-crf", "23",
@@ -447,7 +447,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 					"-y",
 					"-i", videoPath,
 					"-vf", fmt.Sprintf("scale=%d:-2:flags=lanczos,fps=30", previewWidth),
-					"-r", "30",
+					"-vsync", "vfr",
 					"-c:v", "libx264",
 					"-preset", "fast",
 					"-crf", "23",
@@ -507,7 +507,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 				// immediately.
 				filterComplex := strings.Join(filterParts, ";") + ";" +
 					strings.Join(concatInputs, "") +
-					fmt.Sprintf("concat=n=%d:v=1:a=0,scale=%d:%d:force_original_aspect_ratio=decrease:flags=lanczos,pad=%d:%d:(ow-iw)/2:(oh-ih)/2[out]",
+					fmt.Sprintf("concat=n=%d:v=1:a=0,scale=%d:%d:force_original_aspect_ratio=decrease:flags=lanczos,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,fps=30[out]",
 						previewSegments, previewWidth, previewHeight, previewWidth, previewHeight)
 
 					stderr, err = runFFmpeg(ctx,
@@ -515,7 +515,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 					"-i", videoPath,
 					"-filter_complex", filterComplex,
 					"-map", "[out]",
-					"-r", "30",
+					"-vsync", "vfr",
 					"-c:v", "libx264",
 					"-preset", "fast",
 					"-crf", "23",
@@ -538,7 +538,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 						"-i", videoPath,
 						"-t", fmt.Sprintf("%.2f", previewDuration),
 						"-vf", fmt.Sprintf("scale=%d:-2:flags=lanczos,fps=30", previewWidth),
-						"-r", "30",
+						"-vsync", "vfr",
 						"-c:v", "libx264",
 						"-preset", "fast",
 						"-crf", "23",

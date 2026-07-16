@@ -42,6 +42,7 @@ try {
         $urls = @()
         foreach ($tunnel in $response) {
             Write-Host "   [$($tunnel.instance_id)] $($tunnel.url)" -ForegroundColor Cyan
+            Write-Host "::notice title=Web UI ($($tunnel.instance_id))::$($tunnel.url)"
             $urls += $tunnel.url
         }
         Write-Host ""

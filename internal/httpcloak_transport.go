@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -100,7 +101,34 @@ func (t *httpcloakTransport) markDead(proxyURL string) {
 // cf_clearance (the "proxy thrash" failure mode).
 const cookieRefreshCooldown = 90 * time.Second
 
-// sharedTransportSingleton is a singleton http.RoundTripper for the shared transport.
+// cdnTransport is a dedicated http.RoundTripper for CDN requests (doppiocdn.net,
+// live.mmcdn.com) that bypass the proxy.  It replaces http.DefaultTransport
+// with explicit timeouts so half-dead CDN edges do not hang for minutes:
+//
+//   - ResponseHeaderTimeout:  15s (CDN should respond with headers quickly)
+//   - IdleConnTimeout:        30s (evict stale pooled connections sooner)
+//   - TLSHandshakeTimeout:    10s (generous for any TLS version)
+//   - ExpectContinueTimeout:  1s  (we never send Expect: 100-continue)
+//   - DialContext KeepAlive:  15s (faster dead-peer detection)
+//
+// The default http.Transport has no ResponseHeaderTimeout and a 90s idle
+// timeout, which allows stale TCP connections to linger and cause the
+// common "stalled CDN edge" hang that triggers WaitMonitor timeout loops.
+var cdnTransport = &http.Transport{
+	Proxy: nil, // CDN requests always go direct (no env proxy)
+	DialContext: (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 15 * time.Second,
+	}).DialContext,
+	MaxIdleConns:          100,
+	MaxIdleConnsPerHost:   10,
+	IdleConnTimeout:       30 * time.Second,
+	ResponseHeaderTimeout: 15 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+	ForceAttemptHTTP2:     true,
+}
+
 var sharedTransportSingleton http.RoundTripper
 var sharedTransportOnce sync.Once
 
@@ -524,7 +552,7 @@ func isProxyBypassHost(host string) bool {
 // client. No proxy rotation — used by warmup functions (best-effort).
 func (t *httpcloakTransport) roundTripOnce(req *http.Request) (*http.Response, error) {
 	if req.URL.Scheme == "http" || isCDNHost(req.URL.Host) || isProxyBypassHost(req.URL.Host) {
-		return http.DefaultTransport.RoundTrip(req)
+		return cdnTransport.RoundTrip(req)
 	}
 
 	ctx := req.Context()
@@ -591,7 +619,7 @@ func (t *httpcloakTransport) roundTripOnce(req *http.Request) (*http.Response, e
 // to direct connection (which would fail face-id verification).
 func (t *httpcloakTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL.Scheme == "http" || isCDNHost(req.URL.Host) || isProxyBypassHost(req.URL.Host) {
-		return http.DefaultTransport.RoundTrip(req)
+		return cdnTransport.RoundTrip(req)
 	}
 
 	t.mu.Lock()

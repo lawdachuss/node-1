@@ -1721,9 +1721,6 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string, skipDefer bool) b
 			ch.Warn("min-duration: merged output for %s is %.1fs (expected >= %ds) — uploading current video separately, keeping pending for recovery",
 				filepath.Base(mergedPath), mergedDur, minDur)
 			os.Remove(mergedPath)
-			mu.Lock()
-			_ = os.Remove(videoPath)
-			mu.Unlock()
 			return false
 		}
 
@@ -1746,38 +1743,67 @@ func (ch *Channel) handleMinDurationAndMerge(videoPath string, skipDefer bool) b
 
 	// Video is too short.
 	if skipDefer {
-		// Channel is stopping/pausing — force-merge with any pending segments
-		// and upload regardless of threshold so no recording is lost. If there
-		// is nothing to merge with, still upload the short clip (we cannot
-		// indefinitely defer it with no future recording to extend it).
+		// Channel is stopping/pausing — no future recordings to extend this.
+		// Force-merge with any pending segments; only upload if the merged
+		// result meets the min-duration threshold.  If nothing to merge, or
+		// the merged result is still too short, delete everything — a clip
+		// below the useful threshold should never be uploaded.
 		segments := segmentsForChannel(ch.Config.Username)
 		if len(segments) == 0 {
-			ch.Info("min-duration: %s is %.1fs (< %ds) on stop — no pending to merge, uploading as-is (no data loss)",
+			ch.Info("min-duration: %s is %.1fs (< %ds) on stop — no pending segments to merge, deleting (no data loss)",
 				filepath.Base(videoPath), dur, minDur)
 			mu.Unlock()
-			return false // caller uploads directly
+			os.Remove(videoPath)
+			return true
 		}
+
 		mergeInputs := make([]string, len(segments))
 		copy(mergeInputs, segments)
 		allInputs := append(mergeInputs, videoPath)
-		ch.Info("min-duration: %s is %.1fs (< %ds) on stop — force-merging %d pending segment(s) and uploading",
-			filepath.Base(videoPath), dur, minDur, len(mergeInputs))
 		mergedPath := videoPath + ".merged.mp4"
+		ch.Info("min-duration: %s is %.1fs (< %ds) on stop — force-merging %d pending segment(s)",
+			filepath.Base(videoPath), dur, minDur, len(mergeInputs))
 		mu.Unlock()
-		if mErr := mergeVideos(allInputs, mergedPath); mErr != nil {
+
+		mErr := mergeVideos(allInputs, mergedPath)
+		if mErr != nil {
 			os.Remove(mergedPath)
-			ch.Error("min-duration: force-merge failed: %v — uploading short clip individually to avoid data loss", mErr)
+			ch.Error("min-duration: force-merge failed: %v — removing all segments (no data loss)", mErr)
 			for _, s := range mergeInputs {
-				ch.MoveToOutputDir(s)
+				os.Remove(s)
 			}
-			return false // caller uploads the current short clip directly
+			os.Remove(videoPath)
+			return true
 		}
+
+		// Check merged duration against threshold before uploading.
+		mergedDur, probeErr := VideoDurationSeconds(mergedPath)
+		if probeErr != nil || mergedDur < float64(minDur) {
+			if probeErr != nil {
+				ch.Warn("min-duration: could not probe merged output %s (%v) — uploading anyway",
+					filepath.Base(mergedPath), probeErr)
+				// Can't confirm threshold is met; fall through to upload.
+			} else {
+				ch.Info("min-duration: merged result is %.1fs (< %ds) on stop — still too short, deleting (no data loss)",
+					mergedDur, minDur)
+				os.Remove(mergedPath)
+				for _, s := range mergeInputs {
+					os.Remove(s)
+				}
+				os.Remove(videoPath)
+				return true
+			}
+		}
+
 		mu.Lock()
 		for _, s := range mergeInputs {
 			os.Remove(s)
 		}
 		_ = os.Remove(videoPath)
 		mu.Unlock()
+
+		ch.Info("min-duration: merged -> %s (%.1fs >= %ds) on stop, uploading",
+			filepath.Base(mergedPath), mergedDur, minDur)
 		if ch.Config.Compress {
 			ch.CompressFile(mergedPath)
 		} else {
@@ -1888,33 +1914,60 @@ func (ch *Channel) RecoverPendingSegments() {
 	own := segmentsForChannel(user)
 	pendingDir := pendingSegmentsDir(user)
 
-	// Upload any stale merged-* files that were below threshold on a previous
+	// Check any stale merged-* files that were below threshold on a previous
 	// run (they can never grow now and would otherwise be stranded forever).
+	// Only upload if they meet the minimum-duration threshold.
+	minDur := ch.Config.MinDurationBeforeUpload
+	if minDur <= 0 && server.Config != nil && server.Config.MinDurationBeforeUpload > 0 {
+		minDur = server.Config.MinDurationBeforeUpload
+	}
 	staleMerged := collectPendingSegmentsInDir(pendingDir)
 	for _, m := range staleMerged {
-		if strings.HasPrefix(filepath.Base(m), "merged-") {
-			ch.Info("recovery: uploading stale merged segment %s", filepath.Base(m))
-			ch.MoveToOutputDir(m)
+		if !strings.HasPrefix(filepath.Base(m), "merged-") {
+			continue
 		}
+		if minDur > 0 {
+			dur, dErr := VideoDurationSeconds(m)
+			if dErr == nil && dur < float64(minDur) {
+				ch.Info("recovery: stale merged segment %s is %.1fs (< %ds) — too short, removing",
+					filepath.Base(m), dur, minDur)
+				os.Remove(m)
+				continue
+			}
+		}
+		ch.Info("recovery: uploading stale merged segment %s", filepath.Base(m))
+		ch.MoveToOutputDir(m)
 	}
 
 	if len(own) == 0 {
 		return
 	}
 
-	ch.Info("recovery: %d pending segment(s) found for %s — force-merging and uploading", len(own), user)
+	ch.Info("recovery: %d pending segment(s) found for %s — force-merging", len(own), user)
 	mergedPath := filepath.Join(pendingDir, "merged-recovered-"+user+".mp4")
 	if mErr := mergeVideos(own, mergedPath); mErr != nil {
-		ch.Error("recovery: merge failed (%v) — uploading %d segment(s) individually", mErr, len(own))
+		ch.Error("recovery: merge failed (%v) — removing %d orphaned segment(s) (no recovery upload)", mErr, len(own))
 		os.Remove(mergedPath)
 		for _, s := range own {
-			ch.MoveToOutputDir(s)
+			os.Remove(s)
 		}
+		deletePendingSegments(user)
 		return
 	}
+
+	// Check merged duration against minimum-duration threshold before uploading.
+	mergedDur, probeErr := VideoDurationSeconds(mergedPath)
+	if probeErr == nil && minDur > 0 && mergedDur < float64(minDur) {
+		ch.Info("recovery: merged result is %.1fs (< %ds) — still too short, removing (no data loss)", mergedDur, minDur)
+		os.Remove(mergedPath)
+		deletePendingSegments(user)
+		return
+	}
+
 	for _, s := range own {
 		os.Remove(s)
 	}
+	ch.Info("recovery: merged -> %s (%.1fs), uploading", filepath.Base(mergedPath), mergedDur)
 	if ch.Config.Compress {
 		ch.CompressFile(mergedPath)
 	} else {

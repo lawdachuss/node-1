@@ -302,6 +302,12 @@ func CreateChannel(c *gin.Context) {
 		req.Pattern = "standard"
 	}
 
+	// Enforce minimum max-duration floor (disable by setting 0, but any
+	// explicit value below the floor is clamped up to avoid 1-minute segments).
+	if req.MaxDuration > 0 && req.MaxDuration < entity.MinMaxDuration {
+		req.MaxDuration = entity.MinMaxDuration
+	}
+
 	usernames := strings.Split(req.Username, ",")
 	if client := server.GetDBClient(); client != nil {
 		var conflicts []string
@@ -1500,10 +1506,11 @@ func GetPoolJSON(c *gin.Context) {
 
 // PoolAddRequest is the request body for adding a channel to the pool.
 type PoolAddRequest struct {
-	Site       string `json:"site" form:"site"`
-	Username   string `json:"username" form:"username" binding:"required"`
-	Resolution int    `json:"resolution" form:"resolution"`
-	Framerate  int    `json:"framerate" form:"framerate"`
+	Site        string `json:"site" form:"site"`
+	Username    string `json:"username" form:"username" binding:"required"`
+	Resolution  int    `json:"resolution" form:"resolution"`
+	Framerate   int    `json:"framerate" form:"framerate"`
+	MaxDuration int    `json:"max_duration" form:"max_duration"`
 }
 
 // AddToPool adds a channel to the shared pool.
@@ -1543,12 +1550,22 @@ func AddToPool(c *gin.Context) {
 		return
 	}
 
+	// Enforce minimal max-duration so new assignments never get a sub-5m setting.
+	maxDur := req.MaxDuration
+	if maxDur > 0 && maxDur < entity.MinMaxDuration {
+		maxDur = entity.MinMaxDuration
+	}
+	if maxDur == 0 {
+		maxDur = 60 // default from CLI --max-duration
+	}
+
 	assignment := database.ChannelAssignment{
-		Username:   req.Username,
-		Site:       req.Site,
-		Status:     "unassigned",
-		Resolution: req.Resolution,
-		Framerate:  req.Framerate,
+		Username:    req.Username,
+		Site:        req.Site,
+		Status:      "unassigned",
+		Resolution:  req.Resolution,
+		Framerate:   req.Framerate,
+		MaxDuration: maxDur,
 	}
 
 	if err := client.BulkInsertAssignments([]database.ChannelAssignment{assignment}); err != nil {

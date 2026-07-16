@@ -76,6 +76,7 @@ type Channel struct {
 	audioSegmentCount int        // tracks audio segments written to current file
 	cleanupMu         sync.Mutex // serialises Cleanup() calls from concurrent goroutines
 	skipMinDurOnExit  bool       // set when context is cancelled; skip min-duration on cleanup
+	forcedStop        atomic.Bool // set when WaitMonitor times out; used by Manager to apply restart cooldown
 	pendingFiles      []pendingFile
 	pendingWg         sync.WaitGroup // tracks async pending-file processing goroutine
 	UploadWg          sync.WaitGroup // tracks in-flight upload goroutines for graceful shutdown
@@ -520,6 +521,7 @@ func (ch *Channel) Resume(_ int) {
 		ch.Warn("resume: previous monitor did not exit within 20s (likely hung on a stalled proxy/CDN request); starting new monitor anyway")
 	}
 
+	ch.forcedStop.Store(false) // reset from any previous forced stop so new Monitor starts fresh
 	ch.Config.IsPaused.Store(false)
 	ch.Update()
 	ch.Info("channel resumed")
@@ -549,6 +551,8 @@ func (ch *Channel) Resume(_ int) {
 // files have been queued into UploadWg. It is bounded so a Monitor hung on a
 // stalled proxy/CDN request that ignores context cancellation cannot block
 // Stop() forever (mirrors the bounded wait already used by Resume).
+// If the timeout fires, sets forcedStop so the Manager can apply a restart
+// cooldown and avoid an immediate re-start cycle.
 func (ch *Channel) WaitMonitor() {
 	done := make(chan struct{})
 	go func() {
@@ -558,8 +562,17 @@ func (ch *Channel) WaitMonitor() {
 	select {
 	case <-done:
 	case <-time.After(60 * time.Second):
+		ch.forcedStop.Store(true)
 		ch.Warn("WaitMonitor: monitor did not exit within 60s (likely hung on a stalled request); proceeding with stop")
 	}
+}
+
+// WasForcedStop reports whether the most recent WaitMonitor timed out,
+// indicating the channel was force-stopped (e.g. a hung proxy/CDN request).
+// The Manager uses this to apply a restart cooldown and avoid vicious
+// stop-start cycles.
+func (ch *Channel) WasForcedStop() bool {
+	return ch.forcedStop.Load()
 }
 
 // ProcessPending waits for any in-flight async processing from Cleanup(CloseProcess)
