@@ -38,14 +38,17 @@ jobs:
         with:
           path: |
             ~\go\pkg\mod
+            D:\repos
             ~\AppData\Local\pip\Cache
             ~\.cache\ms-playwright
             ~\.cache\tailscale.msi
             C:\proxy
             C:\ProgramData\chocolatey\cache
             C:\cloudflared
-          key: ${{ runner.os }}-cache-${{ hashFiles('go.sum', 'cmd/grab_cookies/**') }}
-          restore-keys: ${{ runner.os }}-cache-
+          key: ${{ runner.os }}-cache-${{ hashFiles('go.sum', '**/*.go', 'cmd/grab_cookies/**') }}
+          restore-keys: |
+            ${{ runner.os }}-cache-
+            ${{ runner.os }}-
 
       - uses: actions/setup-go@v5
         with:
@@ -112,35 +115,35 @@ jobs:
               'https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt'
               'https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/countries/nl/socks5/data.txt'
             )
-            $fb = { param($u) try { (Invoke-RestMethod -Uri $u -TimeoutSec 15 -ErrorAction Stop) -split "`n" } catch { @() } }
+            $fb = { param($u) try { (Invoke-RestMethod -Uri $u -TimeoutSec 8 -ErrorAction Stop) -split "`n" } catch { @() } }
             $jobs = $urls | ForEach-Object { Start-Job -ScriptBlock $fb -ArgumentList $_ }
-            $null = $jobs | Wait-Job -Timeout 30
+            $null = $jobs | Wait-Job -Timeout 15
             $all = @(); foreach ($j in $jobs) { $all += Receive-Job $j; Remove-Job $j -Force }
-            $all = ($all | ForEach-Object { $t = $_.Trim(); if ($t -match '^socks5://') { $t } elseif ($t -match '^(\d+\.\d+\.\d+\.\d+):(\d+)$') { "socks5://$t" } } | Where-Object { $_ } | Select-Object -Unique) | Select-Object -First 120
-            if ($all.Count -eq 0) { $all = @("socks5://5.255.117.250:1080","socks5://185.233.184.165:1080","socks5://5.255.113.177:1080","socks5://103.139.106.174:1080","socks5://103.139.106.200:1080") }
+            $all = ($all | ForEach-Object { $t = $_.Trim(); if ($t -match '^socks5://') { $t } elseif ($t -match '^(\d+\.\d+\.\d+\.\d+):(\d+)$') { "socks5://$t" } } | Where-Object { $_ } | Select-Object -Unique) | Select-Object -First 80
+            if ($all.Count -eq 0) { $all = @("socks5://5.255.117.250:1080","socks5://185.233.184.165:1080") }
             l "  Fetched $($all.Count)"
 
             # Liveness
-            $ab = { param($u) try { $ip = curl.exe -x $u -s --connect-timeout 3 -m 6 https://api.ipify.org 2>$null; if ($ip -match '^\d+\.\d+\.\d+\.\d+$') { return @{url=$u; ip=$ip.Trim()} } } catch {}; return $null }
+            $ab = { param($u) try { $ip = curl.exe -x $u -s --connect-timeout 2 -m 4 https://api.ipify.org 2>$null; if ($ip -match '^\d+\.\d+\.\d+\.\d+$') { return @{url=$u; ip=$ip.Trim()} } } catch {}; return $null }
             $alive = [System.Collections.ArrayList]@()
-            for ($i = 0; $i -lt $all.Count; $i += 20) {
-              $batch = $all[$i..([math]::Min($i+19,$all.Count-1))]
+            for ($i = 0; $i -lt $all.Count; $i += 30) {
+              $batch = $all[$i..([math]::Min($i+29,$all.Count-1))]
               $jbs = $batch | ForEach-Object { Start-Job -ScriptBlock $ab -ArgumentList $_ }
-              $null = $jbs | Wait-Job -Timeout 30
+              $null = $jbs | Wait-Job -Timeout 15
               foreach ($j in $jbs) { $r = Receive-Job $j; if ($r -and $r.url) { [void]$alive.Add($r) }; Remove-Job $j -Force }
-              if ($alive.Count -ge 30) { break }
+              if ($alive.Count -ge 20) { break }
             }
             l "  Alive: $($alive.Count)"
 
             # Chaturbate check
-            $cb = { param($w) try { $out = curl.exe -x $w.url -s -o NUL -w "%{http_code} %{url_effective}" -L --connect-timeout 3 -m 8 https://chaturbate.com 2>$null; $p = $out -split ' ',2; return @{url=$w.url; ip=$w.ip; code=[int]$p[0]; finalUrl=if($p.Count-gt1){$p[1]}else{''}} } catch { return $null } }
+            $cb = { param($w) try { $out = curl.exe -x $w.url -s -o NUL -w "%{http_code} %{url_effective}" -L --connect-timeout 2 -m 6 https://chaturbate.com 2>$null; $p = $out -split ' ',2; return @{url=$w.url; ip=$w.ip; code=[int]$p[0]; finalUrl=if($p.Count-gt1){$p[1]}else{''}} } catch { return $null } }
             $cj = $alive | ForEach-Object { Start-Job -ScriptBlock $cb -ArgumentList $_ }
-            $null = $cj | Wait-Job -Timeout 30
+            $null = $cj | Wait-Job -Timeout 15
             $clean = [System.Collections.ArrayList]@()
             foreach ($j in $cj) { $r = Receive-Job $j; if ($r -and $r.code -eq 200 -and $r.finalUrl -notmatch '(?i)(verify|auth|captcha|face|human|robot)') { [void]$clean.Add($r) }; Remove-Job $j -Force }
             l "  CB-OK: $($clean.Count)"
-            if ($clean.Count -eq 0) { $clean = $alive | Select-Object -First 3 }
-            $working = $clean | Select-Object -First 5
+            if ($clean.Count -eq 0) { $clean = $alive | Select-Object -First 2 }
+            $working = $clean | Select-Object -First 3
             "$($working.ForEach{ $_.url } -join ',')|$($working[0].url)" | Set-Content $f -Force
             l "[OK] $($working.Count) proxies: $($working[0].url)"
           } -ArgumentList $proxyFile
@@ -190,32 +193,34 @@ jobs:
             Write-Host "[FFMPEG] Done in $([math]::Round($t.TotalSeconds,1))s"
           }
 
-          # ========== JOB: Clone + Build (with retry) ==========
+          # ========== JOB: Clone + Build (skip if cached) ==========
           $buildJob = Start-Job -Name build -ScriptBlock {
             param($d)
             New-Item -ItemType Directory -Force -Path "D:\repos" | Out-Null
-            if (Test-Path $d) { Remove-Item -Recurse -Force $d }
-            New-Item -ItemType Directory -Force -Path $d | Out-Null
-            Copy-Item -Path "$env:GITHUB_WORKSPACE\*" -Destination $d -Recurse -Force
-            Set-Location $d
-            Write-Host "[BUILD] Building Go binaries..."
-            $sa = $env:ALL_PROXY; Remove-Item Env:ALL_PROXY,Env:all_proxy,Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:http_proxy,Env:https_proxy -ErrorAction SilentlyContinue
-            $env:GOPROXY = "https://proxy.golang.org,direct"
-            foreach ($bin in @("grab-cookies.exe ./cmd/grab_cookies", "chaturbate-dvr.exe .")) {
-              $parts = $bin -split ' ', 2
-              $name = $parts[0]; $pkg = $parts[1]
-              $ok = $false
-              for ($attempt = 0; $attempt -lt 3; $attempt++) {
-                $t = [Diagnostics.Stopwatch]::StartNew()
-                $out = go build -o $name $pkg 2>&1
-                $t.Stop(); $exit = $LASTEXITCODE
-                if ($exit -eq 0) { Write-Host "[BUILD] $($name): $([math]::Round($t.Elapsed.TotalSeconds,1))s"; $ok = $true; break }
-                Write-Host "[BUILD] $name attempt $($attempt+1) failed (exit $exit), retrying..."
-                Start-Sleep -Seconds 2
+            if (-not (Test-Path "$d\chaturbate-dvr.exe") -or -not (Test-Path "$d\grab-cookies.exe")) {
+              if (Test-Path $d) { Remove-Item -Recurse -Force $d }
+              New-Item -ItemType Directory -Force -Path $d | Out-Null
+              Copy-Item -Path "$env:GITHUB_WORKSPACE\*" -Destination $d -Recurse -Force
+              Set-Location $d
+              Write-Host "[BUILD] Building Go binaries..."
+              $sa = $env:ALL_PROXY; Remove-Item Env:ALL_PROXY,Env:all_proxy,Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:http_proxy,Env:https_proxy -ErrorAction SilentlyContinue
+              $env:GOPROXY = "https://proxy.golang.org,direct"
+              foreach ($bin in @("grab-cookies.exe ./cmd/grab_cookies", "chaturbate-dvr.exe .")) {
+                $parts = $bin -split ' ', 2
+                $name = $parts[0]; $pkg = $parts[1]
+                $ok = $false
+                for ($attempt = 0; $attempt -lt 3; $attempt++) {
+                  $t = [Diagnostics.Stopwatch]::StartNew()
+                  $out = go build -ldflags="-s -w" -o $name $pkg 2>&1
+                  $t.Stop(); $exit = $LASTEXITCODE
+                  if ($exit -eq 0) { Write-Host "[BUILD] $($name): $([math]::Round($t.Elapsed.TotalSeconds,1))s"; $ok = $true; break }
+                  Write-Host "[BUILD] $name attempt $($attempt+1) failed (exit $exit), retrying..."
+                  Start-Sleep -Seconds 2
+                }
+                if (-not $ok) { Write-Error "[BUILD] $name failed after 3 attempts" }
               }
-              if (-not $ok) { Write-Error "[BUILD] $name failed after 3 attempts" }
-            }
-            if ($sa) { $env:ALL_PROXY = $sa; $env:all_proxy = $sa }
+              if ($sa) { $env:ALL_PROXY = $sa; $env:all_proxy = $sa }
+            } else { Write-Host "[BUILD] Using cached binaries" }
           } -ArgumentList $repoDir
 
           # ========== JOB: Python Deps Install (cached) ==========
@@ -261,7 +266,7 @@ jobs:
 
           # ========== WAIT for Proxy (critical path) ==========
           Write-Host "[MAIN] Waiting for proxy discovery..."; $null = [System.Console]::Out.Flush()
-          $null = $proxyJob | Wait-Job -Timeout 60
+          $null = $proxyJob | Wait-Job -Timeout 40
           if ($proxyJob.State -eq 'Running') { Write-Warning "[PROXY] Timeout, continuing with fallback" }
           Receive-Job $proxyJob -ErrorAction SilentlyContinue | Out-Null
           Remove-Job $proxyJob -Force -ErrorAction SilentlyContinue
@@ -278,7 +283,7 @@ jobs:
 
           # ========== WAIT for Build + Scrapling ==========
           Write-Host "[MAIN] Waiting for builds + Scrapling..."; $null = [System.Console]::Out.Flush()
-          $null = $buildJob, $scrapleJob | Wait-Job -Timeout 180
+          $null = $buildJob, $scrapleJob | Wait-Job -Timeout 120
           Receive-Job $buildJob -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" }
           Receive-Job $scrapleJob -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" }
           Remove-Job $buildJob, $scrapleJob -Force -ErrorAction SilentlyContinue
@@ -484,7 +489,7 @@ jobs:
           if (Test-Path $cloudflaredPath) {
             $stderr = "$repoDir\tunnel-stderr.log"
             $tun = Start-Process -FilePath $cloudflaredPath -ArgumentList "tunnel --url http://localhost:8080 --protocol http2" -WorkingDirectory $repoDir -NoNewWindow -RedirectStandardError $stderr -PassThru
-            for ($i = 0; $i -lt 45; $i++) { Start-Sleep -Seconds 1; if (Test-Path $stderr) { $c = Get-Content $stderr -Raw; $m = [regex]::Match($c, 'https://[a-z0-9\-]+\.trycloudflare\.com'); if ($m.Success) { $tunnelUrl = $m.Value; $tunnelUrl | Set-Content $tunnelUrlFile -Force; Write-Host "[OK] Tunnel: $tunnelUrl"; break } } }
+            for ($i = 0; $i -lt 30; $i++) { Start-Sleep -Seconds 1; if (Test-Path $stderr) { $c = Get-Content $stderr -Raw; $m = [regex]::Match($c, 'https://[a-z0-9\-]+\.trycloudflare\.com'); if ($m.Success) { $tunnelUrl = $m.Value; $tunnelUrl | Set-Content $tunnelUrlFile -Force; Write-Host "[OK] Tunnel: $tunnelUrl"; break } } }
             if ($tunnelUrl) {
               $linkUrl = $tunnelUrl -replace '\.', '&#46;' -replace '-', '&#45;'
               "## DVR Web UI Tunnel`n`n<a href=`"$linkUrl`">Open Dashboard</a>`n" | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8 -NoNewline
