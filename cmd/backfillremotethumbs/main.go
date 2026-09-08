@@ -11,16 +11,19 @@
 // which we can fetch with a plain HTTP GET and re-host via the standard
 // MultiImageUploader.
 //
+// The Vidara og:image resolution + download lives in the shared
+// github.com/teacat/chaturbate-dvr/recovery package (the same logic used by the
+// automated thumbnail sweep on the fleet). This command is the standalone,
+// on-demand front end.
+//
 // Flow for each missing-thumbnail recording:
 //  1. load all upload_links and recordings; keep recordings whose
 //     thumbnail_url is empty AND that have a Vidara link,
-//  2. GET the Vidara embed page (vidarae.live/e/<code>) and extract the
-//     og:image thumbnail URL,
-//  3. download that thumbnail,
-//  4. re-host it via MultiImageUploader (Pixhost -> ImgBB -> Catbox), keeping
-//     the host mirror map,
-//  5. PATCH recordings.thumbnail_url and save a preview_images row,
-//  6. log a per-host summary.
+//  2. delegate og:image scrape + download to recovery.VidaraThumb,
+//  3. re-host it via MultiImageUploader (Catbox -> Pixhost -> freeimage.host),
+//     keeping the host mirror map,
+//  4. PATCH recordings.thumbnail_url and save a preview_images row,
+//  5. log a per-host summary.
 //
 // Usage:
 //
@@ -35,26 +38,18 @@ package main
 import (
 	"bufio"
 	"flag"
-	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
 	"github.com/teacat/chaturbate-dvr/database"
 	"github.com/teacat/chaturbate-dvr/entity"
+	"github.com/teacat/chaturbate-dvr/recovery"
 	"github.com/teacat/chaturbate-dvr/server"
 	"github.com/teacat/chaturbate-dvr/uploader"
-)
-
-var (
-	// ogImageRe matches <meta property="og:image" content="..."/> on Vidara's
-	// embed page. The thumbnail is video-specific (pointing at the CDN path).
-	ogImageRe = regexp.MustCompile(`(?i)<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']`)
 )
 
 // downloadClient reuses a single HTTP client with browser-like headers so the
@@ -136,7 +131,7 @@ func main() {
 		work = work[:*max]
 	}
 
-	// 4+5. Resolve + optionally upload + PATCH.
+	// 4+3. Resolve + optionally upload + PATCH.
 	imgUploader := uploader.NewMultiImageUploader()
 	var (
 		ok       int
@@ -145,50 +140,42 @@ func main() {
 		rehosted int
 	)
 	for i, w := range work {
-		code := vidaraCode(w.link.URL)
+		code := recovery.VidaraCode(w.link.URL)
 		if code == "" {
 			log.Printf("[%d/%d] %s: bad Vidara URL %q", i+1, len(work), w.rec.Filename, w.link.URL)
 			failed++
 			continue
 		}
-		thumbURL, err := resolveVidaraThumb(code)
-		if err != nil {
-			log.Printf("[%d/%d] %s: resolve thumb: %v", i+1, len(work), w.rec.Filename, err)
-			failed++
-			continue
-		}
-		if thumbURL == "" {
-			log.Printf("[%d/%d] %s: no og:image on page", i+1, len(work), w.rec.Filename)
-			noThumb++
-			continue
-		}
-		log.Printf("[%d/%d] %s: host thumbnail %s", i+1, len(work), w.rec.Filename, thumbURL)
 
 		if *dry {
+			// Dry-run: just resolve and report the host thumbnail URL.
+			hostThumb, err := resolveVidaraThumb(code)
+			if err != nil {
+				log.Printf("[%d/%d] %s: resolve thumb: %v", i+1, len(work), w.rec.Filename, err)
+				failed++
+				continue
+			}
+			if hostThumb == "" {
+				log.Printf("[%d/%d] %s: no og:image on page", i+1, len(work), w.rec.Filename)
+				noThumb++
+				continue
+			}
+			log.Printf("[%d/%d] %s: host thumbnail %s", i+1, len(work), w.rec.Filename, hostThumb)
 			ok++
 			continue
 		}
 
-		// Download the host thumbnail.
-		imgPath, mime, err := downloadThumb(thumbURL, w.rec.Filename)
+		// Download the host thumbnail (og:image scrape + fetch + save).
+		finalPath, err := recovery.VidaraThumb(w.link.URL, os.TempDir(), downloadClient)
 		if err != nil {
-			log.Printf("  ERROR download: %v", err)
+			log.Printf("[%d/%d] %s: recover thumb: %v", i+1, len(work), w.rec.Filename, err)
 			failed++
 			continue
 		}
-		var ext string
-		switch mime {
-		case "image/webp":
-			ext = ".webp"
-		default:
-			ext = ".jpg"
-		}
-		finalPath := imgPath
-		if strings.ToLower(filepath.Ext(imgPath)) != ext {
-			finalPath = imgPath + ext
-			if err := os.Rename(imgPath, finalPath); err != nil {
-				finalPath = imgPath
-			}
+		if finalPath == "" {
+			log.Printf("[%d/%d] %s: no og:image on page", i+1, len(work), w.rec.Filename)
+			noThumb++
+			continue
 		}
 
 		// Re-host via the standard image pipeline.
@@ -210,7 +197,7 @@ func main() {
 			continue
 		}
 
-		// 6. PATCH recordings + preview_images.
+		// 4. PATCH recordings + preview_images.
 		if err := server.UpdateRecordingThumbnails(w.rec.Filename, primary, "", ""); err != nil {
 			log.Printf("  ERROR patch recordings: %v", err)
 			failed++
@@ -229,105 +216,11 @@ func main() {
 }
 
 // resolveVidaraThumb fetches the Vidara embed page and returns the og:image
-// thumbnail URL, or "" if none is present.
+// thumbnail URL, or "" if none is present. It mirrors recovery.VidaraThumb's
+// page-scrape but only reports the URL (used for -dry).
 func resolveVidaraThumb(code string) (string, error) {
-	req, err := http.NewRequest("GET", "https://vidarae.live/e/"+code, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("User-Agent", browserUA)
-	resp, err := downloadClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("page status %d", resp.StatusCode)
-	}
-	m := ogImageRe.FindSubmatch(body)
-	if len(m) < 2 {
-		return "", nil
-	}
-	u := string(m[1])
-	// The og:image may be protocol-relative; normalise to https.
-	u = strings.TrimPrefix(u, "//")
-	if !strings.HasPrefix(u, "http") {
-		u = "https://" + u
-	}
-	return u, nil
+	return recovery.ResolveVidaraImageURL(code, downloadClient)
 }
-
-// downloadThumb downloads a thumbnail to a temp file and returns its path and
-// content type.
-func downloadThumb(imgURL, name string) (string, string, error) {
-	req, err := http.NewRequest("GET", imgURL, nil)
-	if err != nil {
-		return "", "", err
-	}
-	req.Header.Set("User-Agent", browserUA)
-	req.Header.Set("Accept", "image/webp,image/apng,image/*,*/*;q=0.8")
-	resp, err := downloadClient.Do(req)
-	if err != nil {
-		return "", "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("status %d", resp.StatusCode)
-	}
-	tmp, err := os.CreateTemp("", "bfr-"+sanitizeName(name)+"-*")
-	if err != nil {
-		return "", "", err
-	}
-	if _, err := io.Copy(tmp, resp.Body); err != nil {
-		tmp.Close()
-		os.Remove(tmp.Name())
-		return "", "", err
-	}
-	tmp.Close()
-	mime := resp.Header.Get("Content-Type")
-	if i := strings.Index(mime, ";"); i >= 0 {
-		mime = mime[:i]
-	}
-	return tmp.Name(), mime, nil
-}
-
-// vidaraCode extracts the trailing file code from a Vidara share/embed URL
-// (anything after the last "/", 6+ alphanumeric chars).
-func vidaraCode(u string) string {
-	u = strings.TrimSpace(u)
-	if i := strings.IndexAny(u, "?#"); i >= 0 {
-		u = u[:i]
-	}
-	u = strings.TrimRight(u, "/")
-	if i := strings.LastIndex(u, "/"); i >= 0 {
-		u = u[i+1:]
-	}
-	if len(u) < 6 {
-		return ""
-	}
-	for _, r := range u {
-		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') {
-			return ""
-		}
-	}
-	return u
-}
-
-func sanitizeName(name string) string {
-	var b strings.Builder
-	for _, r := range name {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
-			b.WriteRune(r)
-		default:
-			b.WriteRune('_')
-		}
-	}
-	return b.String()
-}
-
-const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
 
 func configFromEnv() *entity.Config {
 	return &entity.Config{

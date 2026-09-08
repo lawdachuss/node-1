@@ -589,7 +589,7 @@ func (c *Client) GetAllRecordings() ([]Recording, error) {
 // every node on every tick.
 func (c *Client) GetRecordingsMissingThumbnails() ([]Recording, error) {
 	var recordings []Recording
-	err := c.getAllPaginated("/recordings?select=filename,thumbnail_url,sprite_url,preview_url&thumbnail_url=is.null", &recordings)
+	err := c.getAllPaginated("/recordings?select=id,filename,thumbnail_url,sprite_url,preview_url&thumbnail_url=is.null", &recordings)
 	return recordings, err
 }
 

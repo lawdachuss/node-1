@@ -93,6 +93,10 @@ type Manager struct {
 	thumbThrottleMu sync.Mutex
 	thumbScanning   bool
 
+	// remoteThumbScanning guards SyncRemoteThumbnails so the startup and periodic
+	// ticker invocations never overlap.
+	remoteThumbScanning bool
+
 	// renderCache caches the last-rendered channel_info HTML per
 	// channel.  Publish() skips the SSE push when the fingerprint
 	// is unchanged, which eliminates redundant template execution
@@ -322,7 +326,7 @@ func (m *Manager) LoadConfig() error {
 
 	// Dedicated short-interval thumbnail-backfill ticker (independent of the
 	// orphan-cleanup interval above).
-	startRecordingsThumbSync()
+	startRecordingsThumbSync(m)
 
 	// File watcher for real-time orphan detection.
 	// Only watch the output directory — files in the temp "videos/"
@@ -438,7 +442,7 @@ func (m *Manager) LoadPooledConfig() error {
 
 	// Dedicated short-interval thumbnail-backfill ticker (independent of the
 	// orphan-cleanup interval above).
-	startRecordingsThumbSync()
+	startRecordingsThumbSync(m)
 
 	// File watcher
 	if server.Config.OutputDir != "" {
@@ -684,20 +688,23 @@ const (
 	thumbSyncInterval = 30 * time.Minute
 )
 
-// startRecordingsThumbSync runs SyncRecordingsThumbnails on a dedicated short
-// ticker, independent of the orphan-cleanup ticker, so recordings whose
-// thumbnail landed only in preview_images get their recordings.thumbnail_url
-// backfilled promptly. SyncRecordingsThumbnails self-throttles, so an
-// overlapping sticky/ticker call is a no-op.
-func startRecordingsThumbSync() {
+// startRecordingsThumbSync runs SyncRecordingsThumbnails (the cheap DB->DB copy)
+// plus SyncRemoteThumbnails (recovering thumbnails from upload hosts when the
+// local file is gone) on a dedicated short ticker, independent of the
+// orphan-cleanup ticker, so recordings whose thumbnail landed only in
+// preview_images get their recordings.thumbnail_url backfilled promptly. Both
+// self-throttle, so an overlapping sticky/ticker call is a no-op.
+func startRecordingsThumbSync(m *Manager) {
 	go func() {
 		// An initial sweep immediately in case nothing else has run yet; the
-		// throttle guard makes a duplicate startup call harmless.
+		// throttle guards make a duplicate startup call harmless.
 		server.SyncRecordingsThumbnails()
+		m.SyncRemoteThumbnails()
 		ticker := time.NewTicker(thumbSyncInterval)
 		defer ticker.Stop()
 		for range ticker.C {
 			server.SyncRecordingsThumbnails()
+			m.SyncRemoteThumbnails()
 		}
 	}()
 }
