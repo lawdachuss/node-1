@@ -22,6 +22,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -38,11 +39,14 @@ import (
 const (
 	thumbWidth   = 1280
 	thumbHeight  = 720
-	streamAPI    = "https://api.streamtape.com"
 	downloadMax  = 512 * 1024 * 1024 // safety cap for a Range response
 	browserUA    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
 	downloadMaxB = 600 * time.Second
 )
+
+// streamAPI is the Streamtape API base URL. A var (not const) so tests can point
+// it at an httptest server.
+var streamAPI = "https://api.streamtape.com"
 
 // cloudflareIPs are known-good Anycast addresses for api.streamtape.com.
 // Some ISP resolvers return a stale origin IP that no longer responds; the
@@ -52,6 +56,13 @@ var cloudflareIPs = []string{"104.21.96.46", "172.67.173.3"}
 // ogImageRe matches <meta property="og:image" content="..."/> on Vidara's
 // embed page. The thumbnail is video-specific (pointing at the CDN path).
 var ogImageRe = regexp.MustCompile(`(?i)<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']`)
+
+// errStreamFileNotFound is returned when Streamtape's dl endpoint reports that
+// the file has gone / is not downloadable under the configured account. It is a
+// permanent condition — retrying only wastes time — so the download loop treats
+// it as a hard stop (fail fast) rather than re-issuing tickets and range grabs
+// that can never succeed.
+var errStreamFileNotFound = errors.New("streamtape: file not found")
 
 // ExtractStreamtapeCode returns the filecode from a Streamtape embed/share URL,
 // or "" if it cannot be identified. Accepts e/ and v/ style URLs as well as the
@@ -242,6 +253,10 @@ func streamGrab(filecode, dstPath string, start, length int64, login, key string
 		}
 		dlURL, err := freshDLURL(filecode, login, key)
 		if err != nil {
+			if errors.Is(err, errStreamFileNotFound) {
+				// Permanent — the file is gone; stop immediately.
+				return err
+			}
 			if tries == 7 {
 				return err
 			}
@@ -332,6 +347,10 @@ func freshDLURL(filecode, login, key string) (string, error) {
 		if err == nil {
 			return url, nil
 		}
+		if errors.Is(err, errStreamFileNotFound) {
+			// Permanent — no point re-issuing tickets.
+			return "", err
+		}
 		lastErr = err
 		time.Sleep(3 * time.Second)
 	}
@@ -378,6 +397,10 @@ func oneTicket(filecode, login, key string) (string, error) {
 	resp.Body.Close()
 	if err := json.Unmarshal(body, &dr); err != nil {
 		return "", fmt.Errorf("dl decode: %w", err)
+	}
+	if dr.Status == 404 || strings.Contains(strings.ToLower(string(body)), "file not found") {
+		// Permanent: the file is gone or not under this account. Do not retry.
+		return "", errStreamFileNotFound
 	}
 	if dr.Status != 200 || dr.Result.URL == "" {
 		return "", fmt.Errorf("dl failed: %s", strings.TrimSpace(string(body)))
