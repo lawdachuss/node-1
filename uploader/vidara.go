@@ -24,14 +24,17 @@ var vidaraAPIBase = "https://api.vidara.so/v1"
 
 // VidaraUploader handles uploading files to vidara.so
 type VidaraUploader struct {
-	apiKey string
+	keys   *keyRing
 	client *http.Client
 }
 
-// NewVidaraUploader creates a new Vidara uploader instance
+// NewVidaraUploader creates a new Vidara uploader instance.  The API key may
+// be a comma-separated list ("key1,key2,key3") to enable rotation when a key
+// is invalidated.  Each instance builds its own ring from the passed value /
+// env, so concurrent uploaders each rotate independently.
 func NewVidaraUploader(apiKey string) *VidaraUploader {
 	return &VidaraUploader{
-		apiKey: apiKey,
+		keys:   buildRingFromEnv("VIDARA_KEY", apiKey),
 		client: &http.Client{
 			Timeout: 120 * time.Minute, // Long timeout for large video uploads
 			Transport: &http.Transport{
@@ -69,7 +72,7 @@ func (u *VidaraUploader) Upload(filePath string) (string, error) {
 
 // UploadWithProgress uploads a file to Vidara and reports progress through fn.
 func (u *VidaraUploader) UploadWithProgress(filePath string, progress ProgressFunc) (string, error) {
-	if u.apiKey == "" {
+	if u.keys.count() == 0 {
 		return "", fmt.Errorf("Vidara API key not configured")
 	}
 
@@ -78,37 +81,57 @@ func (u *VidaraUploader) UploadWithProgress(filePath string, progress ProgressFu
 
 	var lastErr error
 
-	maxAttempts := 3
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		if attempt > 1 {
-			time.Sleep(uploadBackoff(attempt-2, lastErr))
-		}
+	// Try each key at most once per call.  A single-key ring degenerates to a
+	// single attempt loop (rotate is a no-op), preserving prior behavior.
+	keyAttempts := u.keys.count()
+	if keyAttempts < 1 {
+		keyAttempts = 1
+	}
+	maxAttempts := 3 // per-key upload retries (backoff on rate-limit)
 
-		downloadLink, err := u.uploadFile(filePath, progress)
-		if err != nil {
-			lastErr = fmt.Errorf("upload file: %w", err)
-			if isUploadRateLimited(err) {
-				time.Sleep(uploadBackoff(attempt, err))
-				lastErr = nil
-				continue
+	for k := 0; k < keyAttempts; k++ {
+		key := u.keys.current()
+
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			if attempt > 1 {
+				time.Sleep(uploadBackoff(attempt-2, lastErr))
 			}
-			// Fail fast on host-side capacity failures: "no healthy upload
-			// server" (503) and nginx 504 gateway timeouts mean Vidara itself
-			// is saturated — burning the remaining attempts on it just stalls
-			// the file while other hosts could have finished. Bail immediately
-			// and let the caller's parallel host chain take the load.
-			if isVidaraCapacityError(err) {
+
+			downloadLink, err := u.uploadFile(filePath, key, progress)
+			if err != nil {
+				lastErr = fmt.Errorf("upload file: %w", err)
+				if isUploadRateLimited(err) {
+					time.Sleep(uploadBackoff(attempt, err))
+					lastErr = nil
+					continue
+				}
+				// Fail fast on host-side capacity failures: "no healthy upload
+				// server" (503) and nginx 504 gateway timeouts mean Vidara itself
+				// is saturated — burning the remaining attempts on it just stalls
+				// the file while other hosts could have finished. Bail immediately
+				// and let the caller's parallel host chain take the load.
+				if isVidaraCapacityError(err) {
+					return "", lastErr
+				}
+				// Invalid/expired key for THIS key: rotate to the next key.
+				if isVidaraAuthError(err) {
+					u.keys.rotate()
+					lastErr = nil
+					break
+				}
+				if attempt < maxAttempts {
+					continue
+				}
 				return "", lastErr
 			}
-			if attempt < maxAttempts {
-				continue
-			}
-			return "", lastErr
-		}
 
-		return downloadLink, nil
+			return downloadLink, nil
+		}
 	}
 
+	if lastErr == nil {
+		lastErr = fmt.Errorf("Vidara upload failed: all keys exhausted")
+	}
 	return "", lastErr
 }
 
@@ -127,9 +150,26 @@ func isVidaraCapacityError(err error) bool {
 		strings.Contains(msg, "504 gateway time-out")
 }
 
+// isVidaraAuthError returns true when the Vidara error indicates the API key
+// is invalid, expired, or revoked (HTTP 403 / auth wording).  A bad key will
+// never succeed within a run, so callers should rotate to the next key instead
+// of retrying the same one.
+func isVidaraAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "403") ||
+		strings.Contains(msg, "authentication") ||
+		strings.Contains(msg, "unauthorized") ||
+		strings.Contains(msg, "invalid api key") ||
+		strings.Contains(msg, "api key") ||
+		strings.Contains(msg, "forbidden")
+}
+
 // getUploadServer gets the upload server URL from the Vidara API
-func (u *VidaraUploader) getUploadServer() (string, error) {
-	req, err := http.NewRequest("GET", vidaraAPIBase+"/upload/server?api_key="+u.apiKey, nil)
+func (u *VidaraUploader) getUploadServer(key string) (string, error) {
+	req, err := http.NewRequest("GET", vidaraAPIBase+"/upload/server?api_key="+key, nil)
 	if err != nil {
 		return "", fmt.Errorf("create request: %w", err)
 	}
@@ -157,14 +197,14 @@ func (u *VidaraUploader) getUploadServer() (string, error) {
 	return serverResp.Result.UploadServer, nil
 }
 
-func (u *VidaraUploader) uploadFile(filePath string, progress ProgressFunc) (string, error) {
-	uploadServer, err := u.getUploadServer()
+func (u *VidaraUploader) uploadFile(filePath, key string, progress ProgressFunc) (string, error) {
+	uploadServer, err := u.getUploadServer(key)
 	if err != nil {
 		return "", fmt.Errorf("get upload server: %w", err)
 	}
 
 	body, contentLen, contentType, file, err := multipartStreamWithProgress(
-		map[string]string{"api_key": u.apiKey},
+		map[string]string{"api_key": key},
 		"file", filePath, "Vidara", progress,
 	)
 	if err != nil {

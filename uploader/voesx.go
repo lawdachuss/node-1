@@ -16,14 +16,18 @@ const (
 
 // VoeSXUploader handles uploading files to VOE.sx
 type VoeSXUploader struct {
-	apiKey string
+	keys   *keyRing
 	client *http.Client
 }
 
-// NewVoeSXUploader creates a new VOE.sx uploader instance
+// NewVoeSXUploader creates a new VOE.sx uploader instance.  The API key may
+// be a comma-separated list ("key1,key2,key3") to enable rotation when a key
+// is invalidated or its storage quota is exhausted.  Each instance builds its
+// own ring from the passed value / env, so concurrent uploaders each rotate
+// independently (the first upload on a bad key rotates it for that instance).
 func NewVoeSXUploader(apiKey string) *VoeSXUploader {
 	return &VoeSXUploader{
-		apiKey: apiKey,
+		keys:   buildRingFromEnv("VOESX_API_KEY", apiKey),
 		client: &http.Client{
 			Timeout: 120 * time.Minute,
 			Transport: &http.Transport{
@@ -64,7 +68,7 @@ func (u *VoeSXUploader) Upload(filePath string) (string, error) {
 
 // UploadWithProgress uploads a file to VOE.sx and reports progress through fn.
 func (u *VoeSXUploader) UploadWithProgress(filePath string, progress ProgressFunc) (string, error) {
-	if u.apiKey == "" {
+	if u.keys.count() == 0 {
 		return "", fmt.Errorf("VOE.sx API key not configured")
 	}
 
@@ -73,39 +77,56 @@ func (u *VoeSXUploader) UploadWithProgress(filePath string, progress ProgressFun
 
 	var lastErr error
 
-	maxAttempts := 3
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		if attempt > 1 {
-			time.Sleep(uploadBackoff(attempt-2, lastErr))
-		}
+	// Try each key at most once per call.  A single-key ring degenerates to a
+	// single attempt loop (rotate is a no-op), preserving prior behavior.
+	keyAttempts := u.keys.count()
+	if keyAttempts < 1 {
+		keyAttempts = 1
+	}
+	maxAttempts := 3 // per-key upload retries (backoff on rate-limit)
 
-		downloadLink, err := u.uploadFile(filePath, progress)
-		if err != nil {
-			lastErr = fmt.Errorf("upload file: %w", err)
-			if isUploadRateLimited(err) {
-				time.Sleep(uploadBackoff(attempt, err))
-				lastErr = nil
-				continue
+	for k := 0; k < keyAttempts; k++ {
+		key := u.keys.current()
+
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			if attempt > 1 {
+				time.Sleep(uploadBackoff(attempt-2, lastErr))
 			}
-			// Storage-full is unrecoverable — don't waste time retrying.
-			if isVoeStorageFull(err) {
+
+			downloadLink, err := u.uploadFile(filePath, key, progress)
+			if err != nil {
+				lastErr = fmt.Errorf("upload file: %w", err)
+				if isUploadRateLimited(err) {
+					time.Sleep(uploadBackoff(attempt, err))
+					lastErr = nil
+					continue
+				}
+				// Invalid auth (expired/revoked key) or storage-full for THIS
+				// key: rotate to the next key and stop retrying the bad one.
+				if isVoeAuthError(err) || isVoeStorageFull(err) {
+					u.keys.rotate()
+					lastErr = nil
+					break
+				}
+				if attempt < maxAttempts {
+					continue
+				}
 				return "", lastErr
 			}
-			if attempt < maxAttempts {
-				continue
-			}
-			return "", lastErr
-		}
 
-		return downloadLink, nil
+			return downloadLink, nil
+		}
 	}
 
+	if lastErr == nil {
+		lastErr = fmt.Errorf("VOE.sx upload failed: all keys exhausted")
+	}
 	return "", lastErr
 }
 
 // getUploadServer gets the upload server URL from VOE.sx API
-func (u *VoeSXUploader) getUploadServer() (string, error) {
-	url := fmt.Sprintf("%s/upload/server?key=%s", voeSXAPIBase, u.apiKey)
+func (u *VoeSXUploader) getUploadServer(key string) (string, error) {
+	url := fmt.Sprintf("%s/upload/server?key=%s", voeSXAPIBase, key)
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -139,15 +160,15 @@ func (u *VoeSXUploader) getUploadServer() (string, error) {
 	return serverResp.Result, nil
 }
 
-func (u *VoeSXUploader) uploadFile(filePath string, progress ProgressFunc) (string, error) {
+func (u *VoeSXUploader) uploadFile(filePath, key string, progress ProgressFunc) (string, error) {
 	// Step 1: Get upload server
-	uploadServer, err := u.getUploadServer()
+	uploadServer, err := u.getUploadServer(key)
 	if err != nil {
 		return "", fmt.Errorf("get upload server: %w", err)
 	}
 
 	body, contentLen, contentType, file, err := multipartStreamWithProgress(
-		map[string]string{"key": u.apiKey},
+		map[string]string{"key": key},
 		"file", filePath, "VOE.sx", progress,
 	)
 	if err != nil {
@@ -203,4 +224,22 @@ func isVoeStorageFull(err error) bool {
 		strings.Contains(msg, "maximum storage") ||
 		strings.Contains(msg, "storage full") ||
 		strings.Contains(msg, "quota")
+}
+
+// isVoeAuthError returns true when the VOE.sx error indicates the API key is
+// invalid, expired, or revoked (403 / authentication failures).  A bad key
+// will never succeed within a run, so callers should rotate to the next key
+// instead of retrying the same one.  Detected as HTTP 403 or auth wording in
+// the message body.
+func isVoeAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "403") ||
+		strings.Contains(msg, "authentication") ||
+		strings.Contains(msg, "invalid key") ||
+		strings.Contains(msg, "unauthorized") ||
+		strings.Contains(msg, "api key") ||
+		strings.Contains(msg, "forbidden")
 }

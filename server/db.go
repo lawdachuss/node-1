@@ -1242,16 +1242,24 @@ func LoadRecordingThumbnails(filename string) (thumbURL, spriteURL, previewURL s
 }
 
 // UpdateRecordingThumbnails patches the thumbnail_url, sprite_url and preview_url on an
-// existing recording row identified by filename.
+// existing recording row identified by filename. Only non-empty values are written;
+// empty fields are left untouched so a caller that only has a thumbnail never
+// clobbers an existing sprite/preview that may carry richer mirrors.
 func UpdateRecordingThumbnails(filename, thumbnailURL, spriteURL, previewURL string) error {
 	if thumbnailURL == "" && spriteURL == "" && previewURL == "" {
 		return nil
 	}
-	body, err := json.Marshal(map[string]string{
-		"thumbnail_url": thumbnailURL,
-		"sprite_url":    spriteURL,
-		"preview_url":   previewURL,
-	})
+	fields := map[string]string{}
+	if thumbnailURL != "" {
+		fields["thumbnail_url"] = thumbnailURL
+	}
+	if spriteURL != "" {
+		fields["sprite_url"] = spriteURL
+	}
+	if previewURL != "" {
+		fields["preview_url"] = previewURL
+	}
+	body, err := json.Marshal(fields)
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
@@ -1283,6 +1291,82 @@ var (
 // but has a preview_images row, so it is light; the cooldown just prevents the
 // ticker from re-scanning on adjacent ticks.
 const recThumbSyncCooldown = 10 * time.Minute
+
+// recThumbUnfixableBackoff is how long a node skips a recording confirmed to
+// have no fixable preview (no preview_images row, or one with an empty
+// thumbnail). It is bounded (not permanent) so a thumbnail generated later by
+// ScanThumbnails still gets picked up on a later sweep, but it stops every node
+// from re-examining the same permanently-unfixable rows every 30 minutes.
+const recThumbUnfixableBackoff = 24 * time.Hour
+
+// recThumbUnfixable tracks recently-confirmed-unfixable filenames so the sweep
+// skips them without re-querying their previews. Per-node in-memory state;
+// clearing happens lazily as entries age past the backoff.
+var (
+	recThumbUnfixableMu sync.Mutex
+	recThumbUnfixable   = map[string]time.Time{}
+)
+
+// markRecThumbUnfixable records that filename currently has no thumbnail to
+// backfill, so subsequent sweeps skip it until the backoff elapses.
+func markRecThumbUnfixable(filename string) {
+	recThumbUnfixableMu.Lock()
+	recThumbUnfixable[filename] = time.Now()
+	recThumbUnfixableMu.Unlock()
+}
+
+// recThumbUnfixableSkips returns the set of filenames still inside the backoff
+// window, pruning expired entries in the process.
+func recThumbUnfixableSkips() map[string]bool {
+	recThumbUnfixableMu.Lock()
+	defer recThumbUnfixableMu.Unlock()
+	now := time.Now()
+	skips := make(map[string]bool, len(recThumbUnfixable))
+	for fn, ts := range recThumbUnfixable {
+		if now.Sub(ts) < recThumbUnfixableBackoff {
+			skips[fn] = true
+		} else {
+			delete(recThumbUnfixable, fn)
+		}
+	}
+	return skips
+}
+
+// lookupPreviewLinks returns the preview_images-derived asset URLs for a
+// recording filename. Merged recordings store preview_images under the
+// *original* filename (the source HLS/stream recording), so a row recorded as
+// "<file>.merged.mp4" won't match directly — fall back to the pre-merge name so
+// the thumbnail still gets backfilled. Returns ok=false when no row matches.
+func lookupPreviewLinks(previews map[string][3]string, filename string) ([3]string, bool) {
+	if links, ok := previews[filename]; ok {
+		return links, true
+	}
+	if strings.HasSuffix(filename, ".merged.mp4") {
+		if original := strings.TrimSuffix(filename, ".merged.mp4"); original != "" {
+			if links, ok := previews[original]; ok {
+				return links, true
+			}
+		}
+	}
+	return [3]string{}, false
+}
+
+// mergeThumbAssets keeps the recording's existing sprite/preview URLs when they
+// are already populated, so a backfill of a missing thumbnail never clobbers a
+// richer (already-mirrored) sprite/preview with a stale preview_images value.
+func mergeThumbAssets(existingSprite, newSprite, existingPreview, newPreview string) (sprite, preview string) {
+	if existingSprite != "" {
+		sprite = existingSprite
+	} else {
+		sprite = newSprite
+	}
+	if existingPreview != "" {
+		preview = existingPreview
+	} else {
+		preview = newPreview
+	}
+	return sprite, preview
+}
 
 // SyncRecordingsThumbnails is the automatic backfill: for every recording whose
 // recordings.thumbnail_url is empty but whose preview_images row has a thumbnail
@@ -1332,19 +1416,33 @@ func SyncRecordingsThumbnails() {
 	const pacing = 150 * time.Millisecond
 
 	fixed := 0
+	skips := recThumbUnfixableSkips()
 	for i := range recordings {
 		rec := &recordings[i]
 		if rec.ThumbnailURL != "" {
 			continue
 		}
-		links, ok := previews[rec.Filename]
+		if skips[rec.Filename] {
+			continue
+		}
+		links, ok := lookupPreviewLinks(previews, rec.Filename)
 		if !ok {
+			// No preview_images row exists for this file, so it cannot be
+			// backfilled on this sweep. Remember it so we don't re-examine it
+			// on adjacent sweeps; give ScanThumbnails a window to generate one.
+			markRecThumbUnfixable(rec.Filename)
 			continue
 		}
 		thumb, sprite, preview := links[0], links[1], links[2]
 		if thumb == "" {
+			// Preview row exists but carries no thumbnail yet — not fixable now.
+			markRecThumbUnfixable(rec.Filename)
 			continue
 		}
+		// Merge conservatively: the thumbnail is what's missing, so always write
+		// it; but never clobber an existing (possibly richer) sprite/preview that
+		// already survived on the recording row with a stale preview_images value.
+		sprite, preview = mergeThumbAssets(rec.SpriteURL, sprite, rec.PreviewURL, preview)
 		if err := UpdateRecordingThumbnails(rec.Filename, thumb, sprite, preview); err != nil {
 			log.Printf("[thumb-sync] failed to sync %s: %v", rec.Filename, err)
 			continue

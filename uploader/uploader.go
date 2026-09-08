@@ -227,7 +227,7 @@ func (m *MultiHostUploader) initHosts() {
 		if !isGloballyDisabled("GoFile") {
 			m.hosts["GoFile"] = m.gofile.UploadWithProgress
 		}
-		if m.voesx != nil && m.voesx.apiKey != "" && !isGloballyDisabled("VOE.sx") {
+		if m.voesx != nil && m.voesx.keys.count() > 0 && !isGloballyDisabled("VOE.sx") {
 			m.hosts["VOE.sx"] = m.voesx.UploadWithProgress
 		}
 		if m.streamtape != nil && m.streamtape.login != "" && m.streamtape.key != "" && !isGloballyDisabled("Streamtape") {
@@ -236,7 +236,7 @@ func (m *MultiHostUploader) initHosts() {
 		if m.mixdrop != nil && m.mixdrop.email != "" && m.mixdrop.token != "" && !isGloballyDisabled("Mixdrop") {
 			m.hosts["Mixdrop"] = m.mixdrop.UploadWithProgress
 		}
-		if m.vidara != nil && m.vidara.apiKey != "" && !isGloballyDisabled("Vidara") {
+		if m.vidara != nil && m.vidara.keys.count() > 0 && !isGloballyDisabled("Vidara") {
 			m.hosts["Vidara"] = m.vidara.UploadWithProgress
 		}
 		// AnonMP4: always available (no API key required)
