@@ -13,13 +13,33 @@ import (
 	"time"
 )
 
+// freeImageHostGuestKey is the publicly documented shared "guest" API key.
+// freeimage.host no longer accepts programmatic uploads under this key —
+// it returns HTTP 403 "requires authentication" because uploaded images are
+// not tied to any account. It is kept only as an explicit marker so callers
+// can tell when no real account key is configured; the uploader chain skips
+// the host entirely in that case (see HasToken).
+const freeImageHostGuestKey = "6d207e02198a847aa98d0a2a901485a5"
+
 // FreeImageHostUploader handles uploading images to freeimage.host.
-// No account required — uses the guest API key.
 // Supports adult/NSFW content. Permanent hosting (no inactivity deletion).
 // Max file size: 64 MB. Supports JPG, PNG, BMP, GIF, WEBP.
+//
+// A real account API key must be supplied via the FREEIMAGEHOST_API_KEY env
+// var (see https://freeimage.host/api). Without one the shared guest key is
+// used, which freeimage.host rejects with HTTP 403 — so callers should skip
+// this host via HasToken() when no key is configured.
 type FreeImageHostUploader struct {
 	client  *http.Client
 	apiKey  string
+	tokenOK bool
+}
+
+// HasToken reports whether a real account API key is configured. When false,
+// the uploader would fall back to the shared guest key, which freeimage.host
+// rejects with HTTP 403 — callers should skip this host rather than try it.
+func (u *FreeImageHostUploader) HasToken() bool {
+	return u.tokenOK
 }
 
 // freeImageHostResponse is the JSON response from the freeimage.host API.
@@ -47,12 +67,21 @@ type freeImageHostResponse struct {
 }
 
 // NewFreeImageHostUploader creates a new freeimage.host uploader.
-// Uses the guest API key (no account required).
+// Reads the account API key from the FREEIMAGEHOST_API_KEY env var. If it is
+// not set, HasToken() returns false and the host should be skipped — the
+// shared guest key is no longer accepted for uploads (HTTP 403).
 func NewFreeImageHostUploader() *FreeImageHostUploader {
+	key := strings.TrimSpace(os.Getenv("FREEIMAGEHOST_API_KEY"))
+	tokenOK := key != ""
+	if !tokenOK {
+		// Keep the guest key for backward compatibility of the field, but
+		// mark the host as not configured so the chain can skip it.
+		key = freeImageHostGuestKey
+	}
 	return &FreeImageHostUploader{
-		client: newNoProxyClient(2 * time.Minute),
-		// Guest API key — public, documented, no account needed.
-		apiKey: "6d207e02198a847aa98d0a2a901485a5",
+		client:  newNoProxyClient(2 * time.Minute),
+		apiKey:  key,
+		tokenOK: tokenOK,
 	}
 }
 

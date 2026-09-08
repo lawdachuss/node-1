@@ -308,7 +308,14 @@ func isFailFastError(err error) bool {
 		// resolve within a single run; retrying just wastes time. Treat as
 		// fatal so the fallback / deathlist can move on immediately.
 		strings.Contains(msg, "could not authenticate") ||
-		strings.Contains(msg, "account may be locked")
+		strings.Contains(msg, "account may be locked") ||
+		// HTTP 403 rejections (e.g. freeimage.host's "requires authentication"
+		// when uploading with the shared guest key) are account-level and will
+		// not resolve on retry — bail so the next host in the chain is tried.
+		strings.Contains(msg, "http 403") ||
+		strings.Contains(msg, "requires authentication") ||
+		strings.Contains(msg, "access denied") ||
+		strings.Contains(msg, "forbidden")
 }
 
 // isHostDead reports whether an upload error indicates the host is permanently

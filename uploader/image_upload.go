@@ -140,13 +140,19 @@ func (m *MultiImageUploader) Upload(filePath string) (url, host string, err erro
 	}
 	pixhostErr := err
 
-	url, err = uploadWithRetries(3, "freeimage.host", func() (string, error) {
-		return m.freeimage.Upload(filePath)
-	})
-	if err == nil {
-		return url, "freeimage.host", nil
+	// freeimage.host — only if a real account API key is configured. The
+	// shared guest key is rejected with HTTP 403 ("requires authentication"),
+	// so without a key this host is skipped rather than retried pointlessly.
+	freeimageErr := fmt.Errorf("freeimage.host: FREEIMAGEHOST_API_KEY not set")
+	if m.freeimage.HasToken() {
+		url, err = uploadWithRetries(3, "freeimage.host", func() (string, error) {
+			return m.freeimage.Upload(filePath)
+		})
+		if err == nil {
+			return url, "freeimage.host", nil
+		}
+		freeimageErr = err
 	}
-	freeimageErr := err
 
 	// ImgChest — only if token is configured
 	if m.imgchest.HasToken() {
@@ -265,7 +271,9 @@ func (m *MultiImageUploader) UploadToAll(filePath string, onHost OnSuccessFunc) 
 	}
 	addJob("Catbox", m.catbox.Upload)
 	addJob("Pixhost", m.pixhost.Upload)
-	addJob("freeimage.host", m.freeimage.Upload)
+	if m.freeimage.HasToken() {
+		addJob("freeimage.host", m.freeimage.Upload)
+	}
 	if m.imgchest.HasToken() {
 		addJob("ImgChest", m.imgchest.Upload)
 	}
