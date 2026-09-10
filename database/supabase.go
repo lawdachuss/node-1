@@ -133,6 +133,18 @@ func (c *Client) requestWithRetryN(method, path string, body interface{}, maxRet
 				continue
 			}
 
+			// 42P10: ON CONFLICT constraint not in PostgREST schema cache yet
+			// (e.g. right after a migration or during a failover). Transient —
+			// a genuine constraint error will keep failing and exhaust retries.
+			if resp.StatusCode == 400 && strings.Contains(bodyStr, "42P10") {
+				lastErr = fmt.Errorf("HTTP 400: %s", bodyStr)
+				backoff := retryBackoff(attempt)
+				fmt.Printf("[WARN] Supabase schema cache stale — ON CONFLICT constraint missing (attempt %d/%d), retrying in %v\n", attempt+1, maxRetries, backoff)
+				resp.Body.Close()
+				time.Sleep(backoff)
+				continue
+			}
+
 			// Non-retryable error — return as-is
 			if resp.StatusCode == 408 || resp.StatusCode == 429 || resp.StatusCode >= 500 {
 				lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, bodyStr)

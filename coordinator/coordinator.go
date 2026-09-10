@@ -499,14 +499,32 @@ func (c *Coordinator) Register() {
 		SessionDeadline: deadline,
 	}
 
-	if err := c.Client.UpsertNode(node); err != nil {
-		log.Printf("[coordinator] WARNING: failed to register node: %v", err)
-	} else {
-		if deadline != nil {
-			log.Printf("[coordinator] registered as node %q on %s (session deadline: %s)", c.NodeID, host, deadline.Format(time.RFC3339))
-		} else {
-			log.Printf("[coordinator] registered as node %q on %s (no session deadline — permanent node)", c.NodeID, host)
+	// Retry registration: a transient Supabase outage at boot (failover 502/530,
+	// schema-cache hiccup 42P10) must not leave this node's row carrying a stale
+	// session_deadline — the controller would then permanently deadline-migrate a
+	// perfectly healthy node (fresh heartbeats, zero channels, never reassigned).
+	// Mirrors the LoadPooledConfig retry budget.
+	const maxRegAttempts = 8
+	for attempt := 0; ; attempt++ {
+		err := c.Client.UpsertNode(node)
+		if err == nil {
+			if deadline != nil {
+				log.Printf("[coordinator] registered as node %q on %s (session deadline: %s)", c.NodeID, host, deadline.Format(time.RFC3339))
+			} else {
+				log.Printf("[coordinator] registered as node %q on %s (no session deadline — permanent node)", c.NodeID, host)
+			}
+			break
 		}
+		if attempt >= maxRegAttempts-1 {
+			log.Printf("[coordinator] WARNING: failed to register node after %d attempts: %v", maxRegAttempts, err)
+			break
+		}
+		backoff := time.Duration(1<<uint(attempt)) * 2 * time.Second
+		if backoff > 15*time.Second {
+			backoff = 15 * time.Second
+		}
+		log.Printf("[coordinator] node registration failed (attempt %d/%d), retrying in %v: %v", attempt+1, maxRegAttempts, backoff, err)
+		time.Sleep(backoff)
 	}
 }
 
