@@ -10,8 +10,48 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
+
+// imgPileThrottle mirrors ImgBB's process-wide spacing: ImgPile rate-limits
+// per IP/Key with a daily quota (500 uploads/day free), and UploadToAll fires
+// thumb+sprite+preview for every video in parallel.  Without spacing, a burst
+// of a few uploads burns the window and every asset fails with HTTP 429 —
+// observed live on nodes 8/10/13.  8s spacing ≈ 450/h ceiling; after a 429 a
+// longer cooldown lets the window refill.
+var (
+	imgPileMu         sync.Mutex
+	imgPileLastUpload time.Time
+	imgPileBackoff    time.Time
+)
+
+const (
+	imgPileMinInterval      = 8 * time.Second
+	imgPileCooldownInterval = 90 * time.Second
+)
+
+// markImgPileRateLimited extends the cooldown window after a 429.
+func markImgPileRateLimited() {
+	imgPileMu.Lock()
+	defer imgPileMu.Unlock()
+	imgPileBackoff = time.Now().Add(imgPileCooldownInterval)
+}
+
+// throttleImgPile sleeps until the configured spacing has elapsed since the
+// previous ImgPile API call.  Safe for concurrent callers.
+func throttleImgPile() {
+	imgPileMu.Lock()
+	defer imgPileMu.Unlock()
+	interval := imgPileMinInterval
+	if time.Now().Before(imgPileBackoff) {
+		interval = imgPileCooldownInterval
+	}
+	if d := interval - time.Since(imgPileLastUpload); d > 0 {
+		time.Sleep(d)
+	}
+	imgPileLastUpload = time.Now()
+}
 
 // ImgPileUploader handles uploading images to imgpile.com.
 // Requires an API key (created on the settings page), sent as a Bearer token.
@@ -70,12 +110,24 @@ func (u *ImgPileUploader) Upload(filePath string) (string, error) {
 			time.Sleep(backoff)
 		}
 
+		// Space calls process-wide so parallel asset uploads can't exhaust
+		// the rate-limit window in a single tick (see imgPileThrottle).
+		throttleImgPile()
+
 		url, err := u.uploadOnce(filePath)
 		if err == nil {
 			return url, nil
 		}
 		lastErr = err
 
+		if isUploadRateLimited(err) {
+			// A 429 means the shared window is exhausted: mark the cooldown
+			// so subsequent calls (in THIS retry loop and other goroutines)
+			// pace at the slower interval, then try once more after backing
+			// off instead of giving the file up entirely.
+			markImgPileRateLimited()
+			continue
+		}
 		if isFailFastError(err) {
 			return "", err
 		}

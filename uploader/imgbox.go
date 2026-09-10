@@ -12,10 +12,51 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/html"
 )
+
+// imgboxBreaker is a process-wide circuit breaker: Imgbox's token endpoint
+// has had multi-week 500 outages, and UploadToAll attempts it for every
+// thumb/sprite/preview of every video on every node — each attempt paying a
+// homepage fetch + token POST before failing.  After imgboxBreakerThreshold
+// consecutive failures the host is skipped instantly for
+// imgboxBreakerCooldown; a success resets the streak.
+var (
+	imgboxMu        sync.Mutex
+	imgboxFailures  int
+	imgboxOpenUntil time.Time
+)
+
+const (
+	imgboxBreakerThreshold = 3
+	imgboxBreakerCooldown  = 15 * time.Minute
+)
+
+// imgboxBreakerOpen reports whether uploads should be skipped right now.
+func imgboxBreakerOpen() bool {
+	imgboxMu.Lock()
+	defer imgboxMu.Unlock()
+	return time.Now().Before(imgboxOpenUntil)
+}
+
+// imgboxRecordResult updates the breaker streak; it opens after the
+// consecutive-failure threshold and resets on success.
+func imgboxRecordResult(ok bool) {
+	imgboxMu.Lock()
+	defer imgboxMu.Unlock()
+	if ok {
+		imgboxFailures = 0
+		return
+	}
+	imgboxFailures++
+	if imgboxFailures >= imgboxBreakerThreshold {
+		imgboxOpenUntil = time.Now().Add(imgboxBreakerCooldown)
+		imgboxFailures = 0
+	}
+}
 
 // ImgboxUploader handles uploading images to imgbox.com.
 // No API key required — uses CSRF token + guest gallery token.
@@ -58,6 +99,13 @@ func NewImgboxUploader() *ImgboxUploader {
 //  2. POST /ajax/token/generate → get gallery token
 //  3. POST /upload/process → upload file, get image URL
 func (u *ImgboxUploader) Upload(filePath string) (string, error) {
+	// Circuit breaker: skip instantly while the host is known-broken
+	// (multi-week token-endpoint 500s) instead of paying the homepage +
+	// token round-trips on every asset.
+	if imgboxBreakerOpen() {
+		return "", fmt.Errorf("imgbox: skipped — circuit breaker open after repeated failures")
+	}
+
 	release := acquireHostSem("Imgbox")
 	defer release()
 
@@ -80,6 +128,7 @@ func (u *ImgboxUploader) Upload(filePath string) (string, error) {
 
 		url, err := u.uploadOnce(filePath)
 		if err == nil {
+			imgboxRecordResult(true)
 			return url, nil
 		}
 		lastErr = err
@@ -90,9 +139,11 @@ func (u *ImgboxUploader) Upload(filePath string) (string, error) {
 		// (Imgbox's token endpoint has returned 500 for weeks) just burns the
 		// retry budget before the fallback chain moves on.
 		if isFailFastError(err) || isHostDead(err) {
+			imgboxRecordResult(false)
 			return "", err
 		}
 	}
+	imgboxRecordResult(false)
 	return "", fmt.Errorf("imgbox: all 3 attempts failed, last: %w", lastErr)
 }
 

@@ -651,7 +651,7 @@ func (c *Client) DeleteOrphanedRecordings(orphanAge time.Duration) (int, error) 
 	// 1. Find candidates: no thumbnail, no embed, old enough.
 	var candidates []Recording
 	err := c.get(fmt.Sprintf(
-		"/recordings?select=id,username,filename"+
+		"/recordings?select=id,username,filename,instance_id"+
 			"&thumbnail_url=is.null&embed_url=is.null"+
 			"&created_at=lt.%s"+
 			"&order=created_at.desc&limit=500",
@@ -663,9 +663,29 @@ func (c *Client) DeleteOrphanedRecordings(orphanAge time.Duration) (int, error) 
 		return 0, nil
 	}
 
-	// 2. For each candidate, verify zero upload_links.
+	// 2. Determine which nodes are still online.  A row's instance_id is the
+	// node that enqueued it (DBInstanceID); if that node is still heartbeating,
+	// its pipeline may simply be stuck in the thumbnail/upload queue behind a
+	// backlog (thumbnails are generated AFTER the row is created, and a big
+	// batch can take well over 30 min).  Deleting such a row mid-upload makes
+	// every subsequent per-host link save fail with a 23503 FK violation
+	// (observed live: "Key (recording_id) is not present in table \"recordings\"").
+	// Only rows from dead/unknown instances are treated as true orphans.
+	online := map[string]bool{}
+	if nodes, err := c.GetNodes(); err == nil {
+		for _, n := range nodes {
+			if n.Status == "online" || n.Status == "draining" {
+				online[n.NodeID] = true
+			}
+		}
+	}
+
+	// 2b. For each candidate from a non-online instance, verify zero upload_links.
 	var orphanIDs []string
 	for _, rec := range candidates {
+		if rec.InstanceID != "" && online[rec.InstanceID] {
+			continue // owner node is alive — its pipeline still owns this row
+		}
 		var links []UploadLink
 		err := c.get(fmt.Sprintf("/upload_links?select=id&recording_id=eq.%s&limit=1", rec.ID), &links)
 		if err != nil {

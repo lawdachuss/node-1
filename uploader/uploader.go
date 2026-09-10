@@ -309,6 +309,12 @@ func isFailFastError(err error) bool {
 		// fatal so the fallback / deathlist can move on immediately.
 		strings.Contains(msg, "could not authenticate") ||
 		strings.Contains(msg, "account may be locked") ||
+		// Streamtape's auth rejection — "get upload URL: API error 403:
+		// Authentication failed" — is a dead/rotated key.  Note the matcher
+		// below looks for "http 403" which this error shape does not contain,
+		// so it must be listed explicitly.  Retrying it burns 3 attempts ×
+		// every file before the host is auto-disabled.
+		strings.Contains(msg, "authentication failed") ||
 		// HTTP 403 rejections (e.g. freeimage.host's "requires authentication"
 		// when uploading with the shared guest key) are account-level and will
 		// not resolve on retry — bail so the next host in the chain is tried.
@@ -316,6 +322,24 @@ func isFailFastError(err error) bool {
 		strings.Contains(msg, "requires authentication") ||
 		strings.Contains(msg, "access denied") ||
 		strings.Contains(msg, "forbidden")
+}
+
+// isUploadAuthError reports whether an upload error means the host rejected
+// our credentials (dead/rotated key, locked account).  Unlike transient
+// failures this will never succeed again within the run, so the caller can
+// disable the host immediately instead of burning the 3-file failure streak
+// (each file paying full retries — observed live with a rotated Streamtape
+// key: every file retried the 403 three times before the streak disabled it).
+func isUploadAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "authentication failed") ||
+		strings.Contains(msg, "could not authenticate") ||
+		strings.Contains(msg, "account may be locked") ||
+		strings.Contains(msg, "invalid api key") ||
+		strings.Contains(msg, "api key not configured")
 }
 
 // isHostDead reports whether an upload error indicates the host is permanently
@@ -410,6 +434,9 @@ func (m *MultiHostUploader) UploadSelectedWithCallback(filePath string, hosts []
 				if isVoeStorageFull(err) {
 					m.log.Error("upload: %s reported storage full — disabling it for the rest of this run", host)
 					m.DisableHost(host)
+				} else if isUploadAuthError(err) {
+					m.log.Error("upload: %s rejected our credentials — disabling it for the rest of this run", host)
+					m.DisableHost(host)
 				} else if isHostDead(err) {
 					m.log.Error("upload: %s is permanently unreachable — disabling it for the rest of this run", host)
 					m.DisableHost(host)
@@ -473,6 +500,9 @@ func (m *MultiHostUploader) UploadSelectedPriority(filePath string, hosts []stri
 			m.log.Error("upload: %s (priority) failed for %s: %v", host, filePath, err)
 			if isVoeStorageFull(err) {
 				m.log.Error("upload: %s reported storage full — disabling it for the rest of this run", host)
+				m.DisableHost(host)
+			} else if isUploadAuthError(err) {
+				m.log.Error("upload: %s rejected our credentials — disabling it for the rest of this run", host)
 				m.DisableHost(host)
 			} else if isHostDead(err) {
 				m.log.Error("upload: %s is permanently unreachable — disabling it for the rest of this run", host)

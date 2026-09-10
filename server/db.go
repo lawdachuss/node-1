@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -1005,16 +1006,63 @@ func GetRecordingID(filename string) (string, error) {
 // The recordingID should be obtained once via GetRecordingID and reused for
 // all hosts to avoid redundant lookups.
 func SaveUploadLinkByID(recordingID, host, url string) error {
+	return SaveUploadLinkByIDWithFilename(recordingID, host, url, "")
+}
+
+// SaveUploadLinkByIDWithFilename persists a single upload link and, when the
+// recordings row was deleted mid-upload (FK 23503), re-creates it from the
+// filename before retrying once.  The delete races are real: orphan cleanup
+// on another node can remove a row this node is actively uploading against
+// (observed live: "Key (recording_id) is not present in table \"recordings\"").
+// The uploaded video is the source of truth — its link must not be lost to a
+// stale cleanup decision.  A re-created row gets a NEW id, so the caller's
+// stale recordingID is re-resolved by filename before the retry.
+func SaveUploadLinkByIDWithFilename(recordingID, host, url, filename string) error {
 	client := GetDBClient()
 	if client == nil {
 		return fmt.Errorf("Supabase not configured")
 	}
-	return client.SaveUploadLinks([]database.UploadLink{{
+	err := client.SaveUploadLinks([]database.UploadLink{{
 		RecordingID: recordingID,
 		Host:        host,
 		URL:         url,
 		InstanceID:  DBInstanceID(),
 	}})
+	if err == nil || filename == "" || !strings.Contains(err.Error(), "23503") {
+		return err
+	}
+	// Row vanished mid-upload: re-create the basics (upsert-by-filename is
+	// idempotent if the row was concurrently recreated by someone else) and
+	// resolve the (possibly new) ID.
+	if err := SaveRecordingBasics(extractUsernameFromFilenameParts(filename), filename, time.Now().UTC().Format("2006-01-02T15:04:05Z"), "", nil, 0, "", "", "", 0, 0, 0); err != nil {
+		return fmt.Errorf("upload link lost (recording row deleted mid-upload; recreate failed): %w", err)
+	}
+	newID, idErr := GetRecordingID(filename)
+	if idErr != nil || newID == "" {
+		return fmt.Errorf("upload link lost (recording row deleted mid-upload; re-resolve failed): %w", idErr)
+	}
+	return client.SaveUploadLinks([]database.UploadLink{{
+		RecordingID: newID,
+		Host:        host,
+		URL:         url,
+		InstanceID:  DBInstanceID(),
+	}})
+}
+
+// extractUsernameFromFilenameParts derives the channel username from a
+// recording filename of the form "<username>_<timestamp>.mp4" (best-effort).
+func extractUsernameFromFilenameParts(filename string) string {
+	base := filepath.Base(filename)
+	if i := strings.LastIndex(base, "."); i > 0 {
+		base = base[:i]
+	}
+	// Filename format is username_YYYY-MM-DD_HH-MM-SS; the timestamp part
+	// contains two underscore-separated date/time tokens.
+	parts := strings.Split(base, "_")
+	if len(parts) > 3 {
+		base = strings.Join(parts[:len(parts)-3], "_")
+	}
+	return base
 }
 
 // ─── Pipeline States ──────────────────────────────────────────────────────────

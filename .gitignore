@@ -32,6 +32,7 @@ database/*
 !database/tunnel.json
 !database/supabase.go
 !database/supabase_test.go
+!database/orphan_cleanup_test.go
 !database/migrate.sql
 !database/migrate-channel-profiles.sql
 

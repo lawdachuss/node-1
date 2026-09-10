@@ -518,7 +518,7 @@ func (p *Pipeline) stageUploadVideos(ch *Channel) error {
 			if recordingID == "" {
 				return
 			}
-			if saveErr := server.SaveUploadLinkByID(recordingID, host, url); saveErr != nil {
+			if saveErr := server.SaveUploadLinkByIDWithFilename(recordingID, host, url, filename); saveErr != nil {
 				ch.Warn("upload: could not save link from %s for %s immediately: %v", host, filename, saveErr)
 			} else {
 				ch.Info("upload: saved link from %s for %s immediately", host, filename)
