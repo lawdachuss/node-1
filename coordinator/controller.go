@@ -329,7 +329,13 @@ func (c *Coordinator) runControllerCycle() {
 	// Whole-pool splitting guarantees a max difference of one with no unassigned
 	// rows, and only moves existing assignments while repairing an imbalance.
 	if canAssign && len(active) > 0 {
-		needAssignment = needAssignment || c.hasMovableImbalance(all, active, activeSet, heldSet, protectedOwnerSet)
+		// After the cold-start assignment, ALWAYS attempt rebalance (doRebalance=true).
+		// The previous logic gated rebalance on hasMovableImbalance, which returns
+		// false when all over-target channels are recordings (nothing movable). This
+		// caused the controller to never retry: recordings finish, channels become
+		// movable, but the controller only rebalances on fleet-signature changes.
+		// balanceSite is cheap when balanced (iterates pool, finds nothing to move).
+		doRebalance := assignedBefore || needAssignment
 		renewLease := func() bool {
 			held, err := c.Client.TryAcquireControllerLease(c.NodeID, cfg.LeaseTTLSec)
 			if err != nil {
@@ -338,7 +344,7 @@ func (c *Coordinator) runControllerCycle() {
 			}
 			return held
 		}
-		c.balanceSite("", all, active, activeSet, reclaimSet, heldSet, protectedOwnerSet, needAssignment, renewLease)
+		c.balanceSite("", all, active, activeSet, reclaimSet, heldSet, protectedOwnerSet, doRebalance, renewLease)
 		// Live-aware load rebalance: relieve a node carrying more concurrent live
 		// recordings than its fair share by re-pointing its CLAIMED live (not yet
 		// recording) channels to the live-coldest node. Never touches recording rows.

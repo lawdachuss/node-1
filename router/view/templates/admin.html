@@ -673,6 +673,51 @@
         </div>
     </details>
 
+    <!-- ════════ PIPELINE UI STYLES ════════ -->
+    <style>
+        .pipeline-expand-btn {
+            background: none; border: none; cursor: pointer;
+            font-size: 11px; color: var(--text-muted, #52525b);
+            padding: 2px 4px; border-radius: 3px;
+            transition: color 0.15s, background 0.15s;
+            font-family: monospace;
+        }
+        .pipeline-expand-btn:hover { color: var(--text-primary, #e4e4e7); background: var(--bg-hover, rgba(255,255,255,0.06)); }
+        .pipeline-expand-btn.open { transform: rotate(90deg); }
+        .pipeline-detail-row td { padding: 0 !important; border: none !important; }
+        .pipeline-detail-cell {
+            padding: 0 12px 8px 36px !important;
+            border-bottom: 1px solid var(--border-color, #27272a) !important;
+        }
+        .pipeline-detail-content {
+            display: flex; align-items: flex-start; gap: 8px;
+            font-size: 11px; padding: 6px 10px; border-radius: 6px;
+            background: var(--bg-hover, rgba(255,255,255,0.04));
+            border: 1px solid var(--border-color, #27272a);
+        }
+        .pipeline-detail-label {
+            font-weight: 600; color: var(--text-muted, #52525b);
+            white-space: nowrap; flex-shrink: 0;
+        }
+        .pipeline-detail-error {
+            color: #ef4444; word-break: break-all;
+        }
+        .pipeline-row.new-entry {
+            animation: pipeline-flash 1.2s ease-out;
+        }
+        @keyframes pipeline-flash {
+            0% { background: rgba(59,130,246,0.15); }
+            100% { background: transparent; }
+        }
+        .pipeline-row.removed-entry {
+            animation: pipeline-fade 0.5s ease-out forwards;
+        }
+        @keyframes pipeline-fade {
+            0% { opacity: 1; }
+            100% { opacity: 0; background: rgba(239,68,68,0.08); }
+        }
+    </style>
+
     <!-- ════════ LIVE UPLOAD MATRIX ════════ -->
     <style>
         .upload-matrix { margin-top: 8px; max-height: 62vh; overflow-y: auto; }
@@ -925,30 +970,40 @@
 
     <!-- ════════ PIPELINE QUEUE ════════ -->
     <details class="section" open>
-        <summary><span class="arrow">▶</span> Pipeline Queue <span class="count">{{ len .Uploads.Pending }}</span></summary>
+        <summary><span class="arrow">▶</span> Pipeline Queue <span class="count" id="pipeline-queue-count">{{ len .Uploads.Pending }}</span></summary>
         <div class="section-body">
             <table class="admin-table">
                 <thead>
                     <tr>
+                        <th style="width:28px"></th>
                         <th>Channel</th>
                         <th>File</th>
                         <th>Stage</th>
                         <th>Size</th>
                         <th>Failed</th>
-                        <th>Error</th>
                     </tr>
                 </thead>
-                <tbody>
+                <tbody id="pipeline-queue-body">
                     {{ if .Uploads.Pending }}
-                    {{ range .Uploads.Pending }}
-                    <tr>
-                        <td><strong>{{ .Channel }}</strong></td>
-                        <td class="mono truncate" title="{{ .Filename }}">{{ .Filename }}</td>
-                        <td><span class="status-badge pending">{{ .Stage }}</span></td>
-                        <td class="mono">{{ if .Size }}{{ printf "%.1f" (divBytes .Size) }} MB{{ else }}—{{ end }}</td>
-                        <td>{{ if .Failed }}<span class="status-badge failed">Yes</span>{{ else }}<span class="status-badge done">No</span>{{ end }}</td>
-                        <td class="mono" style="color:var(--text-muted);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ .Error }}">{{ if .Error }}{{ .Error }}{{ else }}—{{ end }}</td>
+                    {{ range $i, $p := .Uploads.Pending }}
+                    <tr class="pipeline-row" data-idx="{{ $i }}">
+                        <td><button class="pipeline-expand-btn" onclick="togglePipelineDetail(this)" title="Toggle details">▸</button></td>
+                        <td><strong>{{ $p.Channel }}</strong></td>
+                        <td class="mono truncate" title="{{ $p.Filename }}">{{ $p.Filename }}</td>
+                        <td><span class="status-badge pending">{{ $p.Stage }}</span></td>
+                        <td class="mono">{{ if $p.Size }}{{ printf "%.1f" (divBytes $p.Size) }} MB{{ else }}—{{ end }}</td>
+                        <td>{{ if $p.Failed }}<span class="status-badge failed">Yes</span>{{ else }}<span class="status-badge done">No</span>{{ end }}</td>
                     </tr>
+                    {{ if or $p.Error }}
+                    <tr class="pipeline-detail-row" style="display:none">
+                        <td colspan="6" class="pipeline-detail-cell">
+                            <div class="pipeline-detail-content">
+                                <span class="pipeline-detail-label">Error:</span>
+                                <span class="pipeline-detail-error mono">{{ $p.Error }}</span>
+                            </div>
+                        </td>
+                    </tr>
+                    {{ end }}
                     {{ end }}
                     {{ else }}
                     <tr><td colspan="6" class="empty-state">No pending pipelines</td></tr>
@@ -960,30 +1015,40 @@
 
     <!-- ════════ PIPELINE HISTORY ════════ -->
     <details class="section" open>
-        <summary><span class="arrow">▶</span> Pipeline History <span class="count">{{ len .Uploads.History }}</span></summary>
+        <summary><span class="arrow">▶</span> Pipeline History <span class="count" id="pipeline-history-count">{{ len .Uploads.History }}</span></summary>
         <div class="section-body">
             <table class="admin-table">
                 <thead>
                     <tr>
+                        <th style="width:28px"></th>
                         <th>Channel</th>
                         <th>File</th>
                         <th>Stage</th>
                         <th>Size</th>
                         <th>Result</th>
-                        <th>Error</th>
                     </tr>
                 </thead>
-                <tbody>
+                <tbody id="pipeline-history-body">
                     {{ if .Uploads.History }}
-                    {{ range .Uploads.History }}
-                    <tr>
-                        <td><strong>{{ .Channel }}</strong></td>
-                        <td class="mono truncate" title="{{ .Filename }}">{{ .Filename }}</td>
-                        <td><span class="status-badge done">{{ .Stage }}</span></td>
-                        <td class="mono">{{ if .Size }}{{ printf "%.1f" (divBytes .Size) }} MB{{ else }}—{{ end }}</td>
-                        <td>{{ if .Failed }}<span class="status-badge failed">Failed</span>{{ else }}<span class="status-badge done">OK</span>{{ end }}</td>
-                        <td class="mono" style="color:var(--text-muted);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ .Error }}">{{ if .Error }}{{ .Error }}{{ else }}—{{ end }}</td>
+                    {{ range $i, $p := .Uploads.History }}
+                    <tr class="pipeline-row" data-idx="{{ $i }}">
+                        <td><button class="pipeline-expand-btn" onclick="togglePipelineDetail(this)" title="Toggle details">▸</button></td>
+                        <td><strong>{{ $p.Channel }}</strong></td>
+                        <td class="mono truncate" title="{{ $p.Filename }}">{{ $p.Filename }}</td>
+                        <td><span class="status-badge done">{{ $p.Stage }}</span></td>
+                        <td class="mono">{{ if $p.Size }}{{ printf "%.1f" (divBytes $p.Size) }} MB{{ else }}—{{ end }}</td>
+                        <td>{{ if $p.Failed }}<span class="status-badge failed">Failed</span>{{ else }}<span class="status-badge done">OK</span>{{ end }}</td>
                     </tr>
+                    {{ if or $p.Error }}
+                    <tr class="pipeline-detail-row" style="display:none">
+                        <td colspan="6" class="pipeline-detail-cell">
+                            <div class="pipeline-detail-content">
+                                <span class="pipeline-detail-label">Error:</span>
+                                <span class="pipeline-detail-error mono">{{ $p.Error }}</span>
+                            </div>
+                        </td>
+                    </tr>
+                    {{ end }}
                     {{ end }}
                     {{ else }}
                     <tr><td colspan="6" class="empty-state">No pipeline history</td></tr>
@@ -1221,6 +1286,8 @@ function pollUploads() {
             updateUploadsSection(data);
             updateMetricsUploads(data);
             updateUploadMatrix(data);
+            updatePipelineQueue(data);
+            updatePipelineHistory(data);
         })
         .catch(function() {/* silent */});
 }
@@ -1260,7 +1327,23 @@ function updateMetricsUploads(data) {
     if (cards.length >= 6) {
         var histCard = cards[5];
         var val = histCard.querySelector('.value');
+        var sub = histCard.querySelector('.sub');
+        if (val) val.textContent = active + pending;
+        if (sub) sub.textContent = (data.pending || []).length + ' queued';
+    }
+    // Pipeline History metric card (index 7)
+    if (cards.length >= 8) {
+        var plHistCard = cards[7];
+        var val = plHistCard.querySelector('.value');
         if (val) val.textContent = hist;
+        var sub = plHistCard.querySelector('.sub');
+        if (sub) {
+            var failedCount = 0;
+            for (var i = 0; i < hist; i++) {
+                if (data.history[i].failed) failedCount++;
+            }
+            sub.textContent = failedCount + ' failed';
+        }
     }
 
 
@@ -1388,6 +1471,121 @@ function updateUploadMatrix(data) {
         s.style.display = '';
         s.textContent = order.length + ' host' + (order.length === 1 ? '' : 's') + ' · ' + totalCards + ' upload' + (totalCards === 1 ? '' : 's');
     }
+}
+
+// ── Pipeline Queue / History Real-Time Updates ──
+
+function togglePipelineDetail(btn) {
+    var row = btn.closest('tr');
+    if (!row) return;
+    var detailRow = row.nextElementSibling;
+    if (!detailRow || !detailRow.classList.contains('pipeline-detail-row')) return;
+    var open = detailRow.style.display !== 'none';
+    detailRow.style.display = open ? 'none' : '';
+    btn.textContent = open ? '▸' : '▾';
+    btn.classList.toggle('open', !open);
+}
+
+function updatePipelineQueue(data) {
+    var pending = data.pending || [];
+    var tbody = document.getElementById('pipeline-queue-body');
+    var countEl = document.getElementById('pipeline-queue-count');
+    if (!tbody) return;
+
+    // Build a key set of current filenames for diffing
+    var newKeys = {};
+    for (var i = 0; i < pending.length; i++) newKeys[pending[i].filename] = true;
+
+    // Detect removed entries (flash them out before clearing)
+    var existing = tbody.querySelectorAll('tr.pipeline-row');
+    var hasRemovals = false;
+    for (var j = 0; j < existing.length; j++) {
+        var fn = existing[j].getAttribute('data-filename');
+        if (fn && !newKeys[fn]) {
+            existing[j].classList.add('removed-entry');
+            hasRemovals = true;
+        }
+    }
+
+    function renderQueue() {
+        if (pending.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No pending pipelines</td></tr>';
+        } else {
+            var html = '';
+            for (var i = 0; i < pending.length; i++) {
+                var p = pending[i];
+                var sizeStr = p.size > 0 ? (p.size / 1048576).toFixed(1) + ' MB' : '—';
+                html += '<tr class="pipeline-row new-entry" data-filename="' + escAttr(p.filename || '') + '">'
+                    + '<td><button class="pipeline-expand-btn" onclick="togglePipelineDetail(this)" title="Toggle details">▸</button></td>'
+                    + '<td><strong>' + escHtml(p.channel || '') + '</strong></td>'
+                    + '<td class="mono truncate" title="' + escAttr(p.filename || '') + '">' + escHtml(p.filename || '') + '</td>'
+                    + '<td><span class="status-badge pending">' + escHtml(p.stage || '') + '</span></td>'
+                    + '<td class="mono">' + sizeStr + '</td>'
+                    + '<td>' + (p.failed ? '<span class="status-badge failed">Yes</span>' : '<span class="status-badge done">No</span>') + '</td>'
+                    + '</tr>';
+                if (p.error) {
+                    html += '<tr class="pipeline-detail-row" style="display:none">'
+                        + '<td colspan="6" class="pipeline-detail-cell">'
+                        + '<div class="pipeline-detail-content">'
+                        + '<span class="pipeline-detail-label">Error:</span>'
+                        + '<span class="pipeline-detail-error mono">' + escHtml(p.error) + '</span>'
+                        + '</div></td></tr>';
+                }
+            }
+            tbody.innerHTML = html;
+        }
+        if (countEl) countEl.textContent = pending.length;
+    }
+
+    if (hasRemovals) {
+        setTimeout(renderQueue, 500);
+    } else {
+        renderQueue();
+    }
+}
+
+function updatePipelineHistory(data) {
+    var history = data.history || [];
+    var tbody = document.getElementById('pipeline-history-body');
+    var countEl = document.getElementById('pipeline-history-count');
+    if (!tbody) return;
+
+    // Detect new entries by comparing filenames
+    var oldKeys = {};
+    var existing = tbody.querySelectorAll('tr.pipeline-row');
+    for (var j = 0; j < existing.length; j++) {
+        var fn = existing[j].getAttribute('data-filename');
+        if (fn) oldKeys[fn] = true;
+    }
+
+    if (history.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No pipeline history</td></tr>';
+    } else {
+        var html = '';
+        for (var i = 0; i < history.length; i++) {
+            var p = history[i];
+            var isNew = !oldKeys[p.filename];
+            var sizeStr = p.size > 0 ? (p.size / 1048576).toFixed(1) + ' MB' : '—';
+            html += '<tr class="pipeline-row' + (isNew ? ' new-entry' : '') + '" data-filename="' + escAttr(p.filename || '') + '">'
+                + '<td><button class="pipeline-expand-btn" onclick="togglePipelineDetail(this)" title="Toggle details">▸</button></td>'
+                + '<td><strong>' + escHtml(p.channel || '') + '</strong></td>'
+                + '<td class="mono truncate" title="' + escAttr(p.filename || '') + '">' + escHtml(p.filename || '') + '</td>'
+                + '<td><span class="status-badge done">' + escHtml(p.stage || '') + '</span></td>'
+                + '<td class="mono">' + sizeStr + '</td>'
+                + '<td>' + (p.failed ? '<span class="status-badge failed">Failed</span>' : '<span class="status-badge done">OK</span>') + '</td>'
+                + '</tr>';
+            if (p.error) {
+                html += '<tr class="pipeline-detail-row" style="display:none">'
+                    + '<td colspan="6" class="pipeline-detail-cell">'
+                    + '<div class="pipeline-detail-content">'
+                    + '<span class="pipeline-detail-label">Error:</span>'
+                    + '<span class="pipeline-detail-error mono">' + escHtml(p.error) + '</span>'
+                    + '</div></td></tr>';
+            }
+        }
+        tbody.innerHTML = html;
+    }
+    if (countEl) countEl.textContent = history.length;
 }
 
 function fmtBytes(n) {

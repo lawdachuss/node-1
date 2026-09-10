@@ -605,6 +605,30 @@ func (c *Client) GetRecordingsMissingThumbnails() ([]Recording, error) {
 	return recordings, err
 }
 
+// HasRecordingThumbnails returns true when the recording identified by filename
+// has non-empty thumbnail_url, sprite_url, and preview_url in the database.
+// Used by the pipeline cleanup to verify thumbnails actually persisted before
+// deleting local files — prevents data loss when DB writes fail silently.
+func (c *Client) HasRecordingThumbnails(filename string) (hasThumb, hasSprite, hasPreview bool, err error) {
+	var recs []struct {
+		ThumbnailURL string `json:"thumbnail_url"`
+		SpriteURL    string `json:"sprite_url"`
+		PreviewURL   string `json:"preview_url"`
+	}
+	err = c.getN(
+		fmt.Sprintf("/recordings?filename=eq.%s&select=thumbnail_url,sprite_url,preview_url&limit=1",
+			url.QueryEscape(filename)),
+		&recs, defaultMaxRetries,
+	)
+	if err != nil {
+		return false, false, false, err
+	}
+	if len(recs) == 0 {
+		return false, false, false, nil
+	}
+	return recs[0].ThumbnailURL != "", recs[0].SpriteURL != "", recs[0].PreviewURL != "", nil
+}
+
 // CountRecordings returns the total number of recording rows in Supabase using
 // PostgREST's exact-count header, so we never have to download every row just
 // to show a tally on the admin panel.
@@ -801,6 +825,110 @@ func (c *Client) SaveUploadLinks(links []UploadLink) error {
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 	return nil
+}
+
+// SaveRecordingWithLinksRPC atomically upserts a recording, its upload links,
+// and preview images in a single Supabase RPC call.  This replaces the 3-call
+// sequential path (SaveRecording → GetRecording → SaveUploadLinks) which could
+// stall pipelines for minutes under Supabase load (each call retries up to 10
+// times with exponential backoff).
+//
+// The RPC function (save_recording_with_links) runs SECURITY DEFINER inside a
+// single Postgres transaction — either all three writes succeed or none do.
+// Returns the recording ID on success.
+func (c *Client) SaveRecordingWithLinksRPC(rec *Recording, links []UploadLink, preview *PreviewImage) (string, error) {
+	type rpcParams struct {
+		Rec     json.RawMessage `json:"p_rec"`
+		Links   json.RawMessage `json:"p_links"`
+		Preview json.RawMessage `json:"p_preview"`
+	}
+
+	recJSON, err := json.Marshal(rec)
+	if err != nil {
+		return "", fmt.Errorf("marshal recording: %w", err)
+	}
+
+	var linksJSON json.RawMessage
+	if len(links) > 0 {
+		linksJSON, err = json.Marshal(links)
+		if err != nil {
+			return "", fmt.Errorf("marshal links: %w", err)
+		}
+	} else {
+		linksJSON = json.RawMessage("null")
+	}
+
+	var previewJSON json.RawMessage
+	if preview != nil {
+		previewJSON, err = json.Marshal(preview)
+		if err != nil {
+			return "", fmt.Errorf("marshal preview: %w", err)
+		}
+	} else {
+		previewJSON = json.RawMessage("null")
+	}
+
+	params := rpcParams{
+		Rec:     recJSON,
+		Links:   linksJSON,
+		Preview: previewJSON,
+	}
+
+	var recordingID string
+	if err := c.rpcN("save_recording_with_links", params, &recordingID, metadataSaveMaxRetries); err != nil {
+		return "", err
+	}
+	return recordingID, nil
+}
+
+// rpcN calls a Supabase PostgRPC function and decodes the scalar result.
+// It retries up to maxRetries times on transient errors.
+func (c *Client) rpcN(name string, params interface{}, result interface{}, maxRetries int) error {
+	jsonBody, err := json.Marshal(params)
+	if err != nil {
+		return fmt.Errorf("marshal rpc params: %w", err)
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		resp, err := c.request("POST", "/rpc/"+name, json.RawMessage(jsonBody))
+		if err != nil {
+			lastErr = err
+			if attempt < maxRetries-1 {
+				time.Sleep(retryBackoff(attempt))
+				continue
+			}
+			return err
+		}
+
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode >= 400 {
+			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+			// Retry on transient Supabase errors
+			if resp.StatusCode == 503 || resp.StatusCode == 408 || resp.StatusCode == 429 || resp.StatusCode >= 500 {
+				if attempt < maxRetries-1 {
+					time.Sleep(retryBackoff(attempt))
+					continue
+				}
+			}
+			return lastErr
+		}
+
+		// Decode scalar result (text, int, etc.)
+		if result != nil {
+			if err := json.Unmarshal(bodyBytes, result); err != nil {
+				// Some RPCs return "" (empty string) — treat as empty result
+				if string(bodyBytes) == "null" || string(bodyBytes) == `""` || len(bodyBytes) == 0 {
+					return nil
+				}
+				return fmt.Errorf("decode rpc result: %w (body: %s)", err, string(bodyBytes))
+			}
+		}
+		return nil
+	}
+	return lastErr
 }
 
 // GetUploadLinks retrieves all upload links for a recording

@@ -880,7 +880,6 @@ func SaveRecordingWithLinks(username, filename, timestamp, roomTitle string, tag
 		return fmt.Errorf("Supabase not configured")
 	}
 
-	// Look up channel ID for foreign key
 	rec := &database.Recording{
 		Username:     username,
 		Filename:     filename,
@@ -900,13 +899,42 @@ func SaveRecordingWithLinks(username, filename, timestamp, roomTitle string, tag
 		PreviewURL:   previewURL,
 		InstanceID:   DBInstanceID(),
 	}
-	// Skip channel_id lookup — the channels table is shared across instances
-	// and the FK would point to the wrong instance's row.
-	// Recordings are uniquely identified by filename, so channel_id is cosmetic.
 
-	// Save recording first, falling back gracefully when a column is missing
-	// (the schema may not have duration/end_reason yet). Retry by dropping the
-	// newest column first, then the older duration column.
+	var uploadLinks []database.UploadLink
+	for host, u := range links {
+		uploadLinks = append(uploadLinks, database.UploadLink{
+			Host:       host,
+			URL:        u,
+			InstanceID: DBInstanceID(),
+		})
+	}
+
+	preview := &database.PreviewImage{
+		Filename:     filename,
+		ThumbnailURL: thumbnailURL,
+		SpriteURL:    spriteURL,
+		PreviewURL:   previewURL,
+		UploadedAt:   time.Now().UTC().Format("2006-01-02T15:04:05Z"),
+		InstanceID:   DBInstanceID(),
+	}
+
+	// ── Fast path: single atomic RPC (recording + links + preview) ────
+	if _, err := client.SaveRecordingWithLinksRPC(rec, uploadLinks, preview); err != nil {
+		if strings.Contains(err.Error(), "PGRST204") || strings.Contains(err.Error(), "function save_recording_with_links") {
+			return saveRecordingWithLinksLegacy(client, rec, uploadLinks, filename)
+		}
+		fmt.Printf("[WARN] atomic metadata RPC failed, falling back to sequential save: %v\n", err)
+		return saveRecordingWithLinksLegacy(client, rec, uploadLinks, filename)
+	}
+
+	cacheClear()
+	return nil
+}
+
+// saveRecordingWithLinksLegacy is the original sequential path (SaveRecording →
+// GetRecording → SaveUploadLinks), kept as fallback when the atomic RPC is not
+// yet deployed.
+func saveRecordingWithLinksLegacy(client *database.Client, rec *database.Recording, uploadLinks []database.UploadLink, filename string) error {
 	if err := client.SaveRecording(rec); err != nil && strings.Contains(err.Error(), "PGRST204") {
 		fmt.Printf("[WARN] end_reason column missing in Supabase — saving without it: %v\n", err)
 		rec.EndReason = ""
@@ -923,22 +951,13 @@ func SaveRecordingWithLinks(username, filename, timestamp, roomTitle string, tag
 		return fmt.Errorf("save recording: %w", err)
 	}
 
-	// Get the saved recording to get its ID for upload links
 	savedRec, err := client.GetRecording(filename)
 	if err != nil {
 		return fmt.Errorf("get recording after save: %w", err)
 	}
 
-	// Save upload links — batch upsert is atomic: either all succeed or
-	// none do, so partial failures cannot orphan individual host URLs.
-	var uploadLinks []database.UploadLink
-	for host, url := range links {
-		uploadLinks = append(uploadLinks, database.UploadLink{
-			RecordingID: savedRec.ID,
-			Host:        host,
-			URL:         url,
-			InstanceID:  DBInstanceID(),
-		})
+	for i := range uploadLinks {
+		uploadLinks[i].RecordingID = savedRec.ID
 	}
 	if len(uploadLinks) > 0 {
 		if err := client.SaveUploadLinks(uploadLinks); err != nil {
@@ -948,6 +967,25 @@ func SaveRecordingWithLinks(username, filename, timestamp, roomTitle string, tag
 
 	cacheClear()
 	return nil
+}
+
+// VerifyRecordingThumbnails checks whether the recording identified by filename
+// has non-empty thumbnail/sprite/preview URLs in the database.  The pipeline
+// cleanup calls this before deleting local files to prevent data loss when DB
+// writes fail silently (e.g. RLS blocks the anon key, network timeout).
+func VerifyRecordingThumbnails(filename string) (hasThumb, hasSprite, hasPreview bool) {
+	client := GetDBClient()
+	if client == nil {
+		// No DB configured — cannot verify, assume thumbnails are present
+		// to avoid blocking cleanup on standalone nodes.
+		return true, true, true
+	}
+	h, s, p, err := client.HasRecordingThumbnails(filename)
+	if err != nil {
+		fmt.Printf("[WARN] could not verify thumbnails for %s: %v — keeping local file\n", filename, err)
+		return false, false, false
+	}
+	return h, s, p
 }
 
 // SaveRecordingBasics saves minimal recording metadata before upload starts.

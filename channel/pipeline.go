@@ -382,8 +382,22 @@ func (p *Pipeline) stageUploadVideos(ch *Channel) error {
 				ch.Info("upload: all hosts already have %s per journal", filename)
 				return nil
 			}
-			ch.Warn("upload: stale journal for %s has no saved links; clearing journal and re-uploading", filename)
+			// The journal says every host succeeded but p.Links is empty
+			// (typically after a crash/restart before state was persisted).
+			// Try to recover the download links from the journal instead
+			// of destroying them and re-uploading to every host.
 			if p.FileHash != "" {
+				if recovered := server.LoadJournalLinks(p.FileHash); len(recovered) > 0 {
+					ch.Info("upload: recovered %d links from journal for %s", len(recovered), filename)
+					p.Links = recovered
+					for host, link := range recovered {
+						if p.EmbedURL == "" {
+							p.EmbedURL = embedURLFromLink(host, link)
+						}
+					}
+					return nil
+				}
+				ch.Warn("upload: stale journal for %s has no recoverable links; clearing and re-uploading", filename)
 				if jErr := server.DeleteJournalByHash(p.FileHash); jErr != nil {
 					ch.Warn("upload: could not clear stale journal for %s: %v", filename, jErr)
 				}
@@ -516,6 +530,14 @@ func (p *Pipeline) stageUploadVideos(ch *Channel) error {
 				}
 			})
 			if recordingID == "" {
+				// Recording row doesn't exist yet (SaveRecordingBasics
+				// failed or was skipped).  Save the link by filename — the
+				// upsert in SaveRecordingWithLinks will create the row
+				// later.  Store in the journal so the link survives even
+				// if the per-DB save can't run yet.
+				if jErr := server.SaveJournalEntry(p.FileHash, filename, host, "success", url, 0, ""); jErr != nil {
+					ch.Warn("upload: could not save journal entry for %s/%s: %v", host, filename, jErr)
+				}
 				return
 			}
 			if saveErr := server.SaveUploadLinkByIDWithFilename(recordingID, host, url, filename); saveErr != nil {
@@ -750,18 +772,31 @@ func (p *Pipeline) stageSaveMetadata(ch *Channel) error {
 		p.Links,
 	); err != nil {
 		ch.Error("upload: failed to save to Supabase: %v", err)
-		// Journal entries prevent retry — clean them so upload generates fresh links.
-		if p.FileHash != "" {
-			ch.Warn("upload: removing journal for %s so upload retries", p.Filename)
-			if jErr := server.DeleteJournalByHash(p.FileHash); jErr != nil {
-				ch.Warn("upload: could not delete journal for %s: %v", p.Filename, jErr)
-			}
-		}
+		// Do NOT delete the journal here — it contains the download links
+		// that succeeded during upload.  Deleting it would force a full
+		// re-upload on retry, and if hosts are now down the links are lost
+		// forever.  The pipeline retries stageSaveMetadata with the same
+		// p.Links, and the journal is only cleared after a successful save
+		// or when the upload itself needs to be retried.
 		p.LastError = err.Error()
 		return err
 	}
 
 	ch.Info("upload: saved recording metadata to Supabase for %s", p.Filename)
+
+	// Safety net: if the RPC saved the recording but the thumbnail_url
+	// didn't make it (schema mismatch, partial write), explicitly patch it.
+	// This is cheap (single PATCH) and prevents the "recording saved but
+	// no thumbnail" gap that forces ScanThumbnails to backfill later.
+	if p.ThumbURL != "" {
+		dbThumb, _, _ := server.VerifyRecordingThumbnails(p.Filename)
+		if !dbThumb {
+			ch.Warn("upload: thumbnail missing in DB after save for %s — re-saving", p.Filename)
+			if err := server.UpdateRecordingThumbnails(p.Filename, p.ThumbURL, p.SpriteURL, p.PreviewURL); err != nil {
+				ch.Warn("upload: could not re-save thumbnails for %s: %v", p.Filename, err)
+			}
+		}
+	}
 	return nil
 }
 
@@ -788,6 +823,17 @@ func (p *Pipeline) stageCleanup(ch *Channel) error {
 	// while the video itself is already safe in the cloud.
 	if p.ThumbURL == "" || p.SpriteURL == "" || p.PreviewURL == "" {
 		ch.Info("cleanup: keeping %s — thumbnail missing (queued for thumbnail retry)", p.Filename)
+		return nil
+	}
+
+	// Verify thumbnails actually persisted to the database before deleting
+	// local files.  The pipeline object holds URLs in memory, but the DB
+	// write may have failed silently (RLS, timeout, network error).  If the
+	// thumbnails didn't make it to Supabase, keeping the local file lets
+	// ScanThumbnails regenerate them later.
+	dbThumb, dbSprite, dbPreview := server.VerifyRecordingThumbnails(p.Filename)
+	if !dbThumb || !dbSprite || !dbPreview {
+		ch.Warn("cleanup: keeping %s — thumbnails not in DB (thumb=%v sprite=%v preview=%v), will retry", p.Filename, dbThumb, dbSprite, dbPreview)
 		return nil
 	}
 
@@ -1170,6 +1216,15 @@ func (pq *PipelineQueue) processPipeline(p *Pipeline) {
 			p.Failed = true
 			p.LastError = "upload produced no links"
 			return
+		}
+
+		// Persist state immediately after upload succeeds so that p.Links
+		// survives a crash before the deferred state save runs.  Without
+		// this, a crash between upload completion and stageSaveMetadata
+		// would lose all download links (only in memory) and force a full
+		// re-upload on resume.
+		if err := server.SavePipelineState(p.toDBState()); err != nil {
+			ch.Warn("pipeline: could not persist state with links for %s: %v", filename, err)
 		}
 
 		// Upload succeeded: links are persisted. Now await the thumbnails with
