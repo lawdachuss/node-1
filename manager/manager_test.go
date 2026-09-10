@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/teacat/chaturbate-dvr/channel"
+	"github.com/teacat/chaturbate-dvr/coordinator"
 	"github.com/teacat/chaturbate-dvr/database"
 	"github.com/teacat/chaturbate-dvr/entity"
 	"github.com/teacat/chaturbate-dvr/server"
@@ -131,10 +132,13 @@ func TestCreateChannelFromAssignmentResumesPausedChannel(t *testing.T) {
 }
 
 // TestCreateChannelFromAssignmentSkipsDuplicateRecording verifies the
-// duplicate-recording guard: a DB assignment already status='recording' that
-// this node is NOT actively recording must NOT be started, otherwise a channel
-// reassigned here mid-recording by an external autopilot would spawn a second,
-// overlapping recording on top of the one owned by the source node.
+// duplicate-recording guard: a DB assignment already status='recording' on
+// ANOTHER node that this node is NOT actively recording must NOT be started,
+// otherwise a channel reassigned here mid-recording by an external autopilot
+// would spawn a second, overlapping recording on top of the one owned by the
+// source node. A recording row with NO owner (or this node as owner) must NOT
+// trip the guard: that is this node's own stale marker, which it must be able
+// to restart after boot.
 func TestCreateChannelFromAssignmentSkipsDuplicateRecording(t *testing.T) {
 	m, err := New()
 	if err != nil {
@@ -142,12 +146,17 @@ func TestCreateChannelFromAssignmentSkipsDuplicateRecording(t *testing.T) {
 	}
 	defer m.StopAllChannels()
 
+	// Wire a coordinator so the guard has a NodeID to compare against: this
+	// node is "node-self", the recording belongs to "node-other".
+	m.Coordinator = &coordinator.Coordinator{NodeID: "node-self"}
+
 	ca := &database.ChannelAssignment{
-		Username:   "dup_user",
-		Site:       "chaturbate",
-		Status:     "recording",
-		Framerate:  60,
-		Resolution: 1080,
+		Username:     "dup_user",
+		Site:         "chaturbate",
+		Status:       "recording",
+		AssignedNode: "node-other", // recorded elsewhere → never start here
+		Framerate:    60,
+		Resolution:   1080,
 	}
 	if err := m.CreateChannelFromAssignment(ca); err != nil {
 		t.Fatalf("CreateChannelFromAssignment returned error: %v", err)

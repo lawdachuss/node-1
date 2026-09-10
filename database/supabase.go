@@ -1557,7 +1557,14 @@ func (c *Client) patchSiteLive(site string, usernames []string, live bool, now s
 // ReassignChannel atomically moves a channel_assignments row from one node to
 // another via the reassign_channel RPC (SELECT ... FOR UPDATE SKIP LOCKED), so
 // even when several nodes race to migrate the same channel only one wins.
-func (c *Client) ReassignChannel(username, site, fromNode, toNode string) error {
+// ReassignChannel moves an already-assigned channel from one node to another
+// via the reassign_channel RPC (SELECT ... FOR UPDATE SKIP LOCKED), so
+// concurrent moves serialize safely. The RPC reports whether the row actually
+// moved: its UPDATE is guarded on assigned_node = p_from_node AND status <>
+// 'recording', so a stale snapshot (row already moved, or it flipped to
+// 'recording' in between) matches zero rows and the RPC returns false instead
+// of silently succeeding.
+func (c *Client) ReassignChannel(username, site, fromNode, toNode string) (bool, error) {
 	body := map[string]interface{}{
 		"p_username":  username,
 		"p_site":      site,
@@ -1566,14 +1573,33 @@ func (c *Client) ReassignChannel(username, site, fromNode, toNode string) error 
 	}
 	resp, err := c.requestWithRetry("POST", "/rpc/reassign_channel", body)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+		return false, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
 	}
-	return nil
+	// Tolerant decode: the RPC may return SETOF boolean ([true]), a scalar
+	// boolean (true), or — against an older DB still exposing the void RPC —
+	// an empty body. Empty/unknown shapes conservatively report "moved" so the
+	// controller keeps its previous behavior until the migration lands.
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, err
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return true, nil // legacy void RPC: no payload
+	}
+	var arr []bool
+	if err := json.Unmarshal(raw, &arr); err == nil {
+		return len(arr) > 0 && arr[0], nil
+	}
+	var single bool
+	if err := json.Unmarshal(raw, &single); err == nil {
+		return single, nil
+	}
+	return true, nil // unexpected shape: conservative
 }
 
 // ============================================================================

@@ -432,13 +432,15 @@ func (ch *Channel) resolveWatchEnd(ctx context.Context, s site.Site, req *intern
 			// cycles are never merged.
 			//
 			// Trust only an EXPLICIT "not live" signal from the probe.
-			// Chaturbate's own API reports room_status="offline"/"away" when the
-			// model truly left; any other status we were actively recording
-			// through (public, hidden, or an empty/ambiguous value) means the
-			// model is still broadcastable — treat it as a stalled session so
-			// the Monitor reconnects with a fresh HLS URL and the cycle merges
-			// into the same long recording.
-			if si != nil && isDefinitiveOfflineStatus(si.RoomStatus) {
+			// ErrChannelOffline/ErrNotFound ARE that explicit signal: the probe
+			// resolved the room status and reports the model is not
+			// broadcastable (si is nil in that case — the answer IS the error).
+			// The previous `si != nil &&` guard made a definitive answer look
+			// ambiguous, so the node fast-reconnected against an offline stream
+			// forever instead of benching it. A non-nil si (adapter returned a
+			// partial answer alongside the sentinel) still goes through the
+			// room-status check: only offline/away are definitive.
+			if si == nil || isDefinitiveOfflineStatus(si.RoomStatus) {
 				ch.setCloseReason("channel went offline")
 			} else {
 				ch.setCloseReason("stream session expired (HLS session/token) — reconnecting")

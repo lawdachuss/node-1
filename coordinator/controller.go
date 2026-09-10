@@ -389,36 +389,69 @@ func recordingLeaseFresh(lastHeartbeat string, now time.Time) bool {
 	return err == nil && now.Sub(hb) <= recordingLeaseTTL
 }
 
-// hasMovableImbalance measures ownership counts, never a channel's position in
-// a sorted list.  Equal counts are already balanced even when a different
-// perfectly-valid prior allocation gave a particular channel to another node.
-// That distinction is what prevents a stable fleet from shuffling channels.
+// hasMovableImbalance reports whether the assignment sweep can and should run:
+// true when some work is stranded (unassigned, or owned by a node outside the
+// active set), or when some active node's share deviates from the equal split
+// AND the over-target node owns at least one movable (claimed) row.
+//
+// A pinned recording COUNTS toward its owner's share — it occupies a slot on
+// that node until the stream ends — but is never movable itself. Counting it
+// while excluding it from movability is what makes equality achievable and
+// stable: recordings starting/ending change no counts at all, so a healthy
+// fleet converges after one sweep and stays put. (The previous version counted
+// only movable rows: every recording start/end then shifted the targets, the
+// deviation never cleared, and the controller re-swept the whole pool every
+// cycle — fleet-wide stop/start churn.)
 func (c *Coordinator) hasMovableImbalance(all []database.ChannelAssignment, active []database.Node, activeSet, heldSet, protectedOwnerSet map[string]bool) bool {
 	if len(active) == 0 || len(all) == 0 {
 		return false
 	}
-	pool := make([]database.ChannelAssignment, 0, len(all))
-	for _, ca := range all {
-		// Exclude HELD channels and in-progress recordings whose owner is still
-		// alive (online/draining within the grace). Neither is movable, so
-		// neither should count toward an imbalance; a deadline-migrating node's
-		// pinned recording is not "misplaced" work — it finishes on its owner.
-		if !heldSet[ca.AssignedNode] && !(ca.Status == "recording" && protectedOwnerSet[ca.AssignedNode]) {
-			pool = append(pool, ca)
-		}
-	}
 	nodes := append([]database.Node(nil), active...)
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].NodeID < nodes[j].NodeID })
-	targets := equalSplitCounts(len(pool), nodes)
+
+	// Shares over the whole balancable pool: everything except rows on held
+	// nodes (they keep their channels during the grace) and recordings that are
+	// finishing on a non-active protected owner (draining/migrating — the work
+	// leaves the fleet with that node, so it must not shape the split).
 	counts := make(map[string]int, len(nodes))
-	for _, ca := range pool {
-		if ca.AssignedNode == "" || !activeSet[ca.AssignedNode] {
-			return true
+	total := 0
+	for _, ca := range all {
+		owner := ca.AssignedNode
+		if heldSet[owner] {
+			continue
 		}
-		counts[ca.AssignedNode]++
+		if ca.Status == "recording" && !activeSet[owner] {
+			if protectedOwnerSet[owner] || owner == "" {
+				continue // finishing on its (draining/migrating) owner, or being reclaimed
+			}
+			return true // recording marker on a dead node's row — needs a sweep/reclaim
+		}
+		if owner == "" || !activeSet[owner] {
+			return true // stranded work: must be claimed/redistributed
+		}
+		counts[owner]++
+		total++
 	}
+	targets := equalSplitCounts(total, nodes)
+
+	deviates := false
 	for _, n := range nodes {
 		if counts[n.NodeID] != targets[n.NodeID] {
+			deviates = true
+			break
+		}
+	}
+	if !deviates {
+		return false
+	}
+	// Only sweep if the deviation is actually correctable: some over-share
+	// node must own a movable (claimed) row. A node that is over its share
+	// purely because of pinned recordings cannot shed anything yet.
+	for _, ca := range all {
+		if ca.Status == "recording" || heldSet[ca.AssignedNode] || !activeSet[ca.AssignedNode] {
+			continue
+		}
+		if counts[ca.AssignedNode] > targets[ca.AssignedNode] {
 			return true
 		}
 	}
@@ -890,9 +923,14 @@ func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment,
 	// they move onto live nodes before the runner is killed.
 	var pool []database.ChannelAssignment
 	for _, ca := range all {
-		if (site == "" || ca.Site == site) && !heldSet[ca.AssignedNode] && !(ca.Status == "recording" && protectedOwnerSet[ca.AssignedNode]) {
-			pool = append(pool, ca)
+		owner := ca.AssignedNode
+		if heldSet[owner] {
+			continue // held node keeps its channels during the grace window
 		}
+		if ca.Status == "recording" && !activeSet[owner] && (protectedOwnerSet[owner] || owner == "") {
+			continue // finishing on a draining/migrating owner, or being reclaimed
+		}
+		pool = append(pool, ca)
 	}
 	if len(active) == 0 || len(pool) == 0 {
 		return
@@ -909,6 +947,10 @@ func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment,
 	sorted := append([]database.Node{}, active...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].NodeID < sorted[j].NodeID })
 	targets := equalSplitCounts(len(pool), sorted)
+	// A pinned recording counts toward its owner's share (it occupies a slot on
+	// that node until the stream ends) but the move loop below never relocates
+	// it. This is what makes the split achievable and stable: recordings
+	// starting/ending change no counts, so a converged fleet stops moving.
 	counts := make(map[string]int, len(sorted))
 	for _, ca := range pool {
 		if activeSet[ca.AssignedNode] {
@@ -944,11 +986,12 @@ func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment,
 	}
 
 	// Then move only from an overloaded/dead node to an under-target node.
-	// A fresh recording is never moved; it simply occupies one of its node's
-	// slots until the stream ends.
+	// A recording is NEVER moved — whatever its owner's state, it occupies one
+	// of its node's slots until the stream ends (the RPC refuses it anyway); a
+	// dead node's rows are freed by the reclaim path above instead.
 	for _, ca := range pool {
 		cur := ca.AssignedNode
-		if cur == "" || heldSet[cur] || (ca.Status == "recording" && activeSet[cur]) {
+		if cur == "" || heldSet[cur] || ca.Status == "recording" {
 			continue
 		}
 		if activeSet[cur] && counts[cur] <= targets[cur] {
@@ -962,8 +1005,16 @@ func (c *Coordinator) balanceSite(site string, all []database.ChannelAssignment,
 			log.Printf("[controller] lease lost during assignment sweep; stopping")
 			return
 		}
-		if err := c.Client.ReassignChannel(ca.Username, ca.Site, cur, want); err != nil {
+		moved, err := c.Client.ReassignChannel(ca.Username, ca.Site, cur, want)
+		if err != nil {
 			log.Printf("[controller] reassign %s/%s %s -> %s error: %v", ca.Site, ca.Username, cur, want, err)
+			continue
+		}
+		if !moved {
+			// Zero rows matched: the row moved or became recording underneath us.
+			// Our snapshot is stale for this row — leave the counts untouched (they
+			// are wrong either way) and let the next cycle's fresh read correct it.
+			log.Printf("[controller] reassign %s/%s %s -> %s was a no-op (row moved or became recording elsewhere)", ca.Site, ca.Username, cur, want)
 			continue
 		}
 		if activeSet[cur] {
@@ -1059,16 +1110,41 @@ func (c *Coordinator) rebalanceLiveLoad(all []database.ChannelAssignment, active
 			log.Printf("[controller] lease lost during live-load balance; stopping")
 			return
 		}
-		if err := c.Client.ReassignChannel(m.ca.Username, m.ca.Site, m.src, m.dst); err != nil {
+		moved, err := c.Client.ReassignChannel(m.ca.Username, m.ca.Site, m.src, m.dst)
+		if err != nil {
 			log.Printf("[controller] live-load reassign %s/%s %s -> %s error: %v", m.ca.Site, m.ca.Username, m.src, m.dst, err)
 			// Degrade conservatively: stop shedding this source on a persistent
 			// error rather than retrying the same move forever.
 			rec[m.src] = fair
 			continue
 		}
+		if !moved {
+			// The RPC's guarded UPDATE matched zero rows: the row moved elsewhere
+			// or flipped to recording between the snapshot and the write. Mark it
+			// recording in the local snapshot so pickLiveRebalanceMove skips it —
+			// without this the same row is re-picked forever (it once produced six
+			// identical moves of one channel in a single tick). The stale flag only
+			// lives in this cycle's snapshot; the next cycle re-reads fresh state.
+			log.Printf("[controller] live-load reassign %s/%s %s -> %s was a no-op (row moved or became recording elsewhere) — skipping it this cycle", m.ca.Site, m.ca.Username, m.src, m.dst)
+			for i := range all {
+				if all[i].Site == m.ca.Site && all[i].Username == m.ca.Username {
+					all[i].Status = "recording"
+					break
+				}
+			}
+			continue
+		}
 		rec[m.src]--
 		rec[m.dst]++
 		mutations++
+		// Reflect the move in the snapshot so the next pick sees the row on its
+		// new owner instead of re-moving the same row.
+		for i := range all {
+			if all[i].Site == m.ca.Site && all[i].Username == m.ca.Username {
+				all[i].AssignedNode = m.dst
+				break
+			}
+		}
 		log.Printf("[controller] live-load balance: moved %s/%s %s -> %s", m.ca.Site, m.ca.Username, m.src, m.dst)
 	}
 }

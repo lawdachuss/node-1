@@ -1,7 +1,10 @@
 package coordinator
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -48,31 +51,42 @@ func testNode(id string, deadline *time.Time) database.Node {
 	return database.Node{NodeID: id, Status: "online", SessionDeadline: deadline}
 }
 
-// TestHasMovableImbalanceIgnoresPinnedRecordingOnMigratingNode verifies that a
-// deadline-migrating node's in-progress recording is NOT counted toward an
-// imbalance (it stays pinned to finish on its owner), while its claimed slot is
-// still loaded into the pool for redistribution.
+// TestHasMovableImbalanceIgnoresPinnedRecordingOnMigratingNode verifies that
+// a deadline-migrating node's in-progress recording does not by itself create
+// an imbalance: recordings count toward their owner's share, so equal counts
+// stay balanced no matter which rows are recordings — while a movable
+// over-share row still triggers a sweep.
 func TestHasMovableImbalanceIgnoresPinnedRecordingOnMigratingNode(t *testing.T) {
-	deadline := time.Now().Add(2 * time.Minute) // within the migration window
-	active := []database.Node{testNode("node-a", nil), testNode("node-b", &deadline)}
+	active := []database.Node{testNode("node-a", nil), testNode("node-b", nil)}
 	activeSet := map[string]bool{"node-a": true, "node-b": true}
 	heldSet := map[string]bool{}
-	// Both nodes are online and recently heartbeating → their recordings are
-	// protected. node-b is also deadline-migrating: its claimed channels must
-	// leave, but a recording on it must not be moved.
 	protected := map[string]bool{"node-a": true, "node-b": true}
 
-	all := []database.ChannelAssignment{
-		{Username: "rec1", AssignedNode: "node-b", Status: "recording"},
-		{Username: "idle1", AssignedNode: "node-b", Status: "claimed"},
-		{Username: "idle2", AssignedNode: "node-a", Status: "claimed"},
+	c := &Coordinator{}
+
+	// a: 1 claimed + 1 recording; b: 2 claimed → counts 2 vs 2 → balanced;
+	// the recording changes nothing (it occupies one of node-a's slots).
+	balanced := []database.ChannelAssignment{
+		{Username: "aRec", AssignedNode: "node-a", Status: "recording"},
+		{Username: "a1", AssignedNode: "node-a", Status: "claimed"},
+		{Username: "b1", AssignedNode: "node-b", Status: "claimed"},
+		{Username: "b2", AssignedNode: "node-b", Status: "claimed"},
+	}
+	if c.hasMovableImbalance(balanced, active, activeSet, heldSet, protected) {
+		t.Fatal("2 vs 2 counts are balanced — a pinned recording must not create an imbalance")
 	}
 
-	c := &Coordinator{}
-	// node-b's recording is excluded from the pool, so node-a's single channel
-	// vs node-b's single movable channel are exactly balanced → no imbalance.
-	if c.hasMovableImbalance(all, active, activeSet, heldSet, protected) {
-		t.Fatal("pinned recording on a migrating node should not create an imbalance")
+	// a: 1 recording + 3 claimed; b: 1 claimed → total 5, targets 3/2.
+	// node-a (4) is over its share AND owns movable rows → sweep warranted.
+	movableOver := []database.ChannelAssignment{
+		{Username: "aRec", AssignedNode: "node-a", Status: "recording"},
+		{Username: "a1", AssignedNode: "node-a", Status: "claimed"},
+		{Username: "a2", AssignedNode: "node-a", Status: "claimed"},
+		{Username: "a3", AssignedNode: "node-a", Status: "claimed"},
+		{Username: "b1", AssignedNode: "node-b", Status: "claimed"},
+	}
+	if !c.hasMovableImbalance(movableOver, active, activeSet, heldSet, protected) {
+		t.Fatal("movable over-share row should trigger a sweep")
 	}
 }
 
@@ -189,6 +203,173 @@ func TestPickLiveRebalanceMoveSkipsUnassignedAndNonActiveNodes(t *testing.T) {
 	}
 	if m := pickLiveRebalanceMove(all, active, rec, 1); m != nil {
 		t.Fatalf("channels on unassigned/off-node must never be moved, got %+v", m.ca)
+	}
+}
+
+// TestHasMovableImbalanceStableWhenRecordingsRun pins the 2026-09-10 fleet
+// regression: a node that is over the equal split ONLY because of pinned
+// recordings (which can never be moved) must not keep the imbalance check
+// true — that made the controller re-sweep the whole pool every cycle and
+// stop/start channels fleet-wide. Recordings count toward the share; only
+// movable (claimed) over-share rows justify a sweep.
+func TestHasMovableImbalanceStableWhenRecordingsRun(t *testing.T) {
+	active := []database.Node{testNode("node-a", nil), testNode("node-b", nil)}
+	activeSet := map[string]bool{"node-a": true, "node-b": true}
+	heldSet := map[string]bool{}
+	protected := map[string]bool{"node-a": true, "node-b": true}
+
+	c := &Coordinator{}
+
+	// 2 vs 2: node-a owns a recording, node-b owns a claimed channel. Counts
+	// are equal → no imbalance regardless of movability.
+	balanced := []database.ChannelAssignment{
+		{Username: "aRec", AssignedNode: "node-a", Status: "recording"},
+		{Username: "b1", AssignedNode: "node-b", Status: "claimed"},
+	}
+	if c.hasMovableImbalance(balanced, active, activeSet, heldSet, protected) {
+		t.Fatal("2 vs 2 counts are balanced — no sweep")
+	}
+
+	// a: 1 recording + 2 claimed; b: 1 claimed → total 4, targets 2/2.
+	// node-a is over its share AND owns movable rows → a sweep is warranted.
+	movableOver := []database.ChannelAssignment{
+		{Username: "aRec", AssignedNode: "node-a", Status: "recording"},
+		{Username: "a1", AssignedNode: "node-a", Status: "claimed"},
+		{Username: "a2", AssignedNode: "node-a", Status: "claimed"},
+		{Username: "b1", AssignedNode: "node-b", Status: "claimed"},
+	}
+	if !c.hasMovableImbalance(movableOver, active, activeSet, heldSet, protected) {
+		t.Fatal("movable over-share row should trigger a sweep")
+	}
+
+	// a: 3 recordings; b: 1 claimed → total 4, targets 2/2. node-a is over its
+	// share but every over-share row is a pinned recording. Nothing movable →
+	// the fleet must be left alone (this is the state that used to sweep forever).
+	pinnedOver := []database.ChannelAssignment{
+		{Username: "aRec1", AssignedNode: "node-a", Status: "recording"},
+		{Username: "aRec2", AssignedNode: "node-a", Status: "recording"},
+		{Username: "aRec3", AssignedNode: "node-a", Status: "recording"},
+		{Username: "b1", AssignedNode: "node-b", Status: "claimed"},
+	}
+	if c.hasMovableImbalance(pinnedOver, active, activeSet, heldSet, protected) {
+		t.Fatal("over-share from pinned recordings only must NOT trigger a sweep")
+	}
+}
+
+// staleMoveDB is a stateful fake for the reassign RPC: it applies the same
+// guard as reassign_channel (assigned_node = p_from_node AND status <>
+// 'recording') and reports whether the row actually moved.
+type staleMoveDB struct {
+	assignments []database.ChannelAssignment
+	posts       int
+}
+
+func (f *staleMoveDB) handler(w http.ResponseWriter, r *http.Request) {
+	switch {
+	case r.Method == "POST" && strings.Contains(r.URL.Path, "/rpc/claim_controller_lease"):
+		json.NewEncoder(w).Encode(true)
+	case r.Method == "POST" && strings.Contains(r.URL.Path, "/rpc/reassign_channel"):
+		f.posts++
+		var body struct {
+			PUsername string `json:"p_username"`
+			PSite     string `json:"p_site"`
+			PFromNode string `json:"p_from_node"`
+			PToNode   string `json:"p_to_node"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		moved := false
+		for i := range f.assignments {
+			ca := &f.assignments[i]
+			if ca.Username == body.PUsername && ca.Site == body.PSite &&
+				ca.AssignedNode == body.PFromNode && ca.Status != "recording" {
+				ca.AssignedNode = body.PToNode
+				ca.Status = "claimed"
+				moved = true
+				break
+			}
+		}
+		json.NewEncoder(w).Encode([]bool{moved})
+	default:
+		w.WriteHeader(http.StatusInternalServerError)
+	}
+}
+
+func newStaleMoveClient(t *testing.T, fake *staleMoveDB) *database.Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(fake.handler))
+	t.Cleanup(srv.Close)
+	return database.NewClient(srv.URL, "test-key")
+}
+
+// TestRebalanceLiveLoadNeverMovesTheSameRowTwice reproduces the 2026-09-10
+// avrora_jessie incident: the live-load balancer re-picked the same row from
+// its STALE snapshot after every successful move, overwriting each previous
+// destination (node-16 -> node-1 -> node-10 -> ... six times in one tick).
+// The snapshot must be updated after a real move so the row is not re-picked.
+func TestRebalanceLiveLoadNeverMovesTheSameRowTwice(t *testing.T) {
+	fake := &staleMoveDB{
+		assignments: []database.ChannelAssignment{
+			{Username: "avrora", Site: "chaturbate", AssignedNode: "node-16", Status: "claimed", IsLive: true},
+			// node-16 is carrying 6 recordings — far over any fair share — so
+			// without the snapshot fix the balancer keeps re-picking avrora from
+			// its stale snapshot and re-moving it (6 posts, one per shed unit,
+			// exactly the 2026-09-10 incident shape).
+			{Username: "rec1", Site: "chaturbate", AssignedNode: "node-16", Status: "recording", IsLive: true},
+			{Username: "rec2", Site: "chaturbate", AssignedNode: "node-16", Status: "recording", IsLive: true},
+			{Username: "rec3", Site: "chaturbate", AssignedNode: "node-16", Status: "recording", IsLive: true},
+			{Username: "rec4", Site: "chaturbate", AssignedNode: "node-16", Status: "recording", IsLive: true},
+			{Username: "rec5", Site: "chaturbate", AssignedNode: "node-16", Status: "recording", IsLive: true},
+			{Username: "rec6", Site: "chaturbate", AssignedNode: "node-16", Status: "recording", IsLive: true},
+		},
+	}
+	c := &Coordinator{Client: newStaleMoveClient(t, fake)}
+	active := map[string]bool{"node-1": true, "node-10": true, "node-16": true}
+	all := append([]database.ChannelAssignment{}, fake.assignments...)
+	renew := func() bool { return true }
+
+	c.rebalanceLiveLoad(all, active, renew)
+
+	if fake.posts != 1 {
+		t.Fatalf("expected exactly 1 reassign POST (the only movable row), got %d", fake.posts)
+	}
+	if got := all[0].AssignedNode; got == "node-16" || got == "" {
+		t.Fatalf("row should have moved off node-16, snapshot says %q", got)
+	}
+}
+
+// TestRebalanceLiveLoadSkipsRowLostToRace covers the no-op RPC result: when
+// the guarded UPDATE matches zero rows (row moved or became recording
+// elsewhere), the loop must mark the row done and terminate — not spin
+// forever and not count it as a move.
+func TestRebalanceLiveLoadSkipsRowLostToRace(t *testing.T) {
+	fake := &staleMoveDB{
+		// DB reality: the row flipped to 'recording' after the controller read
+		// its snapshot. The snapshot below still says claimed on node-a.
+		assignments: []database.ChannelAssignment{
+			{Username: "racer", Site: "chaturbate", AssignedNode: "node-a", Status: "recording", IsLive: true},
+			{Username: "recX", Site: "chaturbate", AssignedNode: "node-a", Status: "recording", IsLive: true},
+			{Username: "recY", Site: "chaturbate", AssignedNode: "node-a", Status: "recording", IsLive: true},
+		},
+	}
+	c := &Coordinator{Client: newStaleMoveClient(t, fake)}
+	active := map[string]bool{"node-a": true, "node-b": true}
+	all := []database.ChannelAssignment{
+		{Username: "racer", Site: "chaturbate", AssignedNode: "node-a", Status: "claimed", IsLive: true},
+		{Username: "recX", Site: "chaturbate", AssignedNode: "node-a", Status: "recording", IsLive: true},
+		{Username: "recY", Site: "chaturbate", AssignedNode: "node-a", Status: "recording", IsLive: true},
+	}
+	renew := func() bool { return true }
+
+	c.rebalanceLiveLoad(all, active, renew) // must return, not hang
+
+	if fake.posts != 1 {
+		t.Fatalf("expected exactly 1 (rejected) reassign POST, got %d", fake.posts)
+	}
+	if got := all[0].AssignedNode; got != "node-a" {
+		t.Fatalf("no-op move must not change the snapshot owner, got %q", got)
+	}
+	if got := all[0].Status; got != "recording" {
+		t.Fatalf("no-op move must mark the row done in the snapshot, got status %q", got)
 	}
 }
 
