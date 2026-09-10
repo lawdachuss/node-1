@@ -84,6 +84,12 @@ func persistSettings(key string, s *persistedSettings) error {
 // "dvr_settings" key. For backwards compatibility, if the per-node key has no
 // cookie blob yet, it falls back to the legacy cookie fields stored in the
 // global key (so a node that already ran never finds itself with no cookies).
+//
+// Upload credentials: a non-empty local value (.env / CLI flag / GitHub
+// secret) always wins over the central blob — the central value only seeds
+// fields the local config left empty (see applyUploadCredential). This is the
+// secret-rotation path: update the GitHub secret or .env, restart, and the
+// next SaveSettings converges the whole fleet onto the new key.
 func LoadSettings() error {
 	// 1) Credentials are always read from the global key.
 	if b := LoadSettingsFromDB(); b != nil {
@@ -92,32 +98,21 @@ func LoadSettings() error {
 			return fmt.Errorf("unmarshal global settings: %w", err)
 		}
 		ConfigMu.Lock()
-		if v := validPersistedValue(s.VoeSXAPIKey); v != "" {
-			Config.VoeSXAPIKey = v
-		}
-		if v := validPersistedValue(s.StreamtapeLogin); v != "" {
-			Config.StreamtapeLogin = v
-		}
-		if v := validPersistedValue(s.StreamtapeKey); v != "" {
-			Config.StreamtapeKey = v
-		}
-		if v := validPersistedValue(s.MixdropEmail); v != "" {
-			Config.MixdropEmail = v
-		}
-		if v := validPersistedValue(s.MixdropToken); v != "" {
-			Config.MixdropToken = v
-		}
-		if v := validPersistedValue(s.VidaraKey); v != "" {
-			Config.VidaraKey = v
-		}
+		// Upload credentials: local (env/flag/GitHub-secret) value wins; the
+		// central blob only seeds fields the local config left empty.
+		Config.VoeSXAPIKey = applyUploadCredential(Config.VoeSXAPIKey, s.VoeSXAPIKey, "voesx_api_key")
+		Config.StreamtapeLogin = applyUploadCredential(Config.StreamtapeLogin, s.StreamtapeLogin, "streamtape_login")
+		Config.StreamtapeKey = applyUploadCredential(Config.StreamtapeKey, s.StreamtapeKey, "streamtape_key")
+		Config.MixdropEmail = applyUploadCredential(Config.MixdropEmail, s.MixdropEmail, "mixdrop_email")
+		Config.MixdropToken = applyUploadCredential(Config.MixdropToken, s.MixdropToken, "mixdrop_token")
+		Config.VidaraKey = applyUploadCredential(Config.VidaraKey, s.VidaraKey, "vidara_key")
 		if v := validPersistedValue(s.StripchatPDKey); v != "" {
 			Config.StripchatPDKey = v
 		}
-		// Central value wins over .env/GitHub-secret AFFILIATE_WM, exactly like
-		// the upload credentials above: SaveSettings persists whatever value
-		// was effective at startup, so a node can seed Supabase once and every
-		// other node adopts it (an empty stored value is skipped, so it never
-		// wipes a locally-set one).
+		// Central value wins over .env/GitHub-secret AFFILIATE_WM: SaveSettings
+		// persists whatever value was effective at startup, so a node can seed
+		// Supabase once and every other node adopts it (an empty stored value
+		// is skipped, so it never wipes a locally-set one).
 		if v := validPersistedValue(s.AffiliateWM); v != "" {
 			Config.AffiliateWM = v
 		}
@@ -196,6 +191,26 @@ func extractCookie(cookieStr, name string) string {
 		}
 	}
 	return ""
+}
+
+// applyUploadCredential resolves one upload credential at settings-load time.
+//
+// Precedence (fleet secret-rotation fix): a non-empty LOCAL value (from .env,
+// CLI flag, or GitHub secret) always wins over the persisted central value;
+// the central value only seeds fields the local config left empty. Previously
+// the central blob won unconditionally, so rotating a key in GitHub
+// secrets/.env never reached the fleet: every node's LoadSettings overwrote
+// the fresh env value with the stale central one and SaveSettings immediately
+// re-persisted it — uploads kept failing with 401/403 auth errors (e.g.
+// Streamtape "Authentication failed") until the blob was fixed by hand.
+func applyUploadCredential(local, central, name string) string {
+	if v := validPersistedValue(local); v != "" {
+		if prev := validPersistedValue(central); prev != "" && prev != v {
+			log.Printf("[startup] upload credential %s: local (env/flag) value overrides the central Supabase value — next save re-persists it fleet-wide", name)
+		}
+		return v
+	}
+	return validPersistedValue(central)
 }
 
 // validPersistedValue returns s trimmed, or "" when s is empty, whitespace-only,

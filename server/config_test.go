@@ -262,6 +262,74 @@ func TestApplyCentralSessionDurationContinuous(t *testing.T) {
 	}
 }
 
+// TestLoadSettingsLocalCredentialsWinOverCentral is the regression test for
+// secret rotation: the fleet previously let the central dvr_settings blob win
+// unconditionally, so rotated .env/GitHub-secret credentials were clobbered at
+// startup and SaveSettings re-persisted the stale keys forever (Streamtape
+// 403 "Authentication failed" across the fleet). A non-empty local value must
+// win; the central blob only seeds empty local fields.
+func TestLoadSettingsLocalCredentialsWinOverCentral(t *testing.T) {
+	ts := httptest.NewServer(newFakeSupabase().handler())
+	defer ts.Close()
+
+	oldID := os.Getenv("NODE_ID")
+	os.Setenv("NODE_ID", "node-70")
+	defer os.Setenv("NODE_ID", oldID)
+
+	oldConfig := Config
+	defer func() { Config = oldConfig }()
+
+	// Central blob holds the OLD (stale) rotated-away credentials.
+	seed := []byte(`{"voesx_api_key":"old-voe","streamtape_login":"old-st-login","streamtape_key":"old-st-key","vidara_key":"old-vidara","affiliate_wm":"wm-1"}`)
+	Config = &entity.Config{SupabaseURL: ts.URL, SupabaseAPIKey: "test-key"}
+	if err := SaveSettingsToDBForKey("dvr_settings", seed); err != nil {
+		t.Fatalf("seed central blob: %v", err)
+	}
+
+	// Local config (env/flag path) holds the NEW rotated credentials. Vidara is
+	// intentionally left empty locally — the central value must seed it.
+	Config.VoeSXAPIKey = "new-voe"
+	Config.StreamtapeLogin = "new-st-login"
+	Config.StreamtapeKey = "new-st-key"
+
+	if err := LoadSettings(); err != nil {
+		t.Fatalf("LoadSettings: %v", err)
+	}
+	if Config.VoeSXAPIKey != "new-voe" {
+		t.Errorf("voesx = %q, want new-voe (local must win)", Config.VoeSXAPIKey)
+	}
+	if Config.StreamtapeLogin != "new-st-login" {
+		t.Errorf("streamtape_login = %q, want new-st-login (local must win)", Config.StreamtapeLogin)
+	}
+	if Config.StreamtapeKey != "new-st-key" {
+		t.Errorf("streamtape_key = %q, want new-st-key (local must win)", Config.StreamtapeKey)
+	}
+	if Config.VidaraKey != "old-vidara" {
+		t.Errorf("vidara = %q, want old-vidara (central seeds empty local field)", Config.VidaraKey)
+	}
+
+	// SaveSettings must converge the fleet onto the new values.
+	if err := SaveSettings(); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+	var g persistedSettings
+	if err := json.Unmarshal(LoadSettingsFromDB(), &g); err != nil {
+		t.Fatalf("unmarshal global blob: %v", err)
+	}
+	if g.StreamtapeKey != "new-st-key" || g.VoeSXAPIKey != "new-voe" {
+		t.Errorf("after save central blob = st:%q voe:%q, want rotated values", g.StreamtapeKey, g.VoeSXAPIKey)
+	}
+
+	// A node with NO local values must still pick up the (now rotated) central ones.
+	Config = &entity.Config{SupabaseURL: ts.URL, SupabaseAPIKey: "test-key"}
+	if err := LoadSettings(); err != nil {
+		t.Fatalf("LoadSettings (no local): %v", err)
+	}
+	if Config.StreamtapeKey != "new-st-key" || Config.VidaraKey != "old-vidara" {
+		t.Errorf("seed-only node = st:%q vidara:%q, want central values", Config.StreamtapeKey, Config.VidaraKey)
+	}
+}
+
 // TestSyncNodeEnvironmentAfterDotenv proves NodeID()/CookieSettingsKey() pick
 // up NODE_ID even though package init() runs before .env is loaded.
 func TestSyncNodeEnvironmentAfterEnv(t *testing.T) {
