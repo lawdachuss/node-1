@@ -527,6 +527,7 @@ func New(c *cli.Context) (*entity.Config, error) {
 		CFRefreshMin:          c.Int("cf-refresh-min"),
 		NotifyCooldownHours:   c.Int("notify-cooldown-hours"),
 		NotifyStreamOnline:    c.Bool("notify-stream-online"),
+		DisableEarlyDrain:     c.Bool("disable-early-drain"),
 	}
 
 	// If user provided a custom ffmpeg path, set it globally

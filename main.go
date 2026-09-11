@@ -325,6 +325,12 @@ func main() {
 				EnvVars: []string{"SESSION_DURATION"},
 				Value:   "",
 			},
+			&cli.BoolFlag{
+				Name:    "disable-early-drain",
+				Usage:   "Never force-stop channels before the session duration elapses, even if the upload backlog can't finish before the run deadline",
+				EnvVars: []string{"DISABLE_EARLY_DRAIN"},
+				Value:   false,
+			},
 			&cli.IntFlag{
 				Name:    "max-local-age-days",
 				Usage:   "Delete local recordings older than this many days if already uploaded (0 = disabled)",

@@ -681,10 +681,10 @@ const (
 	// permanently-broken recording would otherwise be re-hammered (3 hosts ×
 	// 3 attempts) on every startup and periodic scan.
 	thumbRetryCooldown = 45 * time.Minute
-// thumbSyncInterval is how often the dedicated thumbnail-backfill ticker
-// runs. SyncRecordingsThumbnails self-throttles to a 10-minute cooldown, so
-// this keeps recordings.thumbnail_url current without waiting for the
-// (default 60-minute) orphan-cleanup ticker.
+	// thumbSyncInterval is how often the dedicated thumbnail-backfill ticker
+	// runs. SyncRecordingsThumbnails self-throttles to a 10-minute cooldown, so
+	// this keeps recordings.thumbnail_url current without waiting for the
+	// (default 60-minute) orphan-cleanup ticker.
 	thumbSyncInterval = 30 * time.Minute
 )
 
@@ -1193,8 +1193,11 @@ func (m *Manager) StartSession(d time.Duration) {
 	// finish with enough room left for the final drain (earlyDrainMargin).
 	// Instead of refusing outright — which previously left a node idle for the
 	// rest of its run — clamp the session to fit. Recording continues until the
-	// deadline rather than stopping after the first session.
-	if rd := resolveRunDeadline(); !rd.IsZero() {
+	// deadline rather than stopping after the first session.  When
+	// DisableEarlyDrain is set this clamping is skipped: the full configured
+	// session runs regardless of the run deadline (the backlog is drained at
+	// the natural boundary instead).
+	if rd := resolveRunDeadline(); !rd.IsZero() && !(server.Config != nil && server.Config.DisableEarlyDrain) {
 		limit := rd.Add(-earlyDrainMargin)
 		if time.Now().Add(d).After(limit) {
 			fit := time.Until(limit)
@@ -1279,6 +1282,9 @@ func (m *Manager) PendingUploadBytes() int64 {
 // the drain the time the big files need.  No-op when there is no deadline
 // (local dev) or the backlog fits comfortably.
 func (m *Manager) checkEarlyFinalDrain() {
+	if server.Config != nil && server.Config.DisableEarlyDrain {
+		return
+	}
 	rd := resolveRunDeadline()
 	if rd.IsZero() {
 		return

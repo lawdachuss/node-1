@@ -48,6 +48,12 @@ jobs:
       CHANNEL_POOL_MODE: ${{ secrets.CHANNEL_POOL_MODE }}
       NODE_ID: ${{ secrets.NODE_ID }}
       SESSION_DURATION: ${{ secrets.SESSION_DURATION }}
+      # Never force-stop channels before the session duration elapses, even if
+      # the upload backlog can't finish before the run deadline.  Disables the
+      # early-final-drain heuristic that previously cut sessions short (the
+      # ~3h-into-a-5h20m-session pattern).  Backlog is drained at the natural
+      # session boundary instead.
+      DISABLE_EARLY_DRAIN: 'true'
       # Defer videos shorter than this (seconds) for merging instead of uploading
       # them. Mirrors the per-channel min_duration_before_upload=1200 in the pool
       # so the watcher/orphan/pending-flush paths (global-only) never upload shorts.

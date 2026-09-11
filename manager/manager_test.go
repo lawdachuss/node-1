@@ -452,6 +452,42 @@ func TestStartSessionRefusesPastRunDeadline(t *testing.T) {
 	t.Fatal("StartSession should start a session that fits before RUN_DEADLINE")
 }
 
+// TestStartSessionDisableEarlyDrainSkipsClamp verifies that with
+// DisableEarlyDrain set, StartSession does NOT refuse or clamp a session that
+// would overrun the run deadline — channels must keep recording the full
+// configured session duration regardless of the runner's deadline.
+func TestStartSessionDisableEarlyDrainSkipsClamp(t *testing.T) {
+	oldMgr, oldCfg := server.Manager, server.Config
+	defer restoreTestGlobalsSafe(oldMgr, oldCfg, nil)
+
+	m, err := New()
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer m.StopSession()
+
+	t.Setenv("RUN_DEADLINE", strconv.FormatInt(time.Now().Add(time.Minute).Unix(), 10))
+	server.Config = &entity.Config{Interval: 1, Domain: "http://127.0.0.1:1/", CFChannelThreshold: 5, DisableEarlyDrain: true}
+
+	// A 2h session would overrun a deadline 1m away — with the flag set it
+	// must still start (unclamped) so recording runs the full duration.
+	m.StartSession(2 * time.Hour)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		remaining, active := m.SessionInfo()
+		if active {
+			// Must be ~2h remaining, not clamped down to minutes. Allow a
+			// couple seconds of elapsed time after the 2h start.
+			if remaining < 2*time.Hour-2*time.Second {
+				t.Fatalf("expected ~2h remaining (unclamped), got %s", remaining)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("StartSession with DisableEarlyDrain must start the full session past the run deadline")
+}
+
 // TestCreateChannelFromAssignmentDeclinesAfterFinalDrain verifies that once
 // the session is stopped (final drain on an ephemeral runner, or graceful
 // shutdown), the manager declines new assignments instead of creating channels
@@ -544,4 +580,3 @@ func TestShouldTriggerEarlyFinalDrain(t *testing.T) {
 		t.Fatal("no pending bytes must not trigger")
 	}
 }
-
