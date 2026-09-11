@@ -31,11 +31,9 @@ const (
 
 	// thumbnailAssetTimeout caps how long generateThumbnailForFile waits for
 	// any single asset (thumbnail/sprite/preview) goroutine before giving up
-	// on it. Bounded waits mean a stalled asset can never hang the caller
-	// (pipeline thumbnail_upload stage, orphan rescan, backfill) forever; the
-	// recording still uploads and cleanup keeps the file when the thumbnail is
-	// missing for a later backfill retry.
-	thumbnailAssetTimeout = 3 * time.Hour
+	// on it. 10 minutes is generous: normal generation + image-host upload
+	// takes minutes. If exceeded, the asset is skipped and backfilled later.
+	thumbnailAssetTimeout = 10 * time.Minute
 )
 
 // ThumbnailResult holds the generated thumbnail, sprite, and preview URLs

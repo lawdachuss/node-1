@@ -47,14 +47,12 @@ const maxPipelineRetries = 3
 // wedge froze every pipeline at thumbnail_upload with updated==created (video
 // uploads in the parallel goroutine still succeeded, so recordings had links
 // yet files were never cleaned and the disk filled at ~13 GB/h) because a
-// deadlocked thumbnail goroutine never returned and wg.Wait() waited on it
-// indefinitely. Bounding the wait degrades a pathological stall to "no
-// thumbnail yet" — links are already persisted, the file is kept by cleanup
-// when the thumbnail is missing, and ScanThumbnails/backfill fills it in
-// later — instead of freezing the whole node. Generous so a slow 4K file with
-// seek retries (up to ~45-min ffmpeg budgets each) plus image-host uploads is
-// never falsely abandoned.
-const pipelineThumbnailTimeout = 3 * time.Hour
+// After upload succeeds, wait this long for thumbnail generation. If exceeded,
+// proceed without thumbnails — the file is kept (cleanup checks for thumbURL)
+// and ScanThumbnails/backfill fills it in later. 15 minutes is generous:
+// normal thumbnails take minutes; if it's been 15min something is wrong
+// (deadlocked ffmpeg, image-host outage) and we shouldn't block the pipeline.
+const pipelineThumbnailTimeout = 15 * time.Minute
 
 // defaultPipelineWorkers is how many pipelines one channel's queue processes
 // concurrently.  More workers means a channel with a backlog of recordings
@@ -676,7 +674,7 @@ func (p *Pipeline) stageSaveMetadata(ch *Channel) error {
 	// thumbnail and sprite to the image hosts on every retry — exactly the
 	// host-hammering loop that causes the fleet-wide rate-limit failures.
 	// A missing sprite/preview is cosmetic; a missing thumbnail is not.
-	if p.ThumbURL == "" || p.SpriteURL == "" || p.PreviewURL == "" {
+	if p.ThumbURL == "" {
 		thumb := ch.generateThumbnail(p.FilePath, nil)
 		generated := false
 		if p.ThumbURL == "" && thumb.ThumbURL != "" {
