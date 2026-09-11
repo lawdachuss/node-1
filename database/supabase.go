@@ -1283,7 +1283,7 @@ type UploadJournal struct {
 	Filename   string `json:"filename"`
 	Host       string `json:"host"`
 	Status     string `json:"status"`
-	ErrorMsg   string `json:"error_msg,omitempty"`
+	ErrorMsg   string `json:"error_msg"`
 	FileSize   int64  `json:"file_size,omitempty"`
 	InstanceID string `json:"instance_id,omitempty"`
 	CreatedAt  string `json:"created_at,omitempty"`
