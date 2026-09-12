@@ -117,6 +117,14 @@ type MultiHostUploader struct {
 	disabledHosts map[string]bool // hosts disabled for the rest of this run
 	disabledMu    sync.Mutex
 	consecFails   failingHosts // consecutive failures per host -> auto-disable at threshold
+	// fullSend records hosts whose previous attempt already transmitted the
+	// file's complete body to the server but lost the response (see
+	// errBodyFullySent).  Persisting across UploadSelectedWithCallback calls
+	// (which stageUploadVideos re-runs once per DoWithRetry attempt, reusing
+	// the same MultiHostUploader) prevents re-uploading a file whose bytes
+	// were already fully pushed.
+	fullSendMu sync.Mutex
+	fullSend   map[string]bool
 }
 
 // package-level set of upload hosts that must never be attempted this run,
@@ -182,6 +190,56 @@ func (m *MultiHostUploader) recordHostSuccess(name string) {
 	m.disabledMu.Lock()
 	defer m.disabledMu.Unlock()
 	m.consecFails.recordSuccess(name)
+}
+
+// markFullSend records that the given host's last attempt streamed the file's
+// complete body (progress reached total).  See the fullSend field comment.
+func (m *MultiHostUploader) markFullSend(name string) {
+	m.fullSendMu.Lock()
+	defer m.fullSendMu.Unlock()
+	if m.fullSend == nil {
+		m.fullSend = map[string]bool{}
+	}
+	m.fullSend[name] = true
+}
+
+// hasFullSend reports whether the host already received the complete body of
+// the current file on a prior attempt, so we must not re-stream it.
+func (m *MultiHostUploader) hasFullSend(name string) bool {
+	m.fullSendMu.Lock()
+	defer m.fullSendMu.Unlock()
+	return m.fullSend[name]
+}
+
+// clearFullSend forgets a host's full-send marker on success.
+func (m *MultiHostUploader) clearFullSend(name string) {
+	m.fullSendMu.Lock()
+	delete(m.fullSend, name)
+	m.fullSendMu.Unlock()
+}
+
+// errBodyFullySent reports that a previous attempt already handed the file's
+// entire body to the host but its response was lost (timeout, EOF, reset, 5xx
+// after upload).  Re-uploading the same bytes would create duplicate files.
+func errBodyFullySent(host string) error {
+	return fmt.Errorf("%s upload: file body was already fully transmitted in a previous attempt but the response was lost — not re-uploading this file to avoid duplicates", host)
+}
+
+// trackFullSend wraps a progress callback so the MultiHostUploader records the
+// moment a host's upload stream reaches 100% of the file.  Used by
+// UploadSelectedWithCallback and UploadSelectedPriority so that a file whose
+// complete body was already pushed to a host on a prior DoWithRetry attempt is
+// NOT re-streamed (stageUploadVideos re-runs the uploader once per attempt
+// while reusing the same MultiHostUploader).
+func (m *MultiHostUploader) trackFullSend(progressFn ProgressFunc) ProgressFunc {
+	return func(host string, current, total int64) {
+		if total > 0 && current >= total {
+			m.markFullSend(host)
+		}
+		if progressFn != nil {
+			progressFn(host, current, total)
+		}
+	}
 }
 
 // failingHostsThreshold is how many consecutive files a host may fail before
@@ -414,7 +472,7 @@ func (m *MultiHostUploader) UploadSelectedWithCallback(filePath string, hosts []
 	var mu sync.Mutex
 	results := []UploadResult{}
 
-	progressFn := m.progress
+	progressFn := m.trackFullSend(m.progress)
 	for _, name := range hosts {
 		if m.isHostDisabled(name) {
 			m.log.Info("upload: skipping disabled host %s for %s", name, filePath)
@@ -427,8 +485,19 @@ func (m *MultiHostUploader) UploadSelectedWithCallback(filePath string, hosts []
 		wg.Add(1)
 		go func(host string, fn uploaderFunc) {
 			defer wg.Done()
-			m.log.Info("upload: starting %s upload for %s", host, filePath)
-			link, err := fn(filePath, progressFn)
+			var link string
+			var err error
+			if m.hasFullSend(host) {
+				// A previous attempt already pushed the file's complete body to
+				// this host but lost the response.  Re-streaming the same bytes
+				// would create a duplicate upload on the host, so fail this
+				// attempt without touching the socket.
+				m.log.Error("upload: skipping %s for %s — file body was already fully transmitted in a previous attempt (response lost)", host, filePath)
+				err = errBodyFullySent(host)
+			} else {
+				m.log.Info("upload: starting %s upload for %s", host, filePath)
+				link, err = fn(filePath, progressFn)
+			}
 			if err != nil {
 				m.log.Error("upload: %s failed for %s: %v", host, filePath, err)
 				if isVoeStorageFull(err) {
@@ -447,6 +516,7 @@ func (m *MultiHostUploader) UploadSelectedWithCallback(filePath string, hosts []
 			} else {
 				m.log.Info("upload: %s successful for %s: %s", host, filePath, link)
 				m.recordHostSuccess(host)
+				m.clearFullSend(host)
 				if onHost != nil {
 					onHost(host, link)
 				}
@@ -482,7 +552,7 @@ func (m *MultiHostUploader) UploadSelectedPriority(filePath string, hosts []stri
 	}
 
 	var results []UploadResult
-	progressFn := m.progress
+	progressFn := m.trackFullSend(m.progress)
 
 	for _, host := range priorityHosts {
 		if m.isHostDisabled(host) {
@@ -493,8 +563,15 @@ func (m *MultiHostUploader) UploadSelectedPriority(filePath string, hosts []stri
 		if !ok {
 			continue
 		}
-		m.log.Info("upload: priority upload to %s for %s", host, filePath)
-		link, err := fn(filePath, progressFn)
+		var link string
+		var err error
+		if m.hasFullSend(host) {
+			m.log.Error("upload: skipping %s for %s — file body was already fully transmitted in a previous attempt (response lost)", host, filePath)
+			err = errBodyFullySent(host)
+		} else {
+			m.log.Info("upload: priority upload to %s for %s", host, filePath)
+			link, err = fn(filePath, progressFn)
+		}
 		results = append(results, UploadResult{Host: host, DownloadLink: link, Error: err})
 		if err != nil {
 			m.log.Error("upload: %s (priority) failed for %s: %v", host, filePath, err)
@@ -514,6 +591,7 @@ func (m *MultiHostUploader) UploadSelectedPriority(filePath string, hosts []stri
 		} else {
 			m.log.Info("upload: %s (priority) successful for %s: %s", host, filePath, link)
 			m.recordHostSuccess(host)
+			m.clearFullSend(host)
 		}
 	}
 

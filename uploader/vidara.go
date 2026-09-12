@@ -79,6 +79,23 @@ func (u *VidaraUploader) UploadWithProgress(filePath string, progress ProgressFu
 	release := acquireHostSem("Vidara")
 	defer release()
 
+	// Detect when the ENTIRE file body has been handed to the transport on
+	// this attempt.  A failure after that point (5xx after upload, EOF,
+	// connection reset, response-decode error) means Vidara already received
+	// every byte of the file — retrying would push the SAME file again and
+	// stack duplicate uploads (the "uploaded 100%, then it started uploading
+	// again" loop).  In that case bail on this host immediately instead of
+	// re-streaming the file up to 3 times per key.
+	var bodyFullySent bool
+	wrapped := func(host string, current, total int64) {
+		if total > 0 && current >= total {
+			bodyFullySent = true
+		}
+		if progress != nil {
+			progress(host, current, total)
+		}
+	}
+
 	var lastErr error
 
 	// Try each key at most once per call.  A single-key ring degenerates to a
@@ -97,9 +114,17 @@ func (u *VidaraUploader) UploadWithProgress(filePath string, progress ProgressFu
 				time.Sleep(uploadBackoff(attempt-2, lastErr))
 			}
 
-			downloadLink, err := u.uploadFile(filePath, key, progress)
+			downloadLink, err := u.uploadFile(filePath, key, wrapped)
 			if err != nil {
 				lastErr = fmt.Errorf("upload file: %w", err)
+				// A fully-transmitted body already reached the server; the
+				// failure is only in reading the response.  Re-streaming the
+				// same file would create duplicate uploads, so surface the
+				// error now and let the caller's outer retry cadence (journal
+				// state + pipeline backoff) decide what happens next.
+				if bodyFullySent {
+					return "", lastErr
+				}
 				if isUploadRateLimited(err) {
 					time.Sleep(uploadBackoff(attempt, err))
 					lastErr = nil
@@ -151,20 +176,29 @@ func isVidaraCapacityError(err error) bool {
 }
 
 // isVidaraAuthError returns true when the Vidara error indicates the API key
-// is invalid, expired, or revoked (HTTP 403 / auth wording).  A bad key will
-// never succeed within a run, so callers should rotate to the next key instead
-// of retrying the same one.
+// is invalid, expired, or revoked.  A bad key will never succeed within a run,
+// so callers should rotate to the next key instead of retrying the same one.
+//
+// The matcher deliberately uses explicit credential-rejection wording ONLY and
+// NOT broad substrings like "403", "forbidden", or a bare "api key".  Vidara's
+// API is fronted by nginx/Cloudflare, and block pages / WAF 403 responses
+// embed those words; matching them mislabels a site-side block as a dead key,
+// which rotates a perfectly valid key to "Vidara upload failed: all keys
+// exhausted" for every file (seen in production: 460 such journal rows while
+// the configured key still returned HTTP 200 on /upload/server).
 func isVidaraAuthError(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "403") ||
-		strings.Contains(msg, "authentication") ||
-		strings.Contains(msg, "unauthorized") ||
-		strings.Contains(msg, "invalid api key") ||
-		strings.Contains(msg, "api key") ||
-		strings.Contains(msg, "forbidden")
+	// Vidara has returned the rejection in every one of these spellings
+	// ("invalid api key", "invalid_api_key", "invalid api_key").
+	return strings.Contains(msg, "invalid api key") ||
+		strings.Contains(msg, "invalid api_key") ||
+		strings.Contains(msg, "invalid_api_key") ||
+		strings.Contains(msg, "api key is invalid") ||
+		strings.Contains(msg, "authentication failed") ||
+		strings.Contains(msg, "unauthorized")
 }
 
 // getUploadServer gets the upload server URL from the Vidara API
