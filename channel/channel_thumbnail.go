@@ -124,6 +124,20 @@ func fileExists(path string) bool {
 	return err == nil && !fi.IsDir()
 }
 
+// waitForOutputFile polls with backoff until the file is confirmed to exist.
+// On Windows an AV scanner (Defender, etc.) can briefly hold an exclusive lock
+// on a freshly-created file, making os.Stat return ERROR_FILE_NOT_FOUND even
+// though ffmpeg exited successfully. Retrying with a short delay resolves it.
+func waitForOutputFile(path string) bool {
+	for delay := 0; delay < 5; delay++ {
+		if fileExists(path) {
+			return true
+		}
+		time.Sleep(time.Duration(50*(1<<delay)) * time.Millisecond) // 50, 100, 200, 400, 800 ms
+	}
+	return false
+}
+
 // runFFmpegParallel runs fn for each index in [0, n) with up to workers
 // goroutines running at once.  Each fn is responsible for acquiring its own
 // ffmpeg slot (AcquireFFmpeg/ReleaseFFmpeg) so the global ffmpegSem bounds
@@ -325,9 +339,8 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 
 		// generateThumb extracts the single thumbnail frame (slow=true uses
 		// slow seek for codecs where fast seek crashes ffmpeg).  It uses a
-		// fresh context per attempt so the slow-seek retry / regeneration is
-		// never killed instantly by a shared context exhausted by the failed
-		// fast seek.
+		// fresh context per attempt so the slow-seek retry is never killed
+		// instantly by a shared context exhausted by a failed fast seek.
 		generateThumb := func(slow bool) error {
 			args := []string{"-y"}
 			if slow {
@@ -371,14 +384,9 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		// The freshly-written .thumb.jpg can be briefly invisible to os.Stat
 		// (Windows AV scanners) OR deleted by a concurrent flow processing the
 		// same video (a second pipeline's DeleteSidecarFiles). Either way a
-		// missing file at upload time showed up as "pixhost: stat file". Poll
-		// briefly, then regenerate (a single-frame extract is fast) before
-		// uploading.
-		if err == nil && !fileExists(thumbJPG) {
-			errFn("thumb: %s missing after generation — regenerating", filepath.Base(thumbJPG))
-			err = generateThumb(true)
-		}
-		if err == nil && !fileExists(thumbJPG) {
+		// missing file at upload time showed up as "pixhost: stat file".
+		// Poll briefly before uploading.
+		if err == nil && !waitForOutputFile(thumbJPG) {
 			err = fmt.Errorf("thumbnail file %s never appeared", filepath.Base(thumbJPG))
 		}
 

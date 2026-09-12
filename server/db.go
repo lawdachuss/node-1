@@ -1536,8 +1536,58 @@ func SyncRecordingsThumbnails() {
 		fixed++
 		time.Sleep(pacing)
 	}
-	if fixed > 0 {
-		log.Printf("[thumb-sync] backfilled thumbnail_url onto %d recording(s)", fixed)
+
+	// Second sweep: recordings that already have a thumbnail but lack sprite
+	// and/or preview.  These are invisible to the first sweep above (its query
+	// requires a null thumbnail) even though preview_images commonly holds the
+	// missing sprite/preview — the three assets are generated independently and
+	// a sprite/preview failure (timeout on a long video, image-host outage) does
+	// not block the thumbnail.  Copying from preview_images is a pure DB->DB
+	// merge (no regeneration, no image-host upload), so it cannot burn host
+	// quota the way regeneration would.
+	fixedSP := 0
+	spRecs, err := client.GetRecordingsMissingSpriteOrPreview()
+	if err != nil {
+		log.Printf("[thumb-sync] could not load sprite/preview-missing recordings: %v", err)
+	} else {
+		for i := range spRecs {
+			rec := &spRecs[i]
+			if rec.ThumbnailURL == "" {
+				continue
+			}
+			if skips[rec.Filename] {
+				continue
+			}
+			links, ok := lookupPreviewLinks(previews, rec.Filename)
+			if !ok {
+				// No preview_images row exists for this file.  The recording
+				// already has its thumbnail, so nothing about it will be
+				// regenerated (ScanThumbnails only acts when the THUMBNAIL is
+				// missing) and there is nothing to merge.  Mark it unfixable so
+				// nodes don't re-query it on every sweep.
+				markRecThumbUnfixable(rec.Filename)
+				continue
+			}
+			sprite, preview := links[1], links[2]
+			// Merge conservatively: only fill what the recording row is missing;
+			// never clobber an existing (possibly richer) sprite/preview with a
+			// stale preview_images value.
+			sprite, preview = mergeThumbAssets(rec.SpriteURL, sprite, rec.PreviewURL, preview)
+			if sprite == rec.SpriteURL && preview == rec.PreviewURL {
+				// Nothing to fill — the recording already has everything the
+				// preview_images row offers for these fields.
+				continue
+			}
+			if err := UpdateRecordingThumbnails(rec.Filename, "", sprite, preview); err != nil {
+				log.Printf("[thumb-sync] failed to sync sprite/preview for %s: %v", rec.Filename, err)
+				continue
+			}
+			fixedSP++
+			time.Sleep(pacing)
+		}
+	}
+	if fixed > 0 || fixedSP > 0 {
+		log.Printf("[thumb-sync] backfilled thumbnail_url onto %d recording(s) and sprite/preview onto %d", fixed, fixedSP)
 	}
 }
 

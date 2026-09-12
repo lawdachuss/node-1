@@ -605,6 +605,17 @@ func (c *Client) GetRecordingsMissingThumbnails() ([]Recording, error) {
 	return recordings, err
 }
 
+// GetRecordingsMissingSpriteOrPreview retrieves recordings that already show a
+// thumbnail but are still missing sprite_url and/or preview_url.  These rows
+// are invisible to GetRecordingsMissingThumbnails (their thumbnail exists), yet
+// preview_images may already hold the sprite/preview the video card needs, so
+// the DB->DB thumb-sync sweep can merge them without regenerating anything.
+func (c *Client) GetRecordingsMissingSpriteOrPreview() ([]Recording, error) {
+	var recordings []Recording
+	err := c.getAllPaginated("/recordings?select=id,filename,thumbnail_url,sprite_url,preview_url&thumbnail_url=not.eq.&or=(sprite_url.is.null,sprite_url.eq.,preview_url.is.null,preview_url.eq.)", &recordings)
+	return recordings, err
+}
+
 // HasRecordingThumbnails returns true when the recording identified by filename
 // has non-empty thumbnail_url, sprite_url, and preview_url in the database.
 // Used by the pipeline cleanup to verify thumbnails actually persisted before
