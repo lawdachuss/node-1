@@ -1283,6 +1283,7 @@ type UploadJournal struct {
 	Filename   string `json:"filename"`
 	Host       string `json:"host"`
 	Status     string `json:"status"`
+	Link       string `json:"link,omitempty"`
 	ErrorMsg   string `json:"error_msg"`
 	FileSize   int64  `json:"file_size,omitempty"`
 	InstanceID string `json:"instance_id,omitempty"`
@@ -1318,6 +1319,36 @@ func (c *Client) GetJournalEntriesByStatus(status string) ([]UploadJournal, erro
 	var entries []UploadJournal
 	err := c.get(fmt.Sprintf("/upload_journal?status=eq.%s&order=created_at.desc", url.QueryEscape(status)), &entries)
 	return entries, err
+}
+
+// GetJournalSuccessWithLinks retrieves recent upload-journal success entries
+// that carry a persisted download link.  These are the rows from which a
+// recording's missing upload_links can be rebuilt after a crash (see
+// server.ReconcileMissingUploadLinks).  `link=like.*` matches every non-null,
+// non-empty string; NULL rows are excluded automatically.
+func (c *Client) GetJournalSuccessWithLinks(limit int) ([]UploadJournal, error) {
+	var entries []UploadJournal
+	path := "/upload_journal?status=eq.success&link=like.*&select=file_hash,filename,host,link&order=updated_at.desc&limit=" + strconv.Itoa(limit)
+	err := c.get(path, &entries)
+	return entries, err
+}
+
+// GetUploadLinkHosts returns the set of hosts for which a recording already
+// has a persisted upload link.  Used by reconciliation to avoid re-inserting
+// links that are already present.
+func (c *Client) GetUploadLinkHosts(recordingID string) ([]string, error) {
+	var links []struct {
+		Host string `json:"host"`
+	}
+	err := c.get(fmt.Sprintf("/upload_links?select=host&recording_id=eq.%s", url.QueryEscape(recordingID)), &links)
+	if err != nil {
+		return nil, err
+	}
+	hosts := make([]string, 0, len(links))
+	for _, l := range links {
+		hosts = append(hosts, l.Host)
+	}
+	return hosts, nil
 }
 
 // DeleteJournalByHash removes all journal entries for a file hash (e.g. after local file is deleted).

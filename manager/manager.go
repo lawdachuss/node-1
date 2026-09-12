@@ -309,6 +309,13 @@ func (m *Manager) LoadConfig() error {
 		channel.CleanupOrphanedFiles()
 		m.ScanThumbnails()
 		server.SyncRecordingsThumbnails()
+		// Restore upload_links for recordings whose per-host link save never
+		// landed (node died between journal-write and link-save).  Bounded to
+		// the most recent maxUploadJournalReconcile journal successes so the
+		// sweep can't balloon on huge journals.
+		if restored := server.ReconcileMissingUploadLinks(maxUploadJournalReconcile); restored > 0 {
+			fmt.Printf("[recover] restored %d upload link(s) missing from previous runs\n", restored)
+		}
 	}()
 
 	// Periodic orphan cleanup + thumbnail scan
@@ -320,6 +327,7 @@ func (m *Manager) LoadConfig() error {
 				channel.CleanupOrphanedFiles()
 				m.ScanThumbnails()
 				server.SyncRecordingsThumbnails()
+				server.ReconcileMissingUploadLinks(maxUploadJournalReconcile)
 			}
 		}()
 	}
@@ -686,6 +694,10 @@ const (
 	// this keeps recordings.thumbnail_url current without waiting for the
 	// (default 60-minute) orphan-cleanup ticker.
 	thumbSyncInterval = 30 * time.Minute
+	// maxUploadJournalReconcile bounds how many recent successful journal
+	// entries ReconcileMissingUploadLinks scans per sweep.  It only restores
+	// links for hosts whose recording row exists, so 1000 covers a large run.
+	maxUploadJournalReconcile = 1000
 )
 
 // startRecordingsThumbSync runs SyncRecordingsThumbnails (the cheap DB->DB copy)

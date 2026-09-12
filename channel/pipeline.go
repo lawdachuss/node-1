@@ -517,33 +517,40 @@ func (p *Pipeline) stageUploadVideos(ch *Channel) error {
 		var recordingID string
 		var recordingIDOnce sync.Once
 		attemptResults := upl.UploadSelectedWithCallback(filePath, hostsToTry, func(host, url string) {
-			// Save the upload link to Supabase the instant a host succeeds —
-			// don't wait for all hosts.  If the runner VM dies before other
-			// hosts finish, this link survives.
-			recordingIDOnce.Do(func() {
-				var lookupErr error
-				recordingID, lookupErr = server.GetRecordingID(filename)
-				if lookupErr != nil {
-					ch.Warn("upload: could not find recording ID for %s: %v", filename, lookupErr)
-				}
-			})
-			if recordingID == "" {
-				// Recording row doesn't exist yet (SaveRecordingBasics
-				// failed or was skipped).  Save the link by filename — the
-				// upsert in SaveRecordingWithLinks will create the row
-				// later.  Store in the journal so the link survives even
-				// if the per-DB save can't run yet.
-				if jErr := server.SaveJournalEntry(p.FileHash, filename, host, "success", url, 0, ""); jErr != nil {
-					ch.Warn("upload: could not save journal entry for %s/%s: %v", host, filename, jErr)
-				}
-				return
-			}
-			if saveErr := server.SaveUploadLinkByIDWithFilename(recordingID, host, url, filename); saveErr != nil {
-				ch.Warn("upload: could not save link from %s for %s immediately: %v", host, filename, saveErr)
-			} else {
-				ch.Info("upload: saved link from %s for %s immediately", host, filename)
+		// Persist the journal entry FIRST — while the upload result and its
+		// download link are in hand — then save the link to the recordings
+		// row.  If the runner dies between the two, or the DB save exhausts
+		// its retries, the journal carries the link so ReconcileMissingUploadLinks
+		// can restore it on the next boot.  Previously the journal was written
+		// only for the empty-recording-ID path (and wholesale after all hosts),
+		// so a crash in between left a host "done" in the journal with its link
+		// permanently unpersisted.
+		if jErr := server.SaveJournalEntry(p.FileHash, filename, host, "success", url, 0, ""); jErr != nil {
+			ch.Warn("upload: could not save journal entry for %s/%s: %v", host, filename, jErr)
+		}
+		// Save the upload link to Supabase the instant a host succeeds —
+		// don't wait for all hosts.  If the runner VM dies before other
+		// hosts finish, this link survives.
+		recordingIDOnce.Do(func() {
+			var lookupErr error
+			recordingID, lookupErr = server.GetRecordingID(filename)
+			if lookupErr != nil {
+				ch.Warn("upload: could not find recording ID for %s: %v", filename, lookupErr)
 			}
 		})
+		if recordingID == "" {
+			// Recording row doesn't exist yet (SaveRecordingBasics failed or
+			// was skipped).  The journal entry above already preserves the
+			// link; the upsert in SaveRecordingWithLinks creates the row (and
+			// reconciles the journal) later.
+			return
+		}
+		if saveErr := server.SaveUploadLinkByIDWithFilename(recordingID, host, url, filename); saveErr != nil {
+			ch.Warn("upload: could not save link from %s for %s immediately: %v", host, filename, saveErr)
+		} else {
+			ch.Info("upload: saved link from %s for %s immediately", host, filename)
+		}
+	})
 		results = append(results, attemptResults...)
 
 		// Save journal entries for each result

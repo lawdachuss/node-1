@@ -1610,6 +1610,7 @@ func SaveJournalEntry(fileHash, filename, host, status, link string, fileSize in
 		Filename:   filename,
 		Host:       host,
 		Status:     status,
+		Link:       link,
 		ErrorMsg:   errMsg,
 		FileSize:   fileSize,
 		InstanceID: DBInstanceID(),
@@ -1631,6 +1632,7 @@ func LoadJournalByHash(fileHash string) ([]database.UploadJournal, error) {
 				FileHash:  fileHash,
 				Host:      e.Host,
 				Status:    e.Status,
+				Link:      e.Link,
 				ErrorMsg:  e.ErrMsg,
 				FileSize:  e.FileSize,
 				UpdatedAt: e.UpdatedAt,
@@ -1683,4 +1685,98 @@ func DeleteJournalByHash(fileHash string) error {
 		return nil
 	}
 	return client.DeleteJournalByHash(fileHash)
+}
+
+// ReconcileMissingUploadLinks restores upload_links rows for recordings whose
+// metadata was saved but whose per-host link save never landed, rebuilding
+// them from upload-journal successes that carry a persisted download link.
+//
+// Background: when a host upload succeeds the pipeline (a) writes a journal
+// entry and (b) immediately saves the link to the recording row.  If the
+// runner dies between (a) and (b) — or Supabase is down longer than the
+// in-flight save retries — the recording stays at zero upload_links forever.
+// On restart LoadCompletedHosts reads the journal's successes and considers
+// those hosts done, so the missing links are never re-uploaded AND never
+// re-persisted.  This sweep closes that gap: every journal success that
+// carries a link re-creates the corresponding upload_links row (idempotent
+// upsert by recording_id, host).  It is safe to run alongside active
+// pipelines — upsert semantics mean a concurrent link save ends the same way.
+//
+// Returns the number of links restored.
+func ReconcileMissingUploadLinks(limit int) int {
+	client := GetDBClient()
+	if client == nil {
+		return 0
+	}
+
+	entries, err := client.GetJournalSuccessWithLinks(limit)
+	if err != nil {
+		fmt.Printf("[WARN] reconcile: could not load journal successes: %v\n", err)
+		return 0
+	}
+	if len(entries) == 0 {
+		return 0
+	}
+
+	// Group journal successes by filename, keeping the most recent link per host.
+	byFilename := make(map[string]map[string]string) // filename -> host -> link
+	order := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.Filename == "" || e.Host == "" || e.Link == "" {
+			continue
+		}
+		if _, ok := byFilename[e.Filename]; !ok {
+			byFilename[e.Filename] = make(map[string]string)
+			order = append(order, e.Filename)
+		}
+		byFilename[e.Filename][e.Host] = e.Link
+	}
+	if len(order) == 0 {
+		return 0
+	}
+
+	restored := 0
+	for _, filename := range order {
+		links := byFilename[filename]
+
+		rec, err := client.GetRecording(filename)
+		if err != nil || rec == nil || rec.ID == "" {
+			// No recording row (e.g. the temp-file upload anomaly or the row
+			// was never created) — nothing to attach links to.
+			continue
+		}
+
+		existing, err := client.GetUploadLinkHosts(rec.ID)
+		if err != nil {
+			fmt.Printf("[WARN] reconcile: could not read links for %s: %v\n", filename, err)
+			continue
+		}
+		have := make(map[string]bool, len(existing))
+		for _, h := range existing {
+			have[h] = true
+		}
+
+		for host, link := range links {
+			if have[host] {
+				continue
+			}
+			if err := client.SaveUploadLink(&database.UploadLink{
+				RecordingID: rec.ID,
+				Host:        host,
+				URL:         link,
+				InstanceID:  DBInstanceID(),
+			}); err != nil {
+				fmt.Printf("[WARN] reconcile: restore %s/%s: %v\n", filename, host, err)
+				continue
+			}
+			have[host] = true
+			restored++
+		}
+	}
+
+	if restored > 0 {
+		fmt.Printf("[startup] reconcile: restored %d upload link(s) from journal for %d recording(s)\n", restored, len(order))
+		cacheClear()
+	}
+	return restored
 }
