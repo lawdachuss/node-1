@@ -2087,6 +2087,7 @@ type PoolAddRequest struct {
 	Username   string `json:"username" form:"username" binding:"required"`
 	Resolution int    `json:"resolution" form:"resolution"`
 	Framerate  int    `json:"framerate" form:"framerate"`
+	MaxDuration int   `json:"max_duration" form:"max_duration"`
 }
 
 // AddToPool adds a channel to the pool.  In pooled mode this creates a
@@ -2109,6 +2110,11 @@ func AddToPool(c *gin.Context) {
 	if req.Framerate == 0 {
 		req.Framerate = 60
 	}
+	// Default max_duration to the global --max-duration value (90) so newly
+	// added pool channels rotate every 1h30m unless explicitly overridden.
+	if req.MaxDuration <= 0 {
+		req.MaxDuration = 90
+	}
 	req.Username = strings.TrimSpace(req.Username)
 
 	// Duplicate guard: never add a channel that already exists anywhere.
@@ -2128,6 +2134,7 @@ func AddToPool(c *gin.Context) {
 			Username:   req.Username,
 			Framerate:  req.Framerate,
 			Resolution: req.Resolution,
+			MaxDuration: req.MaxDuration,
 			CreatedAt:  time.Now().Unix(),
 		}
 		if err := server.Manager.CreateChannel(conf, true); err != nil {
@@ -2150,6 +2157,7 @@ func AddToPool(c *gin.Context) {
 		Status:     "unassigned",
 		Resolution: req.Resolution,
 		Framerate:  req.Framerate,
+		MaxDuration: req.MaxDuration,
 	}
 
 	if err := client.BulkInsertAssignments([]database.ChannelAssignment{assignment}); err != nil {

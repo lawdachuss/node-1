@@ -377,6 +377,9 @@
             <option value="60" selected>60fps</option>
             <option value="30">30fps</option>
         </select>
+        <input type="number" id="pool-max-duration" value="90" min="0" step="1"
+               title="Rotate recording every N minutes (0 = no rotation)" class="input-field"
+               style="width:70px;padding:8px 10px" />
         <button class="btn-primary" onclick="addToPool()" id="pool-add-btn">+ Add</button>
         <span class="dup-hint" id="dup-hint">Already exists</span>
     </div>
@@ -586,13 +589,14 @@ function addToPool() {
     if (!username) return;
     var resolution = parseInt(document.getElementById('pool-resolution').value, 10);
     var framerate = parseInt(document.getElementById('pool-framerate').value, 10);
+    var maxDuration = parseInt(document.getElementById('pool-max-duration').value, 10) || 90;
     var btn = document.getElementById('pool-add-btn');
     btn.disabled = true;
     btn.textContent = '...';
     fetch('/api/pool/add', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ site: site, username: username, resolution: resolution, framerate: framerate })
+        body: JSON.stringify({ site: site, username: username, resolution: resolution, framerate: framerate, max_duration: maxDuration })
     })
     .then(function (r) {
         if (r.ok) {
