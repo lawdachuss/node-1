@@ -55,6 +55,7 @@ func TestIndexTemplateRendersCompletely(t *testing.T) {
 	out := renderTemplate(t, "index.html", &IndexData{
 		Config: &entity.Config{
 			VidaraKey:       "test-vidara-key",
+			VidMolyKey:      "test-vidmoly-key",
 			CfClearance:     "test-clearance",
 			StreamtapeLogin: "test-login",
 			StreamtapeKey:   "test-st-key",

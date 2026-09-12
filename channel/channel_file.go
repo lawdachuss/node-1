@@ -1506,6 +1506,7 @@ func configuredUploadHosts() []string {
 		cfg.MixdropEmail,
 		cfg.MixdropToken,
 		cfg.VidaraKey,
+		cfg.VidMolyKey,
 		nil,
 	)
 	return upl.AvailableHosts()
@@ -1588,6 +1589,7 @@ func uploadOrphanedFile(filePath, thumbURL, spriteURL, previewURL string, thumbM
 		cfg.MixdropEmail,
 		cfg.MixdropToken,
 		cfg.VidaraKey,
+		cfg.VidMolyKey,
 		nil, // no logger for orphan recovery
 	)
 

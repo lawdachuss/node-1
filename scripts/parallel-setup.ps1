@@ -429,6 +429,8 @@ if (-not [string]::IsNullOrWhiteSpace($env:MINI_ENV)) {
       if ($ev -match '(?m)^VOESX_API_KEY=') { $ev = $ev -replace '(?m)^VOESX_API_KEY=.*$', "VOESX_API_KEY=$env:VOESX_API_KEY" } else { $ev = $ev.TrimEnd("`r","`n") + "`nVOESX_API_KEY=$env:VOESX_API_KEY`n" } }
     if (-not [string]::IsNullOrWhiteSpace($env:VIDARA_API_KEY)) {
       if ($ev -match '(?m)^VIDARA_KEY=') { $ev = $ev -replace '(?m)^VIDARA_KEY=.*$', "VIDARA_KEY=$env:VIDARA_API_KEY" } else { $ev = $ev.TrimEnd("`r","`n") + "`nVIDARA_KEY=$env:VIDARA_API_KEY`n" } }
+    if (-not [string]::IsNullOrWhiteSpace($env:VIDMOLY_API_KEY)) {
+      if ($ev -match '(?m)^VIDMOLY_KEY=') { $ev = $ev -replace '(?m)^VIDMOLY_KEY=.*$', "VIDMOLY_KEY=$env:VIDMOLY_API_KEY" } else { $ev = $ev.TrimEnd("`r","`n") + "`nVIDMOLY_KEY=$env:VIDMOLY_API_KEY`n" } }
             if (-not [string]::IsNullOrWhiteSpace($env:AFFILIATE_WM)) {
       if ($ev -match '(?m)^AFFILIATE_WM=') { $ev = $ev -replace '(?m)^AFFILIATE_WM=.*$', "AFFILIATE_WM=$env:AFFILIATE_WM" } else { $ev = $ev.TrimEnd("`r","`n") + "`nAFFILIATE_WM=$env:AFFILIATE_WM`n" } }
     # Route Catbox image uploads through the Cloudflare Worker proxy so nodes

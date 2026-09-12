@@ -489,6 +489,7 @@ type UpdateConfigRequest struct {
 	MixdropEmail    string `json:"mixdrop_email" form:"mixdrop_email"`
 	MixdropToken    string `json:"mixdrop_token" form:"mixdrop_token"`
 	VidaraKey       string `json:"vidara_key" form:"vidara_key"`
+	VidMolyKey      string `json:"vidmoly_key" form:"vidmoly_key"`
 	StripchatPDKey  string `json:"stripchat_pdkey" form:"stripchat_pdkey"`
 	AffiliateWM     string `json:"affiliate_wm" form:"affiliate_wm"`
 }
@@ -566,8 +567,8 @@ func UpdateConfig(c *gin.Context) {
 	}
 
 	// Update uploader credentials (VOE.sx / Streamtape / Mixdrop / Vidara)
-	if req.VoeSXAPIKey != "" || req.StreamtapeLogin != "" || req.StreamtapeKey != "" || req.MixdropEmail != "" || req.MixdropToken != "" || req.VidaraKey != "" {
-		server.UpdateUploaderCredentials(req.VoeSXAPIKey, req.StreamtapeLogin, req.StreamtapeKey, req.MixdropEmail, req.MixdropToken, req.VidaraKey)
+if req.VoeSXAPIKey != "" || req.StreamtapeLogin != "" || req.StreamtapeKey != "" || req.MixdropEmail != "" || req.MixdropToken != "" || req.VidaraKey != "" || req.VidMolyKey != "" {
+			server.UpdateUploaderCredentials(req.VoeSXAPIKey, req.StreamtapeLogin, req.StreamtapeKey, req.MixdropEmail, req.MixdropToken, req.VidaraKey, req.VidMolyKey)
 	}
 
 	if err := server.SaveSettings(); err != nil {

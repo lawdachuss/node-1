@@ -32,6 +32,12 @@ func embedURLFromLink(host, link string) string {
 			return "https://vidara.so/e/" + code
 		}
 		return link
+	case "VidMoly":
+		code := link[strings.LastIndex(link, "/")+1:]
+		if code != "" {
+			return "https://vidmoly.biz/embed-" + code + ".html"
+		}
+		return link
 	}
 	return ""
 }
@@ -91,6 +97,7 @@ func (ch *Channel) uploadFile(filePath string, thumbURL, spriteURL, previewURL s
 		cfg.MixdropEmail,
 		cfg.MixdropToken,
 		cfg.VidaraKey,
+		cfg.VidMolyKey,
 		ch, // Channel implements uploader.Logger
 	)
 

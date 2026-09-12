@@ -109,6 +109,7 @@ type MultiHostUploader struct {
 	streamtape    *StreamtapeUploader
 	mixdrop       *MixdropUploader
 	vidara        *VidaraUploader
+	vidmoly       *VidMolyUploader
 	anonmp4       *AnonMP4Uploader
 	log           Logger
 	hostInitOnce  sync.Once
@@ -157,6 +158,52 @@ func isGloballyDisabled(name string) bool {
 	globallyDisabledRWM.RLock()
 	defer globallyDisabledRWM.RUnlock()
 	return globallyDisabled[name]
+}
+
+// Timed quota disables: hosts that exhaust a per-day budget (e.g. VidMoly's
+// ~50 uploads/day free cap) must be skipped for the rest of the day and then
+// re-enabled automatically. Kept at PACKAGE level so the window persists
+// across the per-file MultiHostUploader instances the channel creates (each
+// file builds a fresh uploader, so per-instance state cannot span files).
+var (
+	timedDisabled    map[string]time.Time // host name -> when it may be retried
+	timedDisabledRWM sync.RWMutex
+)
+
+// disableHostFor marks a host unavailable for dur (e.g. 24h after a daily
+// upload cap is hit). Unlike per-instance DisableHost this is package-wide
+// and automatically lifted once dur elapses.
+func disableHostFor(name string, dur time.Duration) {
+	timedDisabledRWM.Lock()
+	defer timedDisabledRWM.Unlock()
+	if timedDisabled == nil {
+		timedDisabled = map[string]time.Time{}
+	}
+	timedDisabled[name] = time.Now().Add(dur)
+}
+
+// isHostTimedOut reports whether the host is inside a timed-disable window
+// (daily quota exhausted) and must be skipped.
+func isHostTimedOut(name string) bool {
+	timedDisabledRWM.RLock()
+	defer timedDisabledRWM.RUnlock()
+	expiry, ok := timedDisabled[name]
+	return ok && time.Now().Before(expiry)
+}
+
+// hostTimedOutUntil returns when the host's timed-disable window ends (zero
+// time if the host is not currently timed-disabled).
+func hostTimedOutUntil(name string) time.Time {
+	timedDisabledRWM.RLock()
+	defer timedDisabledRWM.RUnlock()
+	return timedDisabled[name]
+}
+
+// clearTimedDisablesForTest removes all timed disables (test hook).
+func clearTimedDisablesForTest() {
+	timedDisabledRWM.Lock()
+	timedDisabled = nil
+	timedDisabledRWM.Unlock()
 }
 
 // DisableHost marks a host as unavailable for the remainder of this run (e.g.
@@ -297,6 +344,9 @@ func (m *MultiHostUploader) initHosts() {
 		if m.vidara != nil && m.vidara.keys.count() > 0 && !isGloballyDisabled("Vidara") {
 			m.hosts["Vidara"] = m.vidara.UploadWithProgress
 		}
+		if m.vidmoly != nil && m.vidmoly.keys.count() > 0 && !isGloballyDisabled("VidMoly") {
+			m.hosts["VidMoly"] = m.vidmoly.UploadWithProgress
+		}
 		// AnonMP4: always available (no API key required)
 		if m.anonmp4 != nil && !isGloballyDisabled("AnonMP4") {
 			m.hosts["AnonMP4"] = m.anonmp4.UploadWithProgress
@@ -305,7 +355,7 @@ func (m *MultiHostUploader) initHosts() {
 }
 
 // NewMultiHostUploader creates a new multi-host uploader
-func NewMultiHostUploader(voeSXAPIKey, streamtapeLogin, streamtapeKey, mixdropEmail, mixdropToken, vidaraKey string, log Logger) *MultiHostUploader {
+func NewMultiHostUploader(voeSXAPIKey, streamtapeLogin, streamtapeKey, mixdropEmail, mixdropToken, vidaraKey, vidMolyKey string, log Logger) *MultiHostUploader {
 	if log == nil {
 		log = &nilLogger{}
 	}
@@ -315,6 +365,7 @@ func NewMultiHostUploader(voeSXAPIKey, streamtapeLogin, streamtapeKey, mixdropEm
 		streamtape: NewStreamtapeUploader(streamtapeLogin, streamtapeKey),
 		mixdrop:    NewMixdropUploader(mixdropEmail, mixdropToken),
 		vidara:     NewVidaraUploader(vidaraKey),
+		vidmoly:    NewVidMolyUploader(vidMolyKey),
 		anonmp4:    NewAnonMP4Uploader(),
 		log:        log,
 	}
@@ -478,6 +529,10 @@ func (m *MultiHostUploader) UploadSelectedWithCallback(filePath string, hosts []
 			m.log.Info("upload: skipping disabled host %s for %s", name, filePath)
 			continue
 		}
+		if isHostTimedOut(name) {
+			m.log.Info("upload: skipping %s for %s — daily upload limit reached (auto re-enables at %s)", name, filePath, hostTimedOutUntil(name).Format(time.RFC3339))
+			continue
+		}
 		uploadFn, ok := m.hosts[name]
 		if !ok {
 			continue
@@ -502,6 +557,10 @@ func (m *MultiHostUploader) UploadSelectedWithCallback(filePath string, hosts []
 				m.log.Error("upload: %s failed for %s: %v", host, filePath, err)
 				if isVoeStorageFull(err) {
 					m.log.Error("upload: %s reported storage full — disabling it for the rest of this run", host)
+					m.DisableHost(host)
+				} else if isVidMolyDailyLimit(err) {
+					m.log.Error("upload: %s hit its daily upload limit — skipping it for ~24 hours (auto re-enables)", host)
+					disableHostFor(host, 24*time.Hour)
 					m.DisableHost(host)
 				} else if isUploadAuthError(err) {
 					m.log.Error("upload: %s rejected our credentials — disabling it for the rest of this run", host)
@@ -559,6 +618,10 @@ func (m *MultiHostUploader) UploadSelectedPriority(filePath string, hosts []stri
 			m.log.Info("upload: skipping disabled host %s for %s", host, filePath)
 			continue
 		}
+		if isHostTimedOut(host) {
+			m.log.Info("upload: skipping %s for %s — daily upload limit reached (auto re-enables at %s)", host, filePath, hostTimedOutUntil(host).Format(time.RFC3339))
+			continue
+		}
 		fn, ok := m.hosts[host]
 		if !ok {
 			continue
@@ -577,6 +640,10 @@ func (m *MultiHostUploader) UploadSelectedPriority(filePath string, hosts []stri
 			m.log.Error("upload: %s (priority) failed for %s: %v", host, filePath, err)
 			if isVoeStorageFull(err) {
 				m.log.Error("upload: %s reported storage full — disabling it for the rest of this run", host)
+				m.DisableHost(host)
+			} else if isVidMolyDailyLimit(err) {
+				m.log.Error("upload: %s hit its daily upload limit — skipping it for ~24 hours (auto re-enables)", host)
+				disableHostFor(host, 24*time.Hour)
 				m.DisableHost(host)
 			} else if isUploadAuthError(err) {
 				m.log.Error("upload: %s rejected our credentials — disabling it for the rest of this run", host)
