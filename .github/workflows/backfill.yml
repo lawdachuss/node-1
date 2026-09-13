@@ -1,0 +1,73 @@
+# Thumbnail Backfill — merged automated sweep, every 15 minutes.
+#
+# Brings together the two backfill systems so they run together on GitHub
+# Actions instead of on any one dev machine:
+#
+#   1. AnonMP4 sweep (scripts/anonmp4_backfill.sh)  — recovers thumbnails for
+#      recordings whose only reachable mirror is AnonMP4 (secure signed
+#      /video-api payload captured via headless Chrome CDP, assets re-hosted to
+#      Pixhost, PATCHed into recordings + preview_images).
+#   2. Remote-thumb sweep (cmd/backfillremotethumbs) — recovers thumbnails from
+#      Vidara's og:image (and Streamtape where still live), the existing fleet
+#      backfill, made runner-safe by CATBOX_PROXY_URL.
+#
+# Schedule fires on every repo that has this file on its default branch. The
+# job-level `if` below keeps only ONE repo doing the work (all node repos share
+# the same Supabase, so parallel runs would fight and hammer AnonMP4/Pixhost).
+# Enable by setting BACKFILL_RUNNER=true as a secret on the chosen repo
+# (default expectation: node-16, but it works on any node repo).
+name: Thumbnail Backfill
+run-name: Thumbnail backfill sweep ${{ github.ref_name }}
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backfill:
+    if: ${{ secrets.BACKFILL_RUNNER == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      # Streams Catbox uploads through the Cloudflare worker proxy on the
+      # runner (datacenter IPs get 412 without it) — mirrors the fleet env.
+      CATBOX_PROXY_URL: ${{ secrets.CATBOX_PROXY_URL }}
+      # CHROME_BIN is auto-detected on ubuntu runners; set only if needed.
+      # CHROME_BIN: /usr/bin/google-chrome
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Ensure headless Chrome
+        run: |
+          if ! command -v google-chrome >/dev/null && ! command -v chromium >/dev/null && ! command -v chromium-browser >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq chromium-browser || sudo apt-get install -y -qq chromium
+          fi
+          echo "chrome: $(command -v google-chrome || command -v chromium || command -v chromium-browser)"
+
+      # Merge #1 — AnonMP4 sweep (the new backfill).
+      - name: AnonMP4 thumbnail sweep
+        shell: bash
+        run: bash scripts/anonmp4_backfill.sh
+
+      # Merge #2 — existing remote-thumb (Vidara og:image / Streamtape) sweep.
+      # continue-on-error so a flaky image host never blocks the AnonMP4 run.
+      - name: Remote-thumb sweep (Vidara/Streamtape)
+        continue-on-error: true
+        run: go run ./cmd/backfillremotethumbs

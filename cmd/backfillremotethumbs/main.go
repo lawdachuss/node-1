@@ -229,6 +229,7 @@ func configFromEnv() *entity.Config {
 		SupabaseServiceRoleKey: env("SUPABASE_SERVICE_ROLE_KEY"),
 		FFmpegPath:             env("FFMPEG_PATH"),
 		Domain:                 or(env("DOMAIN"), "https://www.cb.xxx/"),
+		CatboxProxyURL:         env("CATBOX_PROXY_URL"),
 	}
 }
 
