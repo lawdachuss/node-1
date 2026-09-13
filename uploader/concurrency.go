@@ -10,9 +10,9 @@ import "sync"
 const (
 	// defaultGoFileConcurrency is higher because GoFile's fleet tolerates
 	// more parallel uploads than the smaller file hosts.
-	defaultGoFileConcurrency = 12
+	defaultGoFileConcurrency = 24
 	// defaultHostConcurrency applies to every other configured host.
-	defaultHostConcurrency = 8
+	defaultHostConcurrency = 16
 )
 
 var (

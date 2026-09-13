@@ -4,12 +4,12 @@ import "testing"
 
 // TestVMSizedConcurrencyAnchorsAtTwoVCPU verifies a 2-vCPU runner (the
 // standard GitHub-hosted windows-latest VM) gets exactly the tuned production
-// baseline: 12 retry workers, 100 UploadSem, 12 GoFile / 8 other host slots,
-// 3 pipelines per channel.
+// baseline: 24 retry workers, 256 UploadSem, 24 GoFile / 16 other host slots,
+// 6 pipelines per channel.
 func TestVMSizedConcurrencyAnchorsAtTwoVCPU(t *testing.T) {
 	r, s, g, o, p := sizedFor(2)
-	if r != 12 || s != 100 || g != 12 || o != 8 || p != 3 {
-		t.Fatalf("2 vCPU = retry %d, sem %d, gofile %d, other %d, pipelines %d; want 12, 100, 12, 8, 3",
+	if r != 24 || s != 256 || g != 24 || o != 16 || p != 6 {
+		t.Fatalf("2 vCPU = retry %d, sem %d, gofile %d, other %d, pipelines %d; want 24, 256, 24, 16, 6",
 			r, s, g, o, p)
 	}
 }

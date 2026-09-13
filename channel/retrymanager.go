@@ -45,10 +45,10 @@ var (
 	// therefore thumbnail persistence) for hours while the queue drained.
 	// VM-sized at startup via SetRetryWorkers (config.VMSizedConcurrency);
 	// this default is the 2-vCPU GitHub-hosted runner baseline, which fills
-	// both per-host tiers — GoFile's higher 12-slot cap and the 8-slot cap
+	// both per-host tiers — GoFile's higher 24-slot cap and the 16-slot cap
 	// of the other hosts.  DoWithRetry callers still wait on their result
 	// channel, so jobs simply queue when the pool is busy.
-	numWorkers = 12
+	numWorkers = 24
 )
 
 // SetRetryWorkers overrides the retry worker pool size.  Call at startup

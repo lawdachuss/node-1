@@ -57,9 +57,10 @@ const pipelineThumbnailTimeout = 15 * time.Minute
 // defaultPipelineWorkers is how many pipelines one channel's queue processes
 // concurrently.  More workers means a channel with a backlog of recordings
 // uploads several files at once instead of serially.  The global UploadSem
-// still caps total concurrent file uploads across all channels, so this only
-// increases parallelism, never violates the global cap.
-const defaultPipelineWorkers = 3
+// and the retry-worker pool still cap total concurrent file uploads across
+// all channels, so this only increases parallelism, never violates the
+// global cap.
+const defaultPipelineWorkers = 6
 
 var (
 	pipelineWorkers = defaultPipelineWorkers
@@ -403,6 +404,22 @@ func (p *Pipeline) stageUploadVideos(ch *Channel) error {
 			}
 			completedHosts = nil
 			hostsToTry = allHosts
+		} else if p.FileHash != "" {
+			// Partial skip: some hosts were skipped because the journal already
+			// has them "done", but only the all-skipped branch above restores
+			// their links into p.Links.  Pull them back here too so they report
+			// as "done" in the upload matrix (and survive into stageSaveMetadata)
+			// instead of showing "pending" for a host that already has the file.
+			if recovered := server.LoadJournalLinks(p.FileHash); len(recovered) > 0 {
+				for host, link := range recovered {
+					if p.Links[host] == "" {
+						p.Links[host] = link
+						if p.EmbedURL == "" {
+							p.EmbedURL = embedURLFromLink(host, link)
+						}
+					}
+				}
+			}
 		}
 	ch.Info("upload: %d/%d hosts already have this file — uploading to %d remaining",
 		len(completedHosts), len(allHosts), len(hostsToTry))
