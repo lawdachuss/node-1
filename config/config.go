@@ -484,6 +484,7 @@ func New(c *cli.Context) (*entity.Config, error) {
 		PerModelFolder:          c.Bool("per-model-folder"),
 		DeleteLocalAfterUpload:  c.Bool("delete-local-after-upload"),
 		OrphanCleanupInterval:   c.Int("orphan-cleanup-interval"),
+		LogRetentionDays:        c.Int("log-retention-days"),
 		DiskWarningPercent:      c.Int("disk-warning-percent"),
 		DiskCriticalPercent:     c.Int("disk-critical-percent"),
 		MaxLocalAgeDays:         c.Int("max-local-age-days"),

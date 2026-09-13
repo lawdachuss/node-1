@@ -462,6 +462,61 @@ func (c *Client) deleteByUsernamesChunked(table string, usernames []string) erro
 	return nil
 }
 
+// ============================================================================
+// LOG/STAMP RETENTION
+// ============================================================================
+
+// DeleteChannelLogsBefore removes channel_logs rows whose created_at is older
+// than cutoff.  channel_logs is a pure telemetry/log table — the 508 MB / 1.8M
+// rows accumulated by SaveLog/SaveLogBestEffort.  Deleting these does NOT touch
+// recordings, upload_links, preview_images, upload_journal, channels,
+// channel_assignments, pipeline_states or nodes (all "important metadata").
+func (c *Client) DeleteChannelLogsBefore(cutoff time.Time) (int, error) {
+	return c.deleteRowsOlderThan("channel_logs", "created_at", cutoff)
+}
+
+// DeleteDiskUsageBefore removes disk_usage rows whose recorded_at is older than
+// cutoff.  disk_usage is a pure telemetry table (the periodic SaveDiskUsage
+// snapshots) and contains no important metadata.
+func (c *Client) DeleteDiskUsageBefore(cutoff time.Time) (int, error) {
+	return c.deleteRowsOlderThan("disk_usage", "recorded_at", cutoff)
+}
+
+// deleteRowsOlderThan deletes rows from a single pure-log table whose timestamp
+// column is older than cutoff.  It mirrors the DeleteOrphanedRecordings shape:
+// repeatedly page the OLDEST matching ids (order=asc), then delete them in
+// id=in.(...) batches.  Bounded statements + tiny memory — safe for millions of
+// rows and never issues a giant unpaginated DELETE in one request.
+//
+// MUST only ever be called on log/telemetry tables (channel_logs, disk_usage).
+// Metadata tables are deliberately never reachable from here.
+func (c *Client) deleteRowsOlderThan(table, timeField string, cutoff time.Time) (int, error) {
+	const pageSize = 500
+	total := 0
+	for {
+		var ids []struct {
+			ID string `json:"id"`
+		}
+		err := c.get(fmt.Sprintf(
+			"/%s?select=id&%s=lt.%s&order=%s.asc&limit=%d",
+			table, timeField, cutoff.UTC().Format(time.RFC3339), timeField, pageSize), &ids)
+		if err != nil {
+			return total, fmt.Errorf("page old %s ids: %w", table, err)
+		}
+		if len(ids) == 0 {
+			return total, nil
+		}
+		idList := make([]string, 0, len(ids))
+		for _, r := range ids {
+			idList = append(idList, r.ID)
+		}
+		if err := c.delete(fmt.Sprintf("/%s?id=in.(%s)", table, strings.Join(idList, ","))); err != nil {
+			return total, fmt.Errorf("delete old %s batch (%d): %w", table, len(idList), err)
+		}
+		total += len(idList)
+	}
+}
+
 // DeleteChannelsNotIn removes all channel rows whose username is NOT in the
 // provided list. Pass an empty slice to delete all channels.
 //

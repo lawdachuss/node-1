@@ -308,6 +308,14 @@ func main() {
 				Value: 60,
 			},
 			&cli.IntFlag{
+				Name:    "log-retention-days",
+				Usage:   "Prune pure telemetry/log tables (channel_logs, disk_usage) older than this many days in the periodic sweep (0 = disabled; never touches recordings/upload_links/preview_images/metadata)",
+				EnvVars: []string{"LOG_RETENTION_DAYS"},
+				// 3 days matches the widely-referenced "logs are safe to drop after
+				// 3 days" rule; channel_logs is 96% old rows by volume.
+				Value: 3,
+			},
+			&cli.IntFlag{
 				Name:    "disk-warning-percent",
 				Usage:   "Log warning when disk usage exceeds this percentage (0 = disabled)",
 				EnvVars: []string{"DISK_WARNING_PERCENT"},

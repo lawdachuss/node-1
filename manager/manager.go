@@ -328,6 +328,7 @@ func (m *Manager) LoadConfig() error {
 				m.ScanThumbnails()
 				server.SyncRecordingsThumbnails()
 				server.ReconcileMissingUploadLinks(maxUploadJournalReconcile)
+				server.CleanupOldLogs(server.Config.LogRetentionDays)
 			}
 		}()
 	}
@@ -444,6 +445,7 @@ func (m *Manager) LoadPooledConfig() error {
 				channel.CleanupOrphanedFiles()
 				m.ScanThumbnails()
 				server.SyncRecordingsThumbnails()
+				server.CleanupOldLogs(server.Config.LogRetentionDays)
 			}
 		}()
 	}

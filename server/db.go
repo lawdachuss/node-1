@@ -1152,6 +1152,34 @@ func CleanupOrphanedRecordings(orphanAge time.Duration) int {
 	return deleted
 }
 
+// CleanupOldLogs prunes pure telemetry tables (channel_logs, disk_usage) older
+// than retentionDays.  It NEVER touches recordings, upload_links,
+// preview_images, upload_journal, channels, channel_assignments,
+// pipeline_states, nodes or any other important metadata.  retentionDays <= 0
+// disables the sweep.  Returns total rows pruned across both log tables.
+func CleanupOldLogs(retentionDays int) int {
+	if retentionDays <= 0 {
+		return 0
+	}
+	client := GetDBClient()
+	if client == nil {
+		return 0
+	}
+	cutoff := time.Now().UTC().Add(-time.Duration(retentionDays) * 24 * time.Hour)
+	total := 0
+	if n, err := client.DeleteChannelLogsBefore(cutoff); err != nil {
+		fmt.Printf("[WARN] log retention (channel_logs): %v\n", err)
+	} else {
+		total += n
+	}
+	if n, err := client.DeleteDiskUsageBefore(cutoff); err != nil {
+		fmt.Printf("[WARN] log retention (disk_usage): %v\n", err)
+	} else {
+		total += n
+	}
+	return total
+}
+
 // ─── Tunnels ──────────────────────────────────────────────────────────────────
 
 // SaveTunnelToDB saves a tunnel URL to Supabase
