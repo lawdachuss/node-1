@@ -36,6 +36,23 @@ if (Test-Path $cleanScript) {
   Write-Host "(CLEAN) clean-c.ps1 not found at $cleanScript"
 }
 
+# ---- Background thumbnail backfill (replaces the GitHub cron backfill.yml) ----
+# Runs the AnonMP4 + remote-thumb sweeps on a loop (default every 15 min) in a
+# hidden window for the whole session. Only hosted here now — no separate
+# backfill.yml cron. Backed by SUPABASE_URL / SUPABASE_API_KEY /
+# SUPABASE_SERVICE_ROLE_KEY / CATBOX_PROXY_URL from the step env (inherited by
+# the child process), node + Go + Chrome 146 on the runner, and the DVR's
+# RUN_DEADLINE so the sweep stops at the session boundary. Set
+# BACKFILL_RUNNER=false to keep a repo out of the fleet-wide backfill.
+$backfillScript = Join-Path $repoDir "scripts\backfill-sweep.ps1"
+if ($env:BACKFILL_RUNNER -ne 'false' -and (Test-Path $backfillScript)) {
+  $bfShell = if (Get-Command pwsh -ErrorAction SilentlyContinue) { "pwsh" } else { "powershell" }
+  $bfProc = Start-Process -FilePath $bfShell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$backfillScript`"" -WindowStyle Hidden -RedirectStandardOutput "D:\temp\backfill.log" -RedirectStandardError "D:\temp\backfill.err.log" -PassThru
+  Write-Host "(BACKFILL) background thumbnail backfill started (pid $($bfProc.Id), loop -> D:\temp\backfill.log)"; $null = [System.Console]::Out.Flush()
+} else {
+  Write-Host "(BACKFILL) backfill disabled or script missing (BACKFILL_RUNNER=$env:BACKFILL_RUNNER)"
+}
+
 Remove-Item Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:http_proxy,Env:https_proxy -ErrorAction SilentlyContinue
 # SESSION_DURATION, VIDHIDE_API_KEY, STREAMWISH_API_KEY, UPNSHARE_KEY, etc.
 # are passed via the step's env: block from GitHub secrets — $env:XXX works directly.

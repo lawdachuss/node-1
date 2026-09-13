@@ -178,7 +178,9 @@ jobs:
         run: pwsh ./scripts/prepare-cookies.ps1
 
       # 6h recording loop. Passes cookie-grab bounds so the DVR's own refresh
-      # stays within the same limits as the dedicated prep step.
+      # stays within the same limits as the dedicated prep step. The thumbnail
+      # backfill sweep (previously its own 15-min cron in backfill.yml) runs in
+      # the background of this session via scripts/backfill-sweep.ps1.
       - name: Keep Runner Alive
         shell: pwsh
         env:
