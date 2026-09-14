@@ -363,6 +363,62 @@ function Clear-NodeStatus {
     & "curl.exe" -s -o NUL -w "%{http_code}" -X PATCH $apiUrl -H "apikey: $sbKey" -H "Authorization: Bearer $sbKey" -H "Content-Type: application/json" -d $body --noproxy "*" --tlsv1.2 --doh-url "https://cloudflare-dns.com/dns-query" -m 20 2>&1 | Out-Null
   } catch {}
 }
+# Clear-NodeWebUrl blanks only the web_url column (keeps status intact) so a
+# dead session's stale tunnel link stops pointing at a vanished tunnel. Called
+# when the liveness probe catches a tunnel URL that no longer resolves. Unlike
+# Clear-NodeStatus it never flips status, so the node row stays visible as
+# online while cloudflared is being restarted.
+function Clear-NodeWebUrl {
+  param($NodeId)
+  if ([string]::IsNullOrWhiteSpace($NodeId)) { return }
+  $sbUrl = if (-not [string]::IsNullOrWhiteSpace($env:SUPABASE_URL)) { $env:SUPABASE_URL.Trim() } else { $null }
+  $sbKey = if (-not [string]::IsNullOrWhiteSpace($env:SUPABASE_SERVICE_ROLE_KEY)) { $env:SUPABASE_SERVICE_ROLE_KEY.Trim() } else { $null }
+  if (-not $sbUrl -or -not $sbKey) {
+    $sb = Get-Content "$repoDir\.env" -Raw -ErrorAction SilentlyContinue
+    if ($sb) {
+      if (-not $sbUrl -and ($sb -match '(?m)^SUPABASE_URL=(.+)$')) { $sbUrl = $matches[1].Trim() }
+      if (-not $sbKey -and ($sb -match '(?m)^SUPABASE_SERVICE_ROLE_KEY=(.+)$')) { $sbKey = $matches[1].Trim() }
+      if (-not $sbKey -and ($sb -match '(?m)^SUPABASE_API_KEY=(.+)$')) { $sbKey = $matches[1].Trim() }
+    }
+  }
+  if ([string]::IsNullOrWhiteSpace($sbUrl) -or [string]::IsNullOrWhiteSpace($sbKey)) { return }
+  if ($sbUrl -notmatch '^https?://') { $sbUrl = 'https://' + $sbUrl }
+  $sbUrl = $sbUrl.TrimEnd('/')
+  $apiUrl = "$sbUrl/rest/v1/nodes?node_id=eq.$NodeId"
+  $body = @{ web_url = "" } | ConvertTo-Json -Compress
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+  try {
+    & "curl.exe" -s -o NUL -w "%{http_code}" -X PATCH $apiUrl -H "apikey: $sbKey" -H "Authorization: Bearer $sbKey" -H "Content-Type: application/json" -d $body --noproxy "*" --tlsv1.2 --doh-url "https://cloudflare-dns.com/dns-query" -m 20 2>&1 | Out-Null
+  } catch {}
+}
+# Test-TunnelLiveness returns $true only when the published tunnel URL still
+# answers through Cloudflare's edge. A quick tunnel's hostname is created when
+# cloudflared first connects and is DELETED from DNS when the edge connection
+# lapses — cloudflared can stay alive while its hostname goes NXDOMAIN (DNS/edge
+# drop, runner network churn), which is exactly how dead web_url links got
+# advertised to Supabase. curl's exit code is authoritative because the OS
+# resolver can time out or be stale:
+#   rc 0  → resolved and answered (any HTTP status incl. CF 502 = tunnel alive)
+#   rc 6  → NXDOMAIN, the tunnel registration is gone → dead
+#   rc 7  → edge unreachable → dead
+#   rc 28 → no response in time → treated as dead (restart is cheap)
+function Test-TunnelLiveness {
+  param($url)
+  if ([string]::IsNullOrWhiteSpace($url)) { return $false }
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+  $code = "000"; $rc = 0
+  try {
+    $out = & "curl.exe" -s -o NUL -w "%{http_code}" -I $url --connect-timeout 10 -m 25 --noproxy "*" --doh-url "https://cloudflare-dns.com/dns-query" 2>$null
+    $code = "$out".Trim(); $rc = $LASTEXITCODE
+  } catch { return $false }
+  if ($rc -eq 0) { return $true }
+  $hostName = ([uri]$url).Host
+  Write-Host "(WARN) Tunnel liveness probe failed for ${hostName}: curl rc=$rc http=$code"; $null = [System.Console]::Out.Flush()
+  if ($rc -eq 6)  { Write-Host "(WARN)   → hostname no longer resolves (tunnel registration lapsed)" }
+  elseif ($rc -eq 7)  { Write-Host "(WARN)   → Cloudflare edge unreachable" }
+  elseif ($rc -eq 28) { Write-Host "(WARN)   → probe timed out" }
+  return $false
+}
 $myNodeId = Get-NodeId
 Write-Host "(OK) Node ID: $myNodeId"; $null = [System.Console]::Out.Flush()
 $cachedShortUrl = $null; $lastTunnelUrl = $null; $shortUrlJob = $null
@@ -647,12 +703,34 @@ while ($true) {
   $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
   Write-Host "[$now] $tsIp$pub (Elapsed: $([Math]::Round($elapsed/60,1))m)"; $null = [System.Console]::Out.Flush()
 
-  # ═══ Periodic web_url refresh (every 5 min) ═══
+  # ═══ Periodic web_url refresh + tunnel liveness (every 5 min) ═══
   if ($tunnelUrl -and $myNodeId) {
     if (-not $lastWebUrlUpdate) { $lastWebUrlUpdate = 0 }
     if ($elapsed - $lastWebUrlUpdate -ge 300) {
       $lastWebUrlUpdate = $elapsed
-      Update-NodeWebUrl $myNodeId "$tunnelUrl"
+      # Verify the advertised URL still answers BEFORE refreshing web_url. A
+      # quick tunnel hostname is deleted from DNS when its edge connection
+      # lapses even though cloudflared keeps running — without this the 5-min
+      # refresh keeps pushing a dead (NXDOMAIN) link to Supabase. Detect it,
+      # blank web_url, and restart cloudflared for a fresh hostname; the
+      # main-loop retry block re-extracts and re-pushes the new URL.
+      if (-not (Test-TunnelLiveness $tunnelUrl)) {
+        Write-Host "(TUNNEL-DEAD) $($tunnelUrl) no longer answering — restarting cloudflared for a fresh hostname"; $null = [System.Console]::Out.Flush()
+        Send-Notify "warn" "Tunnel URL went dead (no longer resolves/answers): $tunnelUrl — restarting cloudflared."
+        Clear-NodeWebUrl $myNodeId
+        $tunnelUrl = $null; $lastTunnelUrl = $null; $cachedShortUrl = $null
+        if ($tun) { try { $tun.Kill() } catch {}; try { $tun.WaitForExit(5000) } catch {} }
+        $stderrL = "$repoDir\tunnel-stderr.log"
+        if (Test-Path $stderrL) { Remove-Item $stderrL -Force }
+        if (Test-Path $cloudflaredPath) {
+          $tun = Start-Process -FilePath $cloudflaredPath -ArgumentList "tunnel --url http://localhost:8080 --protocol http2" -WorkingDirectory $repoDir -NoNewWindow -RedirectStandardError $stderrL -PassThru
+        }
+        if (-not $tunnelRetryCount) { $tunnelRetryCount = 0 }
+        $tunnelRetryCount = 0
+        Start-Sleep -Seconds 10
+      } else {
+        Update-NodeWebUrl $myNodeId "$tunnelUrl"
+      }
     }
   }
 
