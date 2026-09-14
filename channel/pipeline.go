@@ -553,14 +553,28 @@ func (p *Pipeline) stageUploadVideos(ch *Channel) error {
 			var lookupErr error
 			recordingID, lookupErr = server.GetRecordingID(filename)
 			if lookupErr != nil {
-				ch.Warn("upload: could not find recording ID for %s: %v", filename, lookupErr)
+				// Recording row doesn't exist yet (SaveRecordingBasics failed
+				// or was skipped).  Create it now so the upload link can be
+				// persisted immediately instead of waiting for stageSaveMetadata.
+				ch.Warn("upload: recording row missing for %s, creating basics", filename)
+				if bErr := server.SaveRecordingBasics(
+					extractUsernameFromFilename(filename),
+					filename,
+					time.Now().UTC().Format("2006-01-02T15:04:05Z"),
+					"", nil, 0, "", "", "", 0, 0, 0,
+				); bErr != nil {
+					ch.Warn("upload: could not create recording basics for %s: %v", filename, bErr)
+					return
+				}
+				recordingID, lookupErr = server.GetRecordingID(filename)
+				if lookupErr != nil {
+					ch.Warn("upload: could not find recording ID for %s after creating basics: %v", filename, lookupErr)
+				}
 			}
 		})
 		if recordingID == "" {
-			// Recording row doesn't exist yet (SaveRecordingBasics failed or
-			// was skipped).  The journal entry above already preserves the
-			// link; the upsert in SaveRecordingWithLinks creates the row (and
-			// reconciles the journal) later.
+			// Journal entry above preserves the link; stageSaveMetadata
+			// will reconcile later.  This should be extremely rare.
 			return
 		}
 		if saveErr := server.SaveUploadLinkByIDWithFilename(recordingID, host, url, filename); saveErr != nil {
@@ -856,7 +870,16 @@ func (p *Pipeline) stageCleanup(ch *Channel) error {
 	// ScanThumbnails regenerate them later.
 	dbThumb, dbSprite, dbPreview := server.VerifyRecordingThumbnails(p.Filename)
 	if !dbThumb || !dbSprite || !dbPreview {
-		ch.Warn("cleanup: keeping %s — thumbnails not in DB (thumb=%v sprite=%v preview=%v), will retry", p.Filename, dbThumb, dbSprite, dbPreview)
+		ch.Warn("cleanup: keeping %s — thumbnails not in recordings table (thumb=%v sprite=%v preview=%v), will retry", p.Filename, dbThumb, dbSprite, dbPreview)
+		return nil
+	}
+
+	// Also verify preview_images has the thumbnail.  The legacy fallback path
+	// writes recordings but may skip preview_images; without this check the
+	// local file would be deleted and ScanThumbnails could never regenerate
+	// the missing preview_images row.
+	if !server.VerifyPreviewImage(p.Filename) {
+		ch.Warn("cleanup: keeping %s — thumbnail missing in preview_images table, will retry", p.Filename)
 		return nil
 	}
 

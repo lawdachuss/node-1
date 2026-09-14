@@ -921,10 +921,10 @@ func SaveRecordingWithLinks(username, filename, timestamp, roomTitle string, tag
 	// ── Fast path: single atomic RPC (recording + links + preview) ────
 	if _, err := client.SaveRecordingWithLinksRPC(rec, uploadLinks, preview); err != nil {
 		if strings.Contains(err.Error(), "PGRST204") || strings.Contains(err.Error(), "function save_recording_with_links") {
-			return saveRecordingWithLinksLegacy(client, rec, uploadLinks, filename)
+			return saveRecordingWithLinksLegacy(client, rec, uploadLinks, preview, filename)
 		}
 		fmt.Printf("[WARN] atomic metadata RPC failed, falling back to sequential save: %v\n", err)
-		return saveRecordingWithLinksLegacy(client, rec, uploadLinks, filename)
+		return saveRecordingWithLinksLegacy(client, rec, uploadLinks, preview, filename)
 	}
 
 	cacheClear()
@@ -933,8 +933,10 @@ func SaveRecordingWithLinks(username, filename, timestamp, roomTitle string, tag
 
 // saveRecordingWithLinksLegacy is the original sequential path (SaveRecording →
 // GetRecording → SaveUploadLinks), kept as fallback when the atomic RPC is not
-// yet deployed.
-func saveRecordingWithLinksLegacy(client *database.Client, rec *database.Recording, uploadLinks []database.UploadLink, filename string) error {
+// yet deployed.  It also persists the preview_images row so that the two-table
+// thumbnail invariant (recordings.thumbnail_url ↔ preview_images.thumbnail_url)
+// is never broken by a degraded RPC fallback.
+func saveRecordingWithLinksLegacy(client *database.Client, rec *database.Recording, uploadLinks []database.UploadLink, preview *database.PreviewImage, filename string) error {
 	if err := client.SaveRecording(rec); err != nil && strings.Contains(err.Error(), "PGRST204") {
 		fmt.Printf("[WARN] end_reason column missing in Supabase — saving without it: %v\n", err)
 		rec.EndReason = ""
@@ -962,6 +964,17 @@ func saveRecordingWithLinksLegacy(client *database.Client, rec *database.Recordi
 	if len(uploadLinks) > 0 {
 		if err := client.SaveUploadLinks(uploadLinks); err != nil {
 			return fmt.Errorf("save upload links: %w", err)
+		}
+	}
+
+	// Persist preview_images so the UI's two-table thumbnail join stays intact.
+	// The atomic RPC handles this inside its transaction, but the legacy path
+	// previously skipped it — causing recordings to carry a thumbnail while
+	// preview_images remained empty, which is the root cause of missing
+	// thumbnail reports.
+	if preview != nil && (preview.ThumbnailURL != "" || preview.SpriteURL != "" || preview.PreviewURL != "") {
+		if err := client.SavePreviewImage(preview); err != nil {
+			fmt.Printf("[WARN] legacy fallback: could not save preview images for %s: %v\n", filename, err)
 		}
 	}
 
@@ -1341,6 +1354,22 @@ func DeleteChannelsNotInDB(usernames []string) error {
 	return client.DeleteChannelsNotIn(usernames)
 }
 
+// VerifyPreviewImage checks whether the preview_images row for the given
+// filename exists and carries a non-empty thumbnail URL.  The pipeline
+// cleanup calls this in addition to VerifyRecordingThumbnails so that
+// local files are never deleted when one table is missing thumbnails.
+func VerifyPreviewImage(filename string) (hasThumb bool) {
+	client := GetDBClient()
+	if client == nil {
+		return true
+	}
+	img, err := client.GetPreviewImage(filename)
+	if err != nil || img == nil {
+		return false
+	}
+	return img.ThumbnailURL != ""
+}
+
 // LoadRecordingThumbnails returns the thumbnail, sprite, and preview URLs from
 // the recordings row for a filename (empty strings when missing/not found).
 func LoadRecordingThumbnails(filename string) (thumbURL, spriteURL, previewURL string) {
@@ -1616,6 +1645,48 @@ func SyncRecordingsThumbnails() {
 	}
 	if fixed > 0 || fixedSP > 0 {
 		log.Printf("[thumb-sync] backfilled thumbnail_url onto %d recording(s) and sprite/preview onto %d", fixed, fixedSP)
+	}
+
+	// ── Reverse sweep: recordings → preview_images ────────────────────────
+	// When the legacy fallback path is used (atomic RPC unavailable), the
+	// recording gets its thumbnail but preview_images is never written.
+	// This sweep copies thumbnails from recordings INTO preview_images so
+	// the two-table invariant stays intact and ScanThumbnails never has to
+	// regenerate an asset that already exists in the DB.
+	fixedPreview := 0
+	recsWithThumbs, err := client.GetRecordingsWithThumbnails()
+	if err != nil {
+		log.Printf("[thumb-sync] could not load recordings with thumbnails: %v", err)
+	} else {
+		for i := range recsWithThumbs {
+			rec := &recsWithThumbs[i]
+			if skips[rec.Filename] {
+				continue
+			}
+			if links, ok := previews[rec.Filename]; ok && links[0] != "" {
+				// preview_images already has a thumbnail — nothing to backfill.
+				continue
+			}
+			// preview_images is missing (or has empty thumbnail) — create it
+			// from the recording row.
+			err := client.SavePreviewImage(&database.PreviewImage{
+				Filename:     rec.Filename,
+				ThumbnailURL: rec.ThumbnailURL,
+				SpriteURL:    rec.SpriteURL,
+				PreviewURL:   rec.PreviewURL,
+				UploadedAt:   time.Now().UTC().Format("2006-01-02T15:04:05Z"),
+				InstanceID:   DBInstanceID(),
+			})
+			if err != nil {
+				log.Printf("[thumb-sync] failed to backfill preview_images for %s: %v", rec.Filename, err)
+				continue
+			}
+			fixedPreview++
+			time.Sleep(pacing)
+		}
+	}
+	if fixedPreview > 0 {
+		log.Printf("[thumb-sync] backfilled preview_images from recordings for %d file(s)", fixedPreview)
 	}
 }
 

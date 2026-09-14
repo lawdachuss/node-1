@@ -671,6 +671,15 @@ func (c *Client) GetRecordingsMissingSpriteOrPreview() ([]Recording, error) {
 	return recordings, err
 }
 
+// GetRecordingsWithThumbnails returns all recordings that have a non-empty
+// thumbnail_url.  Used by the reverse-sync sweep to find recordings whose
+// thumbnails should be backfilled into preview_images.
+func (c *Client) GetRecordingsWithThumbnails() ([]Recording, error) {
+	var recordings []Recording
+	err := c.getAllPaginated("/recordings?select=id,filename,thumbnail_url,sprite_url,preview_url&thumbnail_url=not.eq.", &recordings)
+	return recordings, err
+}
+
 // HasRecordingThumbnails returns true when the recording identified by filename
 // has non-empty thumbnail_url, sprite_url, and preview_url in the database.
 // Used by the pipeline cleanup to verify thumbnails actually persisted before
