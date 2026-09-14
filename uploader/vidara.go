@@ -76,7 +76,10 @@ func (u *VidaraUploader) UploadWithProgress(filePath string, progress ProgressFu
 		return "", fmt.Errorf("Vidara API key not configured")
 	}
 
-	release := acquireHostSem("Vidara")
+	release, ok := acquireHostSem("Vidara")
+	if !ok {
+		return "", fmt.Errorf("vidara: upload slot busy — host saturated, skipped this attempt (deadline exceeded)")
+	}
 	defer release()
 
 	// Detect when the ENTIRE file body has been handed to the transport on

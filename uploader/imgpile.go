@@ -100,7 +100,10 @@ func (u *ImgPileUploader) Upload(filePath string) (string, error) {
 		return "", fmt.Errorf("imgpile: no key configured (set IMGPILE_KEY)")
 	}
 
-	release := acquireHostSem("ImgPile")
+	release, ok := acquireHostSem("ImgPile")
+	if !ok {
+		return "", fmt.Errorf("imgpile: upload slot busy — host saturated, skipped this attempt (deadline exceeded)")
+	}
 	defer release()
 
 	var lastErr error

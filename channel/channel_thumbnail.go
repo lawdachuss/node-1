@@ -29,11 +29,29 @@ const (
 	previewDuration = 6.0 // seconds
 	previewSegments = 12  // number of smooth clips to stitch (each ~0.5s)
 
-	// thumbnailAssetTimeout caps how long generateThumbnailForFile waits for
-	// any single asset (thumbnail/sprite/preview) goroutine before giving up
-	// on it. 10 minutes is generous: normal generation + image-host upload
-	// takes minutes. If exceeded, the asset is skipped and backfilled later.
-	thumbnailAssetTimeout = 10 * time.Minute
+	// thumbnailAssetTimeout caps the TOTAL time generateThumbnailForFile waits
+	// for its three asset goroutines (thumbnail/sprite/preview).  The assets
+	// run in parallel and are collected concurrently under this one budget,
+	// and each goroutine signals done the instant its FIRST host succeeds
+	// (mirrors finish in the background): generation is fast keyframe seeks,
+	// so a healthy file completes in well under a minute.  A goroutine that
+	// exceeds the cap keeps running — its onHost callback still persists late
+	// URLs to the DB — the local result just stops waiting on it.  Keeping
+	// this far below the pipeline's 15-minute thumbnail stage cap guarantees
+	// the stage can never again stall out (the seen "timed out after 10m0s"
+	// / "exceeded 15m0s" node-13 wheels came from a sequential 3×10-min wait
+	// PLUS a mirrored-upload wait for the slowest host).
+	thumbnailAssetTimeout = 3 * time.Minute
+
+	// thumbnailFFmpegAcquireTimeout bounds how long thumbnail-scoped work
+	// waits for a free lightweight ffmpeg slot.  Much shorter than the global
+	// FFmpegAcquireTimeout (5 min): a wave of sprite/preview extractions can
+	// spike the pool, and 5 minutes × (16 tiles + 12 clips + concat) per
+	// video turns a transient burst into a 10+ minute stall.  30s rides out a
+	// brief contention wave; if the pool stays saturated, individual
+	// tiles/clips degrade via the existing blank-frame fallbacks instead of
+	// stalling the pipeline.
+	thumbnailFFmpegAcquireTimeout = 30 * time.Second
 )
 
 // ThumbnailResult holds the generated thumbnail, sprite, and preview URLs
@@ -183,7 +201,7 @@ func runFFmpegParallel(workers, n int, fn func(i int) error) error {
 // the retry fails with an immediate "context deadline exceeded" even though it
 // never got a chance to run.
 func runFFmpegFresh(timeout time.Duration, args ...string) error {
-	if err := config.AcquireFFmpegFor(config.FFmpegAcquireTimeout); err != nil {
+	if err := config.AcquireFFmpegFor(thumbnailFFmpegAcquireTimeout); err != nil {
 		return err
 	}
 	defer config.ReleaseFFmpeg()
@@ -218,7 +236,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 	defer probeCancel()
 
 	var dur float64
-	if err := config.AcquireFFmpegFor(config.FFmpegAcquireTimeout); err != nil {
+	if err := config.AcquireFFmpegFor(thumbnailFFmpegAcquireTimeout); err != nil {
 		errFn("thumb: could not acquire ffmpeg slot to probe %s: %v — continuing without duration", filepath.Base(videoPath), err)
 	} else {
 		probeOut, probeErr := config.FFprobeCommandContext(probeCtx,
@@ -262,7 +280,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		} else {
 			defer os.RemoveAll(workDir)
 			seekablePath := filepath.Join(workDir, "seekable.mp4")
-			if err := config.AcquireFFmpegFor(config.FFmpegAcquireTimeout); err != nil {
+			if err := config.AcquireFFmpegFor(thumbnailFFmpegAcquireTimeout); err != nil {
 				errFn("thumb: could not acquire ffmpeg slot for seekable remux of %s: %v — extracting directly", baseName, err)
 			} else {
 				remuxErr := config.FFmpegCommandContext(remuxCtx,
@@ -396,32 +414,32 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 			return
 		}
 
-		imgUploader := uploader.NewMultiImageUploader()
-		thumbURLs := imgUploader.UploadToAllURLs(thumbJPG, func(host, url string) {
+		// StartAll launches every host in parallel; WaitForPrimary returns the
+		// instant the primary URL is known.  The remaining mirrors finish in
+		// the background, accumulating into the result maps and firing onHost
+		// per success.  sess.Wait() then keeps the temp file alive until every
+		// mirror has read it, so it can be deleted safely (mainly on
+		// Windows); the pipeline waits for this only up to the shared
+		// thumbnailAssetTimeout deadline in the collect below.
+		sess := uploader.NewMultiImageUploader().StartAll(thumbJPG, func(host, url string) {
+			mirrorsMu.Lock()
+			if thumbMirrors == nil {
+				thumbMirrors = make(map[string]string)
+			}
+			thumbMirrors[host] = url
+			mirrorsMu.Unlock()
 			if onHost != nil {
 				onHost("thumb", host, url)
 			}
 		})
-		if len(thumbURLs) > 0 {
-			mirrorsMu.Lock()
-			thumbMirrors = thumbURLs
-			mirrorsMu.Unlock()
-			// Pick the first successful URL as primary (prefer Catbox > Pixhost > freeimage.host).
-			for _, host := range []string{"Catbox", "Pixhost", "freeimage.host"} {
-				if url, ok := thumbURLs[host]; ok {
-					info("thumb: ✓ %s (uploaded to %d hosts: %s)", baseName, len(thumbURLs), host)
-					thumbDone <- url
-					return
-				}
-			}
-			// Fallback: just pick any successful URL.
-			for _, url := range thumbURLs {
-				info("thumb: ✓ %s (uploaded to %d hosts)", baseName, len(thumbURLs))
-				thumbDone <- url
-				return
-			}
+		primaryURL, primaryHost, primaryOK := sess.WaitForPrimary()
+		sess.Wait()
+		if primaryOK {
+			info("thumb: ✓ %s (primary host: %s)", baseName, primaryHost)
+			thumbDone <- primaryURL
+			return
 		}
-		errFn("thumb: upload failed for %s — all hosts rejected", baseName)
+		errFn("thumb: upload failed for %s — all hosts rejected or saturated", baseName)
 		thumbDone <- ""
 	}()
 
@@ -604,30 +622,25 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 			return
 		}
 
-		imgUploader := uploader.NewMultiImageUploader()
-		spriteURLs := imgUploader.UploadToAllURLs(spriteJPG, func(host, url string) {
+		sess := uploader.NewMultiImageUploader().StartAll(spriteJPG, func(host, url string) {
+			mirrorsMu.Lock()
+			if spriteMirrors == nil {
+				spriteMirrors = make(map[string]string)
+			}
+			spriteMirrors[host] = url
+			mirrorsMu.Unlock()
 			if onHost != nil {
 				onHost("sprite", host, url)
 			}
 		})
-		if len(spriteURLs) > 0 {
-			mirrorsMu.Lock()
-			spriteMirrors = spriteURLs
-			mirrorsMu.Unlock()
-			for _, host := range []string{"Catbox", "Pixhost", "freeimage.host"} {
-				if url, ok := spriteURLs[host]; ok {
-					info("sprite: ✓ %s (uploaded to %d hosts: %s)", baseName, len(spriteURLs), host)
-					spriteDone <- url
-					return
-				}
-			}
-			for _, url := range spriteURLs {
-				info("sprite: ✓ %s (uploaded to %d hosts)", baseName, len(spriteURLs))
-				spriteDone <- url
-				return
-			}
+		primaryURL, primaryHost, primaryOK := sess.WaitForPrimary()
+		sess.Wait()
+		if primaryOK {
+			info("sprite: ✓ %s (primary host: %s)", baseName, primaryHost)
+			spriteDone <- primaryURL
+			return
 		}
-		errFn("sprite: upload failed for %s — all hosts rejected", baseName)
+		errFn("sprite: upload failed for %s — all hosts rejected or saturated", baseName)
 		spriteDone <- ""
 	}()
 
@@ -880,62 +893,77 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 
 		previewGenerated = true
 
-		imgUploader := uploader.NewMultiImageUploader()
-		previewURLs := imgUploader.UploadToAllURLs(previewPath, func(host, url string) {
+		sess := uploader.NewMultiImageUploader().StartAll(previewPath, func(host, url string) {
+			mirrorsMu.Lock()
+			if previewMirrors == nil {
+				previewMirrors = make(map[string]string)
+			}
+			previewMirrors[host] = url
+			mirrorsMu.Unlock()
 			if onHost != nil {
 				onHost("preview", host, url)
 			}
 		})
-		if len(previewURLs) > 0 {
-			mirrorsMu.Lock()
-			previewMirrors = previewURLs
-			mirrorsMu.Unlock()
-			for _, host := range []string{"Catbox", "freeimage.host"} {
-				if url, ok := previewURLs[host]; ok {
-					info("preview: ✓ %s (uploaded to %d hosts: %s)", baseName, len(previewURLs), host)
-					previewDone <- url
-					return
-				}
-			}
-			for _, url := range previewURLs {
-				info("preview: ✓ %s (uploaded to %d hosts)", baseName, len(previewURLs))
-				previewDone <- url
-				return
-			}
+		primaryURL, primaryHost, primaryOK := sess.WaitForPrimary()
+		sess.Wait()
+		if primaryOK {
+			info("preview: ✓ %s (primary host: %s)", baseName, primaryHost)
+			previewDone <- primaryURL
+			return
 		}
-		errFn("preview: all hosts failed for %s (cosmetic — thumbnail+sprite still saved)", baseName)
+		errFn("preview: all hosts failed or saturated for %s (cosmetic — thumbnail+sprite still saved)", baseName)
 		previewDone <- ""
 	}()
 
 	// Each asset goroutine is internally bounded (per-ffmpeg-call context
-	// timeouts + image-host HTTP client timeouts + per-host semaphores), so a
-	// healthy file finishes in minutes. But the final wait must NEVER be
-	// unbounded: if anything stalls the goroutine (e.g. a future semaphore
-	// regression like the node-13 ffmpegSem wedge that froze every pipeline at
-	// thumbnail_upload), this function would hang forever and take the
-	// pipeline / orphan rescan / thumbnail backfill down with it. Each asset is
-	// capped individually; missing assets degrade to "no thumbnail" and are
-	// retried/backfilled later. The cap is generous so slow 4K files with seek
-	// retries (up to ~45-min ffmpeg budgets each) plus host uploads are never
-	// falsely abandoned.
+	// timeouts + image-host HTTP client timeouts + bounded per-host
+	// semaphore acquires + the first-host-success signal in StartAll), so a
+	// healthy file finishes in well under a minute: extraction is fast
+	// keyframe seeks and the mirror wait (sess.Wait()) is capped by each
+	// host's HTTP client timeout.  But the pipeline must NEVER ride along on
+	// a wedged mirror: the goroutine could still linger on a stuck host.
+	// The final collect therefore MUST NOT wait for the goroutines
+	// themselves — it listens on the done channels under ONE shared deadline,
+	// so when any asset floats too long the stage returns and the goroutine
+	// keeps running in the background (its onHost callback still persists late
+	// URLs to the DB, so nothing is lost; the buffered done channel lets it
+	// finish and run its temp-file cleanup instead of leaking).
+	//
+	// All three assets are collected CONCURRENTLY under that shared budget —
+	// the old sequential 3×10-min collect serialized three waits and blew the
+	// pipeline's 15-minute stage cap on node-13 ("timed out after 10m0s"
+	// then "exceeded 15m0s").  An asset that overruns the cap is abandoned
+	// locally but keeps running in the background.
+	type assetCollect struct {
+		name string
+		dst  *string
+		ch   <-chan string
+	}
+	assets := []assetCollect{
+		{"thumbnail", &result.ThumbURL, thumbDone},
+		{"sprite", &result.SpriteURL, spriteDone},
+		{"preview", &result.PreviewURL, previewDone},
+	}
+	var collectWG sync.WaitGroup
 	deadline := time.NewTimer(thumbnailAssetTimeout)
 	defer deadline.Stop()
-	waitAsset := func(name string, dst *string, ch chan string) {
-		deadline.Reset(thumbnailAssetTimeout)
-		select {
-		case *dst = <-ch:
-		case <-deadline.C:
-			errFn("%s: timed out after %s waiting for %s asset — continuing without it", baseName, thumbnailAssetTimeout, name)
-		}
+	for _, a := range assets {
+		collectWG.Add(1)
+		go func(a assetCollect) {
+			defer collectWG.Done()
+			select {
+			case *a.dst = <-a.ch:
+			case <-deadline.C:
+				errFn("%s: timed out after %s waiting for %s asset — continuing without it (late uploads still persist via onHost)", baseName, thumbnailAssetTimeout, a.name)
+			}
+		}(a)
 	}
-	waitAsset("thumbnail", &result.ThumbURL, thumbDone)
-	waitAsset("sprite", &result.SpriteURL, spriteDone)
-	waitAsset("preview", &result.PreviewURL, previewDone)
+	collectWG.Wait()
 
 	mirrorsMu.Lock()
-	result.ThumbMirrors = thumbMirrors
-	result.SpriteMirrors = spriteMirrors
-	result.PreviewMirrors = previewMirrors
+	result.ThumbMirrors = copyMap(thumbMirrors)
+	result.SpriteMirrors = copyMap(spriteMirrors)
+	result.PreviewMirrors = copyMap(previewMirrors)
 	mirrorsMu.Unlock()
 
 	return result

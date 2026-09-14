@@ -106,7 +106,10 @@ func (u *ImgboxUploader) Upload(filePath string) (string, error) {
 		return "", fmt.Errorf("imgbox: skipped — circuit breaker open after repeated failures")
 	}
 
-	release := acquireHostSem("Imgbox")
+	release, ok := acquireHostSem("Imgbox")
+	if !ok {
+		return "", fmt.Errorf("imgbox: upload slot busy — host saturated, skipped this attempt (deadline exceeded)")
+	}
 	defer release()
 
 	fi, err := os.Stat(filePath)

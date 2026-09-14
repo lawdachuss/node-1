@@ -273,6 +273,20 @@ func (p *Pipeline) stageThumbnail(ch *Channel) error {
 		spriteMirrors := copyMap(mirrors["sprite"])
 		previewMirrors := copyMap(mirrors["preview"])
 		mirrorCount := len(mirrors[assetType])
+		// Keep p.*Mirrors authoritative (monotonic) so any LATER re-save —
+		// stageSaveMetadata runs minutes later, after mirrors finished — carries
+		// the full mirror set and never shrinks what earlier callbacks persisted.
+		// Mirrors finish in the background after generateThumbnail returns, so
+		// without this sync a future save could clobber the DB's grown mirror set
+		// with the partial set known at generation time.
+		switch assetType {
+		case "thumb":
+			p.ThumbMirrors = copyMap(mirrors["thumb"])
+		case "sprite":
+			p.SpriteMirrors = copyMap(mirrors["sprite"])
+		case "preview":
+			p.PreviewMirrors = copyMap(mirrors["preview"])
+		}
 		p.mu.Unlock()
 
 		// Save primary + ALL mirrors seen so far.  Each host success
@@ -286,6 +300,7 @@ func (p *Pipeline) stageThumbnail(ch *Channel) error {
 	}
 
 	thumb := ch.generateThumbnail(p.FilePath, onHostSave)
+	p.mu.Lock()
 	// Fill in only the pieces still missing so a partial failure (e.g. the
 	// preview generated but the thumbnail did not) never discards work that
 	// already succeeded.
@@ -301,17 +316,15 @@ func (p *Pipeline) stageThumbnail(ch *Channel) error {
 	if thumb.PreviewURL != "" {
 		p.PreviewURL = thumb.PreviewURL
 	}
-	// Merge mirror URLs: callback already accumulated per-host mirrors,
-	// but generateThumbnail's result is the authoritative full set.
-	if len(thumb.ThumbMirrors) > 0 {
-		p.ThumbMirrors = thumb.ThumbMirrors
-	}
-	if len(thumb.SpriteMirrors) > 0 {
-		p.SpriteMirrors = thumb.SpriteMirrors
-	}
-	if len(thumb.PreviewMirrors) > 0 {
-		p.PreviewMirrors = thumb.PreviewMirrors
-	}
+	// Union the generator's mirror results into the onHostSave accumulation —
+	// the callback set is the authoritative superset (it keeps firing after
+	// generateThumbnail returns as background mirrors land), but the union
+	// loses nothing if a callback was dropped.  Never replace: a replace could
+	// shrink the DB's mirror set on a later stageSaveMetadata re-save.
+	p.ThumbMirrors = mergeMirrorMaps(mirrors["thumb"], thumb.ThumbMirrors)
+	p.SpriteMirrors = mergeMirrorMaps(mirrors["sprite"], thumb.SpriteMirrors)
+	p.PreviewMirrors = mergeMirrorMaps(mirrors["preview"], thumb.PreviewMirrors)
+	p.mu.Unlock()
 
 	// Final persist — covers any URLs the onHostSave callback missed
 	// (e.g. if all hosts failed and we got nothing).
@@ -728,16 +741,13 @@ func (p *Pipeline) stageSaveMetadata(ch *Channel) error {
 			p.PreviewURL = thumb.PreviewURL
 			generated = true
 		}
-		// Store mirrors from retry generation.
-		if len(thumb.ThumbMirrors) > 0 {
-			p.ThumbMirrors = thumb.ThumbMirrors
-		}
-		if len(thumb.SpriteMirrors) > 0 {
-			p.SpriteMirrors = thumb.SpriteMirrors
-		}
-		if len(thumb.PreviewMirrors) > 0 {
-			p.PreviewMirrors = thumb.PreviewMirrors
-		}
+		// Union mirrors from the retry generation into what we already have (the
+		// early onHostSave writes may have persisted a larger set).
+		p.mu.Lock()
+		p.ThumbMirrors = mergeMirrorMaps(p.ThumbMirrors, thumb.ThumbMirrors)
+		p.SpriteMirrors = mergeMirrorMaps(p.SpriteMirrors, thumb.SpriteMirrors)
+		p.PreviewMirrors = mergeMirrorMaps(p.PreviewMirrors, thumb.PreviewMirrors)
+		p.mu.Unlock()
 		if generated {
 			ch.Info("upload: generated missing presentation assets for %s (retry)", p.Filename)
 		} else {
@@ -1618,4 +1628,19 @@ func copyMap(m map[string]string) map[string]string {
 		cp[k] = v
 	}
 	return cp
+}
+
+// mergeMirrorMaps returns a new map containing every key from a and b (b wins
+// on collision).  Neither input is mutated, so it is safe to union a
+// snapshot taken under lock with a result map written by background
+// goroutines.
+func mergeMirrorMaps(a, b map[string]string) map[string]string {
+	out := make(map[string]string, len(a)+len(b))
+	for k, v := range a {
+		out[k] = v
+	}
+	for k, v := range b {
+		out[k] = v
+	}
+	return out
 }

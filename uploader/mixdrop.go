@@ -54,7 +54,10 @@ func (u *MixdropUploader) Upload(filePath string) (string, error) {
 
 // UploadWithProgress uploads a file to Mixdrop and reports progress through fn.
 func (u *MixdropUploader) UploadWithProgress(filePath string, progress ProgressFunc) (string, error) {
-	release := acquireHostSem("Mixdrop")
+	release, ok := acquireHostSem("Mixdrop")
+	if !ok {
+		return "", fmt.Errorf("mixdrop: upload slot busy — host saturated, skipped this attempt (deadline exceeded)")
+	}
 	defer release()
 
 	var lastErr error

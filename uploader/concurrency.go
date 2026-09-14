@@ -1,6 +1,9 @@
 package uploader
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // Per-host concurrency caps.  These are the primary throughput throttle for
 // uploads: each host only accepts a bounded number of simultaneous requests
@@ -35,18 +38,45 @@ var (
 	}
 )
 
-// acquireHostSem blocks until an upload slot for the named host is free and
-// returns a release function to call when the upload finishes.  Unknown hosts
-// return a no-op so they are never accidentally throttled.
-func acquireHostSem(host string) func() {
+// hostSemAcquireTimeout bounds how long acquireHostSem waits for a free
+// upload slot on a saturated host before declaring that host "busy" for the
+// file.  Bounded acquisition is mandatory: an unbounded block (the pre-fix
+// behavior) let one slow/torpedoed host queue park asset-generation and
+// pipeline goroutines forever — observed on node-13 as 10-15 minute
+// thumbnail-stage stalls and "proceeding without thumbnails".  When a host
+// is saturated we degrade gracefully (skip the host for this file; the
+// pipeline/backfill retries later) instead of parking a goroutine
+// indefinitely.
+const hostSemAcquireTimeout = 2 * time.Minute
+
+// acquireHostSem waits up to hostSemAcquireTimeout for an upload slot on the
+// named host.  It returns a non-nil release func (release, true) when a slot
+// is acquired, or (nil, false) when the host stayed saturated for the whole
+// budget — callers must then fail the host for this file (a transient
+// "busy" error → the pipeline progresses and the file is retried/backfilled
+// later).  Unknown hosts return a no-op release with ok=true so they are
+// never accidentally throttled or failed.
+func acquireHostSem(host string) (release func(), ok bool) {
 	hostSemMu.RLock()
 	sem := hostSems[host]
 	hostSemMu.RUnlock()
 	if sem == nil {
-		return func() {}
+		return func() {}, true
 	}
-	sem <- struct{}{}
-	return func() { <-sem }
+	// Fast path: slot immediately free.
+	select {
+	case sem <- struct{}{}:
+		return func() { <-sem }, true
+	default:
+	}
+	timer := time.NewTimer(hostSemAcquireTimeout)
+	defer timer.Stop()
+	select {
+	case sem <- struct{}{}:
+		return func() { <-sem }, true
+	case <-timer.C:
+		return nil, false
+	}
 }
 
 // SetHostConcurrency replaces the per-host upload semaphores with a new

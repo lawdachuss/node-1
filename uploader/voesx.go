@@ -72,7 +72,10 @@ func (u *VoeSXUploader) UploadWithProgress(filePath string, progress ProgressFun
 		return "", fmt.Errorf("VOE.sx API key not configured")
 	}
 
-	release := acquireHostSem("VOE.sx")
+	release, ok := acquireHostSem("VOE.sx")
+	if !ok {
+		return "", fmt.Errorf("voe.sx: upload slot busy — host saturated, skipped this attempt (deadline exceeded)")
+	}
 	defer release()
 
 	var lastErr error

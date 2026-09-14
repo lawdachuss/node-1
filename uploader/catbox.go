@@ -61,7 +61,10 @@ func NewCatboxUploader() *CatboxUploader {
 // Response on success: plain text URL like "https://files.catbox.moe/abc123.webp"
 // Response on error: plain text error message starting with an error description.
 func (u *CatboxUploader) Upload(filePath string) (string, error) {
-	release := acquireHostSem("Catbox")
+	release, ok := acquireHostSem("Catbox")
+	if !ok {
+		return "", fmt.Errorf("catbox: upload slot busy — host saturated, skipped this attempt (deadline exceeded)")
+	}
 	defer release()
 
 	var lastErr error

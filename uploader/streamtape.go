@@ -62,7 +62,10 @@ func (u *StreamtapeUploader) Upload(filePath string) (string, error) {
 
 // UploadWithProgress uploads a file to Streamtape and reports progress through fn.
 func (u *StreamtapeUploader) UploadWithProgress(filePath string, progress ProgressFunc) (string, error) {
-	release := acquireHostSem("Streamtape")
+	release, ok := acquireHostSem("Streamtape")
+	if !ok {
+		return "", fmt.Errorf("streamtape: upload slot busy — host saturated, skipped this attempt (deadline exceeded)")
+	}
 	defer release()
 
 	uploadURL, err := u.getUploadURL()

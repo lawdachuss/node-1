@@ -176,7 +176,10 @@ func (u *AnonMP4Uploader) Upload(filePath string) (string, error) {
 // UploadWithProgress uploads a video file to AnonMP4 and reports progress
 // through fn (called with host "AnonMP4" and cumulative bytes).
 func (u *AnonMP4Uploader) UploadWithProgress(filePath string, progress ProgressFunc) (string, error) {
-	release := acquireHostSem("AnonMP4")
+	release, ok := acquireHostSem("AnonMP4")
+	if !ok {
+		return "", fmt.Errorf("anonmp4: upload slot busy — host saturated, skipped this attempt (deadline exceeded)")
+	}
 	defer release()
 
 	fileName := filepath.Base(filePath)

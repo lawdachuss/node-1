@@ -92,7 +92,10 @@ func NewFreeImageHostUploader() *FreeImageHostUploader {
 // Fields: key, source (file), format=json
 // Response: JSON with image.url containing the direct link.
 func (u *FreeImageHostUploader) Upload(filePath string) (string, error) {
-	release := acquireHostSem("freeimage.host")
+	release, ok := acquireHostSem("freeimage.host")
+	if !ok {
+		return "", fmt.Errorf("freeimage.host: upload slot busy — host saturated, skipped this attempt (deadline exceeded)")
+	}
 	defer release()
 
 	var lastErr error

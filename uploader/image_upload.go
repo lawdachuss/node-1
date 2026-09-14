@@ -256,13 +256,22 @@ type OnSuccessFunc func(host, url string)
 // This provides maximum redundancy: even if one host goes down, the
 // thumbnail is still available on the others.
 func (m *MultiImageUploader) UploadToAll(filePath string, onHost OnSuccessFunc) []ImageUploadResult {
-	type hostJob struct {
-		name string
-		fn   func(string) (string, error)
-	}
+	sess := m.StartAll(filePath, onHost)
+	sess.Wait()
+	return sess.snapshot()
+}
 
+type hostJob struct {
+	name string
+	fn   func(string) (string, error)
+}
+
+// configuredImageHosts returns the host jobs for filePath, skipping hosts in
+// skipHosts and hosts that reject the file's format.  Shared by UploadToAll
+// and StartAll so the parallel-with-background mirror set and the
+// fire-and-forget primary path always upload to the identical host list.
+func (m *MultiImageUploader) configuredImageHosts(filePath string) []hostJob {
 	jobs := []hostJob{}
-	// Add hosts, skipping any in skipHosts
 	addJob := func(name string, fn func(string) (string, error)) {
 		if m.skipHosts != nil && m.skipHosts[name] {
 			return
@@ -287,11 +296,54 @@ func (m *MultiImageUploader) UploadToAll(filePath string, onHost OnSuccessFunc) 
 	if m.imgbb.keys.count() > 0 {
 		addJob("ImgBB", m.imgbb.Upload)
 	}
+	return jobs
+}
 
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	results := make([]ImageUploadResult, 0, len(jobs))
+// imageUploadSession tracks a set of in-flight parallel host uploads started
+// with MultiImageUploader.StartAll.  It decouples "primary URL known" from
+// "all mirrors done": WaitForPrimary returns the instant the primary URL is
+// available while the remaining host uploads (mirrors) continue in the
+// background, still firing onHost so the DB keeps gaining mirrors.  Wait
+// blocks until every host has finished (each job is bounded by the per-host
+// HTTP client timeout, retry cap and the new host-sem acquire timeout, so
+// Wait itself is finite).
+type imageUploadSession struct {
+	done    <-chan struct{}
+	primary chan ImageUploadResult // first preferred-host success
+	any     chan ImageUploadResult // first other-host success
 
+	mu   sync.Mutex
+	all  []ImageUploadResult // every job's outcome, one per host
+}
+
+// primaryHostWait is how long WaitForPrimary waits for a preferred host
+// (Catbox → Pixhost → freeimage.host) to succeed before settling for the
+// first success from any other host.
+const primaryHostWait = 15 * time.Second
+
+// primaryHostOverallTimeout is the absolute budget for WaitForPrimary.  It
+// MUST be far smaller than the thumbnailAssetTimeout the pipeline allows for
+// the whole asset, so a round of dead hosts fails the primary fast and the
+// pipeline moves on (mirrors keep running in the background either way).
+const primaryHostOverallTimeout = 60 * time.Second
+
+// StartAll begins uploading filePath to all configured hosts in parallel.
+// The returned session lets the caller wait for the first usable URL without
+// blocking on the slowest mirror host; every host still fires onHost on
+// success.  The session's mirror goroutines keep running after WaitForPrimary
+// returns, so callers must NOT delete the source file until Wait() returns.
+func (m *MultiImageUploader) StartAll(filePath string, onHost OnSuccessFunc) *imageUploadSession {
+	jobs := m.configuredImageHosts(filePath)
+	sess := &imageUploadSession{
+		primary: make(chan ImageUploadResult, 1),
+		any:     make(chan ImageUploadResult, 1),
+	}
+
+	var (
+		wg       sync.WaitGroup
+		primOnce sync.Once
+		anyOnce  sync.Once
+	)
 	for _, job := range jobs {
 		wg.Add(1)
 		go func(j hostJob) {
@@ -302,21 +354,105 @@ func (m *MultiImageUploader) UploadToAll(filePath string, onHost OnSuccessFunc) 
 			if err != nil {
 				log.Printf("UploadToAll: %s failed for %s: %v", j.name, filepath.Base(filePath), err)
 			}
-			if err == nil && url != "" && onHost != nil {
-				onHost(j.name, url)
+			if err == nil && url != "" {
+				if onHost != nil {
+					onHost(j.name, url)
+				}
+				if isPreferredPrimaryHost(j.name) {
+					primOnce.Do(func() { sess.primary <- ImageUploadResult{Host: j.name, URL: url} })
+				} else {
+					anyOnce.Do(func() { sess.any <- ImageUploadResult{Host: j.name, URL: url} })
+				}
 			}
-			mu.Lock()
-			results = append(results, ImageUploadResult{
+			sess.mu.Lock()
+			sess.all = append(sess.all, ImageUploadResult{
 				Host: j.name,
 				URL:  url,
 				Err:  err,
 			})
-			mu.Unlock()
+			sess.mu.Unlock()
 		}(job)
 	}
 
-	wg.Wait()
-	return results
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	sess.done = done
+	return sess
+}
+
+// WaitForPrimary returns as soon as a usable primary URL is known: it waits
+// up to primaryHostWait for a preferred host (Catbox → Pixhost →
+// freeimage.host), then falls back to the first success from any other host,
+// and finally gives up on a global budget rather than ever waiting for the
+// slowest host.  Mirrors keep uploading in the background regardless.  ok is
+// false only when no host succeeded within the budget (caller should treat
+// the asset's upload as failed this round).
+func (s *imageUploadSession) WaitForPrimary() (url, host string, ok bool) {
+	flush := func() (string, string, bool) {
+		select {
+		case r := <-s.primary:
+			return r.URL, r.Host, true
+		case r := <-s.any:
+			return r.URL, r.Host, true
+		default:
+			return "", "", false
+		}
+	}
+	// Wait a short grace window for a preferred host — its success yields the
+	// best primary (the host the UI/CDNs serve best).  A faster non-preferred
+	// success in the same window is still accepted; we never deliberately stall.
+	select {
+	case r := <-s.primary:
+		return r.URL, r.Host, true
+	case r := <-s.any:
+		return r.URL, r.Host, true
+	case <-s.done:
+		// All hosts already finished — flush any success that slipped in.
+		return flush()
+	case <-time.After(primaryHostWait):
+		select {
+		case r := <-s.primary:
+			return r.URL, r.Host, true
+		case r := <-s.any:
+			return r.URL, r.Host, true
+		case <-s.done:
+			return flush()
+		case <-time.After(primaryHostOverallTimeout):
+			// Hard stop: never let a round of dead hosts eat the whole asset
+			// budget.  The pipeline retries/backfills; mirrors keep going.
+			return "", "", false
+		}
+	}
+}
+
+// Wait blocks until every host upload in the session has finished.  Each job
+// is bounded (per-host HTTP client timeout, retry cap, bounded host-sem
+// acquire), so this never hangs; callers use it only to know when they may
+// delete the temporary source file.
+func (s *imageUploadSession) Wait() {
+	<-s.done
+}
+
+// snapshot returns one result per host (successes AND failures), valid once
+// Wait has returned.
+func (s *imageUploadSession) snapshot() []ImageUploadResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]ImageUploadResult, len(s.all))
+	copy(out, s.all)
+	return out
+}
+
+// isPreferredPrimaryHost reports whether the named host should be preferred
+// as the primary URL.  These three are the reliable, permanent image hosts
+// the pipeline tries in order; their success within the grace window beats a
+// fast success from a fallback-only host (ImgChest/ImgPile/Imgbox/ImgBB).
+func isPreferredPrimaryHost(host string) bool {
+	switch host {
+	case "Catbox", "Pixhost", "freeimage.host":
+		return true
+	}
+	return false
 }
 
 // UploadToAllURLs is a convenience wrapper that returns only the successful

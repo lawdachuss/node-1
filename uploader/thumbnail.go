@@ -45,7 +45,10 @@ func NewThumbnailUploader(apiKey string) *ThumbnailUploader {
 // loading the entire image into RAM.  Only the multipart preamble (headers +
 // form fields, < 512 B) is buffered in memory.
 func (t *ThumbnailUploader) Upload(thumbnailPath string) (string, error) {
-	release := acquireHostSem("Pixhost")
+	release, ok := acquireHostSem("Pixhost")
+	if !ok {
+		return "", fmt.Errorf("pixhost: upload slot busy — host saturated, skipped this attempt (deadline exceeded)")
+	}
 	defer release()
 
 	log.Printf("Uploading thumbnail to Pixhost.to: %s", thumbnailPath)

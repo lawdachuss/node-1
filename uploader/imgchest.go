@@ -64,7 +64,10 @@ func (u *ImgChestUploader) Upload(filePath string) (string, error) {
 		return "", fmt.Errorf("imgchest: no token configured (set IMGCHEST_TOKEN)")
 	}
 
-	release := acquireHostSem("ImgChest")
+	release, ok := acquireHostSem("ImgChest")
+	if !ok {
+		return "", fmt.Errorf("imgchest: upload slot busy — host saturated, skipped this attempt (deadline exceeded)")
+	}
 	defer release()
 
 	var lastErr error

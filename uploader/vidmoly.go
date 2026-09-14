@@ -71,7 +71,10 @@ func (u *VidMolyUploader) UploadWithProgress(filePath string, progress ProgressF
 		return "", fmt.Errorf("VidMoly API key not configured")
 	}
 
-	release := acquireHostSem("VidMoly")
+	release, ok := acquireHostSem("VidMoly")
+	if !ok {
+		return "", fmt.Errorf("vidmoly: upload slot busy — host saturated, skipped this attempt (deadline exceeded)")
+	}
 	defer release()
 
 	// Detect when the ENTIRE file body has been handed to the transport on

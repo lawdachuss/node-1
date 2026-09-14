@@ -68,7 +68,10 @@ func (u *GoFileUploader) Upload(filePath string) (string, error) {
 
 // UploadWithProgress uploads a file to GoFile and reports progress through fn.
 func (u *GoFileUploader) UploadWithProgress(filePath string, progress ProgressFunc) (string, error) {
-	release := acquireHostSem("GoFile")
+	release, ok := acquireHostSem("GoFile")
+	if !ok {
+		return "", fmt.Errorf("gofile: upload slot busy — host saturated, skipped this attempt (deadline exceeded)")
+	}
 	defer release()
 
 	var downloadLink string
