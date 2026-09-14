@@ -351,6 +351,12 @@ func main() {
 				EnvVars: []string{"MIN_DURATION_BEFORE_UPLOAD"},
 				Value:   1200,
 			},
+			&cli.IntFlag{
+				Name:    "min-file-size-before-upload",
+				Usage:   "Minimum file size in MB before a recording can be uploaded; smaller files are treated as crash artifacts and discarded (0 = disabled)",
+				EnvVars: []string{"MIN_FILE_SIZE_BEFORE_UPLOAD"},
+				Value:   1,
+			},
 			&cli.StringFlag{
 				Name:    "voesx-api-key",
 				Usage:   "API key for VOE.sx uploads",

@@ -781,6 +781,7 @@ func (c *Client) DeleteOrphanedRecordings(orphanAge time.Duration) (int, error) 
 
 	// 2b. For each candidate from a non-online instance, verify zero upload_links.
 	var orphanIDs []string
+	var orphanFiles []string
 	for _, rec := range candidates {
 		if rec.InstanceID != "" && online[rec.InstanceID] {
 			continue // owner node is alive — its pipeline still owns this row
@@ -792,6 +793,7 @@ func (c *Client) DeleteOrphanedRecordings(orphanAge time.Duration) (int, error) 
 		}
 		if len(links) == 0 {
 			orphanIDs = append(orphanIDs, rec.ID)
+			orphanFiles = append(orphanFiles, rec.Filename)
 		}
 	}
 
@@ -814,6 +816,32 @@ func (c *Client) DeleteOrphanedRecordings(orphanAge time.Duration) (int, error) 
 			continue
 		}
 		deleted += len(batch)
+	}
+
+	// 4. Cascade: remove the orphaned recordings' preview_images rows.  These
+	// are keyed by filename (no FK), so deleting only the recordings row leaves
+	// a stray preview_images row behind — the exact source of the ~30 orphan
+	// rows observed in the DB (a thumbnail stored on a recording that orphan
+	// cleanup then deleted).  Match by the same filename to keep the two tables
+	// consistent.
+	if deleted > 0 {
+		fileFilter := make([]string, 0, len(orphanFiles))
+		for _, f := range orphanFiles {
+			if f != "" {
+				fileFilter = append(fileFilter, f)
+			}
+		}
+		for i := 0; i < len(fileFilter); i += batchSize {
+			end := i + batchSize
+			if end > len(fileFilter) {
+				end = len(fileFilter)
+			}
+			files := fileFilter[i:end]
+			err := c.delete(fmt.Sprintf("/preview_images?filename=in.(%s)", strings.Join(files, ",")))
+			if err != nil {
+				continue
+			}
+		}
 	}
 
 	return deleted, nil

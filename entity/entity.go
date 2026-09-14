@@ -218,6 +218,7 @@ type Config struct {
 	PerModelFolder          bool
 	DeleteLocalAfterUpload  bool
 	MinDurationBeforeUpload int // seconds; 0 = disabled; videos shorter than this are deferred for merge
+	MinFileSizeBeforeUpload int // MB; 0 = disabled; files smaller than this are crash artifacts and are discarded
 	OrphanCleanupInterval   int // minutes between periodic orphan/thumbnail sweeps (0 = disabled)
 	LogRetentionDays        int // prune pure telemetry (channel_logs/disk_usage) older than this (0 = disabled, default 3)
 	DiskWarningPercent      int // log warning when disk usage exceeds this (0 = disabled, default 80)

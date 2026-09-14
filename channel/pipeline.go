@@ -1452,6 +1452,24 @@ func (pq *PipelineQueue) enqueueFile(filePath string, alreadyClaimed bool, endRe
 		fileSize = stat.Size()
 	}
 
+	// Belt-and-suspenders min-size guard (the duration/egress paths also check
+	// this): never create a recordings row or pipeline for a crash artifact.
+	// A file below min-file-size-before-upload is a truncated DVR segment, not
+	// a recording, and skipping it here prevents a permanent un-uploadable row
+	// (the observed 1,112-byte "bright_diamonds_054" became a recording with
+	// duration 0, no thumbnail, and an AnonMP4 embed that could never encode).
+	if server.Config != nil && server.Config.MinFileSizeBeforeUpload > 0 {
+		minBytes := int64(server.Config.MinFileSizeBeforeUpload) * 1024 * 1024
+		if fileSize > 0 && fileSize < minBytes {
+			pq.ch.Warn("pipeline: discarding crash-artifact %s (%d bytes < %d)", base, fileSize, minBytes)
+			if rmErr := os.Remove(filePath); rmErr != nil && !os.IsNotExist(rmErr) {
+				pq.ch.Warn("pipeline: could not delete under-sized %s: %v", base, rmErr)
+			}
+			MarkUploadDone(filePath)
+			return
+		}
+	}
+
 	pq.startOnce()
 
 	// Under lock: check stopped, track upload, create pipeline, enqueue — atomic.

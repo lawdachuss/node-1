@@ -18,6 +18,7 @@ import (
 // still cleaned.
 func TestDeleteOrphanedRecordingsSkipsOnlineNodes(t *testing.T) {
 	var deletedIDs []string
+	var deletedPreviewFiles []string
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -25,6 +26,9 @@ func TestDeleteOrphanedRecordingsSkipsOnlineNodes(t *testing.T) {
 		switch {
 		case r.Method == "DELETE" && strings.HasSuffix(path, "/recordings"):
 			deletedIDs = parseIDInFilter(r.URL)
+			w.Write([]byte(`[]`))
+		case r.Method == "DELETE" && strings.HasSuffix(path, "/preview_images"):
+			deletedPreviewFiles = parseFilenameInFilter(r.URL)
 			w.Write([]byte(`[]`))
 		case strings.HasSuffix(path, "/nodes"):
 			json.NewEncoder(w).Encode([]Node{
@@ -38,9 +42,9 @@ func TestDeleteOrphanedRecordingsSkipsOnlineNodes(t *testing.T) {
 			q := r.URL.Query()
 			if q.Get("thumbnail_url") == "is.null" {
 				json.NewEncoder(w).Encode([]Recording{
-					{ID: "rec-alive-1", InstanceID: "node-1", CreatedAt: time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)},
-					{ID: "rec-alive-9", InstanceID: "node-9", CreatedAt: time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)},
-					{ID: "rec-dead", InstanceID: "node-gone", CreatedAt: time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)},
+					{ID: "rec-alive-1", Username: "alice", Filename: "alice_2026-01-01_12-00-00.mp4", InstanceID: "node-1", CreatedAt: time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)},
+					{ID: "rec-alive-9", Username: "bob", Filename: "bob_2026-01-01_12-00-00.mp4", InstanceID: "node-9", CreatedAt: time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)},
+					{ID: "rec-dead", Username: "carol", Filename: "carol_2026-01-01_12-00-00.mp4", InstanceID: "node-gone", CreatedAt: time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)},
 				})
 				return
 			}
@@ -66,6 +70,22 @@ func TestDeleteOrphanedRecordingsSkipsOnlineNodes(t *testing.T) {
 	if len(deletedIDs) != 1 || deletedIDs[0] != "rec-dead" {
 		t.Fatalf("expected only rec-dead to be deleted, got %v", deletedIDs)
 	}
+	if len(deletedPreviewFiles) != 1 || deletedPreviewFiles[0] != "carol_2026-01-01_12-00-00.mp4" {
+		t.Fatalf("expected the dead recording's preview_images row to be cascaded, got %v", deletedPreviewFiles)
+	}
+}
+
+// parseFilenameInFilter extracts filenames from an ?filename=in.(...) DELETE filter.
+func parseFilenameInFilter(u *url.URL) []string {
+	inner := u.Query().Get("filename")
+	if !strings.HasPrefix(inner, "in.(") || !strings.HasSuffix(inner, ")") {
+		return nil
+	}
+	inner = inner[len("in.(") : len(inner)-1]
+	if inner == "" {
+		return nil
+	}
+	return strings.Split(inner, ",")
 }
 
 // parseIDInFilter extracts ids from an ?id=in.(...) DELETE filter.

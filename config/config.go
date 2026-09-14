@@ -489,6 +489,7 @@ func New(c *cli.Context) (*entity.Config, error) {
 		DiskCriticalPercent:     c.Int("disk-critical-percent"),
 		MaxLocalAgeDays:         c.Int("max-local-age-days"),
 		MinDurationBeforeUpload: c.Int("min-duration-before-upload"),
+		MinFileSizeBeforeUpload: c.Int("min-file-size-before-upload"),
 		VoeSXAPIKey:             c.String("voesx-api-key"),
 		StreamtapeLogin:         c.String("streamtape-login"),
 		StreamtapeKey:           c.String("streamtape-key"),

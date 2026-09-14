@@ -860,6 +860,26 @@ func resolveMinDurationBeforeUpload(username string) int {
 // duration we cannot confirm.  When the threshold is disabled (<=0) this is a
 // no-op.
 func discardIfBelowMinDuration(username, path string) bool {
+	// Hard floor: a file smaller than min-file-size-before-upload (default 1MB)
+	// can only be a crash artifact — a truncated/failed segment written by a
+	// dying DVR, not a real recording.  Such a file cannot probe a valid
+	// duration or be encoded into a thumbnail, so the duration gate above
+	// would keep it forever (probe failure => keep) and it would become a
+	// permanent, un-backfillable recordings row like the observed 1,112-byte
+	// "bright_diamonds_054" that AnonMP4 could never encode.  Discard these
+	// unconditionally, independent of the min-duration setting.
+	if server.Config != nil && server.Config.MinFileSizeBeforeUpload > 0 {
+		minBytes := int64(server.Config.MinFileSizeBeforeUpload) * 1024 * 1024
+		if st, statErr := os.Stat(path); statErr == nil && st.Size() < minBytes {
+			if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+				recoveryLogf(path, "min-size: could not delete under-sized file %d bytes (< %d): %v — leaving it un-uploaded", st.Size(), minBytes, rmErr)
+				return true // still treated as discarded: do not upload
+			}
+			recoveryLogf(path, "min-size: discarded crash-artifact recording %d bytes (< %d bytes)", st.Size(), minBytes)
+			return true
+		}
+	}
+
 	minDur := resolveMinDurationBeforeUpload(username)
 	if minDur <= 0 {
 		return false
