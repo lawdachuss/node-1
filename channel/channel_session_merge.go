@@ -117,11 +117,15 @@ func (ch *Channel) trySessionMerge(finalPath, endReason string) bool {
 		merged, err := mergeTwoFiles(prev.path, finalPath)
 		if err != nil {
 			// Merge failed: keep both files and let the normal path upload them
-			// individually so nothing is lost.
-			ch.Error("session merge %s + %s failed: %s — uploading separately", filepath.Base(prev.path), filepath.Base(finalPath), err.Error())
+			// individually so nothing is lost.  Release prev's in-flight marker
+			// too — the log line says "uploading separately", so dropping only
+			// the map entry (the old behavior) leaked prev as a stranded file:
+			// still marked in-flight, never enqueued, invisible to every scan.
+			ch.Error("session merge %s + %s failed: %s — uploading both separately", filepath.Base(prev.path), filepath.Base(finalPath), err.Error())
 			sessionMergeMu.Lock()
 			delete(sessionMergeByUser, user)
 			sessionMergeMu.Unlock()
+			MarkUploadDone(prev.path)
 			return false
 		}
 		MarkUploadInFlight(merged)
@@ -145,10 +149,13 @@ func (ch *Channel) trySessionMerge(finalPath, endReason string) bool {
 		}
 		merged, err := mergeTwoFiles(prev.path, finalPath)
 		if err != nil {
-			ch.Error("session merge (end) %s + %s failed: %s — uploading separately", filepath.Base(prev.path), filepath.Base(finalPath), err.Error())
+			// Same leak guard as the continuation branch: release the parked
+			// file's marker so both halves actually reach the upload path.
+			ch.Error("session merge (end) %s + %s failed: %s — uploading both separately", filepath.Base(prev.path), filepath.Base(finalPath), err.Error())
 			sessionMergeMu.Lock()
 			delete(sessionMergeByUser, user)
 			sessionMergeMu.Unlock()
+			MarkUploadDone(prev.path)
 			return false
 		}
 		sessionMergeMu.Lock()
@@ -171,6 +178,44 @@ func (ch *Channel) flushSessionEntry(e *sessionMergeEntry) {
 		return
 	}
 	ch.MoveToOutputDir(e.path, "max duration or filesize reached")
+}
+
+// FlushHeldSessionMerge releases the file this channel parked in the
+// session-merge hold, if any, by uploading it on its own.
+//
+// The hold is normally released by the NEXT cycle of the same session (a merge
+// or a max-duration flush).  But when the stream ends with no further cycle —
+// the HLS session expired and the channel went offline, or the final file was
+// empty and deleted — nothing ever merges into the parked file.  It used to sit
+// in the map forever: marked in-flight (so every re-claim hit the
+// "already uploading — skipping duplicate" early-out), never enqueued, no
+// recordings row, invisible to every recovery scan, until the runner was torn
+// down and the disk wiped.  Called from ProcessPending, so every channel-stop
+// handoff and session-boundary drain releases the hold before its uploads are
+// awaited.
+func (ch *Channel) FlushHeldSessionMerge() {
+	if ch.Config == nil {
+		return
+	}
+	user := ch.Config.Username
+	lock := sessionMergeLock(user)
+	lock.Lock()
+	defer lock.Unlock()
+
+	sessionMergeMu.Lock()
+	e := sessionMergeByUser[user]
+	delete(sessionMergeByUser, user)
+	sessionMergeMu.Unlock()
+
+	if e == nil || e.path == "" {
+		return
+	}
+	if _, err := os.Stat(e.path); err != nil {
+		return
+	}
+	ch.Info("session merge: flushing held recording %s — no further merge will occur, uploading on its own", filepath.Base(e.path))
+	MarkUploadDone(e.path)
+	ch.flushSessionEntry(e)
 }
 
 // mergeTwoFiles concatenates a then b into a single MP4/MKV via ffmpeg's concat

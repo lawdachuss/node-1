@@ -712,6 +712,17 @@ func (ch *Channel) ProcessPending() {
 		ch.processPendingQueue()
 	}
 	ch.cleanupMu.Unlock()
+
+	// Release the session-merge hold, if any, BEFORE awaiting uploads: a held
+	// file whose session produced no further cycle (offline after token
+	// expiry, empty/deleted final file) would otherwise stay parked forever —
+	// in-flight-marked, never enqueued, no recordings row — until the runner's
+	// disk was wiped.  After pendingFiles have been processed there is no
+	// upcoming cycle that could merge into the hold on this process, so the
+	// only safe release is an individual upload.  Every stop path (handoff
+	// Stop, session-boundary drain) funnels through here.
+	ch.FlushHeldSessionMerge()
+
 	ch.UploadWg.Wait()
 }
 
