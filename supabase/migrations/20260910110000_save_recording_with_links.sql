@@ -98,12 +98,16 @@ BEGIN
   END IF;
 
   -- ── 3. Preview images ──────────────────────────────────────────────
+  -- recording_id ties the preview_images row to the recording just upserted
+  -- so FK-based joins (preview_images.recording_id → recordings.id) work.
+  -- Without it every row stays NULL and consumers cannot link the two tables.
   IF p_preview IS NOT NULL THEN
     INSERT INTO preview_images (
-      filename, thumbnail_url, sprite_url, preview_url,
+      recording_id, filename, thumbnail_url, sprite_url, preview_url,
       thumbnail_mirrors, sprite_mirrors, preview_mirrors,
       uploaded_at, instance_id
     ) VALUES (
+      v_id,
       v_filename,
       p_preview->>'thumbnail_url',
       p_preview->>'sprite_url',
@@ -115,6 +119,7 @@ BEGIN
       p_preview->>'instance_id'
     )
     ON CONFLICT (filename) DO UPDATE SET
+      recording_id      = EXCLUDED.recording_id,
       thumbnail_url     = EXCLUDED.thumbnail_url,
       sprite_url        = EXCLUDED.sprite_url,
       preview_url       = EXCLUDED.preview_url,

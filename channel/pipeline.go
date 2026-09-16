@@ -54,6 +54,23 @@ const maxPipelineRetries = 3
 // (deadlocked ffmpeg, image-host outage) and we shouldn't block the pipeline.
 const pipelineThumbnailTimeout = 15 * time.Minute
 
+// pipelineUploadTimeout bounds how long the video-upload leg of the
+// thumbnail_upload stage may run before the pipeline gives up and fails for
+// retry.  Unlike the thumbnail leg we CANNOT proceed without the upload —
+// stageSaveMetadata needs the download links — but a wedged upload goroutine
+// (upload-semaphore starvation, a deadlocked host HTTP client) must never
+// freeze the pipeline FOREVER, which is exactly the production wedge seen on
+// node-13 (pipelines stuck at thumbnail_upload for days, disk filling while
+// recordings never saved metadata).
+//
+// A healthy upload is bounded far tighter: per-host HTTP clients cap at 120
+// minutes and DoWithRetry caps at maxChannelUploadAttempts, so a multi-GB
+// file normally finishes in tens of minutes.  3 hours is generous headroom
+// that still guarantees a wedged upload cannot hold the pipeline overnight.
+// On expiry the pipeline fails and the retry re-queues later; the upload
+// journal keeps already-succeeded hosts from ever being re-pushed.
+const pipelineUploadTimeout = 3 * time.Hour
+
 // defaultPipelineWorkers is how many pipelines one channel's queue processes
 // concurrently.  More workers means a channel with a backlog of recordings
 // uploads several files at once instead of serially.  The global UploadSem
@@ -1253,11 +1270,19 @@ func (pq *PipelineQueue) processPipeline(p *Pipeline) {
 			err = p.stageUploadVideos(ch)
 		}()
 
-		// Await the video upload FIRST and without a timeout: abandoning an
+		// Await the video upload FIRST and with a hard cap: abandoning an
 		// in-flight upload could let a later stage delete a file that is
 		// still being pushed to hosts. The upload is bounded anyway (retry
-		// workers with attempt caps and per-host HTTP client timeouts).
-		uploadErr = <-uploadDone
+		// workers with attempt caps and per-host HTTP client timeouts), and
+		// pipelineUploadTimeout guarantees a wedged upload goroutine (semaphore
+		// starvation, deadlocked host) cannot freeze this stage forever the
+		// way the node-13 production wedge did.
+		select {
+		case uploadErr = <-uploadDone:
+		case <-time.After(pipelineUploadTimeout):
+			ch.Error("pipeline: upload stage for %s exceeded %s — failing for retry (journal preserves completed hosts)", filename, pipelineUploadTimeout)
+			uploadErr = fmt.Errorf("upload stage timed out after %s", pipelineUploadTimeout)
+		}
 
 		// If the video upload failed there is nothing to advance — fail fast
 		// and let the retry re-queue; do not wait out the thumbnail cap first.

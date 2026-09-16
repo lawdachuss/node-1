@@ -13,6 +13,10 @@
 #   2. Remote-thumb sweep — cmd/backfillremotethumbs recovers Vidara og:image
 #      (and Streamtape where still live) thumbnails, made runner-safe by
 #      CATBOX_PROXY_URL.
+#   3. Sync-thumbs sweep — cmd/syncthumbs copies the thumbnail/sprite/preview
+#      URLs from preview_images onto recordings rows whose thumbnail_url is NULL
+#      (pipelines that wedged at thumbnail_upload never reached save_metadata).
+#      Pure DB sync: idempotent, no image-host uploads.
 #
 # This is the Windows-runner equivalent of scripts/anonmp4_backfill.sh (bash +
 # jq), reimplemented with curl.exe / PowerShell JSON / node / go run — all
@@ -177,6 +181,20 @@ function Invoke-RemoteThumb {
   Bf-Log "remote-thumb: exit $LASTEXITCODE"
 }
 
+# 3. Sync-thumbs sweep — cmd/syncthumbs copies the thumbnail/sprite/preview URLs
+#    from preview_images onto the recordings row where recordings.thumbnail_url is
+#    still NULL (the pipeline that owned the file wedged at thumbnail_upload and
+#    never reached save_metadata). Pure DB sync, no regeneration or image-host
+#    uploads, so it is idempotent and cheap when nothing is missing. Needs
+#    SUPABASE_URL + SUPABASE_API_KEY (already in the step env) and reads .env
+#    from the repo dir as fallback. go run is fine: the source ships with the
+#    repo and the other sweeps compile the same way.
+function Invoke-SyncThumbs {
+  Bf-Log 'syncthumbs: running cmd/syncthumbs...'
+  & go run ./cmd/syncthumbs
+  Bf-Log "syncthumbs: exit $LASTEXITCODE"
+}
+
 $cycle = 0
 $next = $start
 while ($true) {
@@ -186,6 +204,7 @@ while ($true) {
   Bf-Log "backfill cycle $cycle starting (elapsed $([Math]::Round(($now - $start) / 60, 1))m)"
   try { Invoke-AnonMp4 $work } catch { Bf-Log "anonmp4 sweep failed: $_" }
   try { Invoke-RemoteThumb } catch { Bf-Log "remote-thumb sweep failed: $_" }
+  try { Invoke-SyncThumbs } catch { Bf-Log "syncthumbs sweep failed: $_" }
 
   $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
   $remaining = $deadline - $now

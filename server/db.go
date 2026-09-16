@@ -973,6 +973,7 @@ func saveRecordingWithLinksLegacy(client *database.Client, rec *database.Recordi
 	// preview_images remained empty, which is the root cause of missing
 	// thumbnail reports.
 	if preview != nil && (preview.ThumbnailURL != "" || preview.SpriteURL != "" || preview.PreviewURL != "") {
+		preview.RecordingID = savedRec.ID
 		if err := client.SavePreviewImage(preview); err != nil {
 			fmt.Printf("[WARN] legacy fallback: could not save preview images for %s: %v\n", filename, err)
 		}
@@ -1276,6 +1277,15 @@ func SavePreviewLinks(filename, thumbnailURL, spriteURL, previewURL string, thum
 		PreviewMirrors:   previewMirrors,
 		UploadedAt:       time.Now().UTC().Format("2006-01-02T15:04:05Z"),
 		InstanceID:       DBInstanceID(),
+	}
+
+	// Best-effort FK: the recordings row for this filename is normally written
+	// by SaveRecordingBasics before thumbnails upload, so attach recording_id
+	// now rather than leaving the row orphaned.  If the lookup fails (row not
+	// created yet, DB hiccup) the save still succeeds — stageSaveMetadata's
+	// save_recording_with_links upsert backfills recording_id via ON CONFLICT.
+	if recID, ridErr := GetRecordingID(filename); ridErr == nil {
+		img.RecordingID = recID
 	}
 
 	if err := client.SavePreviewImage(img); err != nil {
