@@ -948,6 +948,55 @@ func moveToPendingDir(filePath, username string) error {
 	return os.Rename(filePath, dest)
 }
 
+// recoverConsumedMergeInput handles a stray "<stable video>.consumed" file left
+// by a re-merge that failed to publish AND restore.  It returns the name to
+// classify as a normal main video ("" = handled/deferred, no classification):
+//   - restore: renames the stray back to its original name when that name is
+//     free (the publish rename failed, so a is the only copy of that content);
+//   - dedup: removes the stray when the published merge already occupies the
+//     stable name — the published merge is a strict SUPERSET of it (old merged
+//     file + the next cycle), so dropping it is safe, never a loss;
+//   - defer: leaves it in place when it is too recent (a live re-merge may be
+//     staging it right now) or locked, for a later scan.
+//
+// Renaming onto an occupied destination is never done: on POSIX os.Rename
+// would silently OVERWRITE the freshly published merge, destroying it.
+func recoverConsumedMergeInput(dir, name string) string {
+	bare := strings.TrimSuffix(name, ".consumed")
+	if bare == "" {
+		return ""
+	}
+	path := filepath.Join(dir, name)
+
+	if st, serr := os.Stat(path); serr == nil && time.Since(st.ModTime()) < orphanSettleWindow {
+		return "" // a live re-merge staged this file a moment ago — don't race it
+	}
+
+	dest := filepath.Join(dir, bare)
+	if _, err := os.Stat(dest); err == nil {
+		// Superseded by the published merge (whose content contains it): drop
+		// the duplicate once the OS releases it.
+		if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+			recoveryLogf(bare, "recovery: consumed duplicate of %s could not be removed (locked?) — leaving for the next scan: %v", bare, rmErr)
+		} else {
+			recoveryLogf(bare, "recovery: removed consumed duplicate of published merge %s", bare)
+		}
+		return ""
+	} else if !os.IsNotExist(err) {
+		// Cannot confirm the stable name is free — never risk renaming over a
+		// possibly-present published merge.
+		recoveryLogf(bare, "recovery: could not stat destination %s — leaving stranded input for the next scan: %v", bare, err)
+		return ""
+	}
+
+	if err := os.Rename(path, dest); err != nil {
+		recoveryLogf(bare, "recovery: stranded merge input %s could not be restored — leaving for the next scan: %v", name, err)
+		return ""
+	}
+	recoveryLogf(bare, "recovery: restored stranded merge input %s -> %s; uploading normally", name, bare)
+	return bare
+}
+
 // CleanupOrphanedFiles processes orphaned sidecar files left behind by
 // cancelled or crashed post-processing runs. Instead of deleting them,
 // it runs them through the full pipeline: mux (if split A/V), generate
@@ -992,6 +1041,21 @@ func CleanupOrphanedFiles() {
 			}
 			name := e.Name()
 			path := filepath.Join(dir, name)
+
+			// Recover stray re-merge inputs parked under a ".consumed" suffix
+			// (a re-merge that failed to publish AND restore).  Restored files
+			// fall through to the normal main-video classification and are
+			// uploaded like any stranded recording; duplicates of a published
+			// merge are dropped.
+			if strings.HasSuffix(name, ".consumed") {
+				if recovered := recoverConsumedMergeInput(dir, name); recovered != "" {
+					name = recovered
+					path = filepath.Join(dir, recovered)
+				} else {
+					continue
+				}
+			}
+
 			ext := strings.ToLower(filepath.Ext(name))
 
 			switch {

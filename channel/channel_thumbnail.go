@@ -301,6 +301,32 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		}
 	}
 
+	// A failed first probe (dur == 0) would make the sprite sample only the
+	// first 150 s and the preview take the bounded fallback path.  The remuxed
+	// faststart .mp4 probes reliably — re-probe it so long .ts recordings still
+	// get full-cover sprites and properly segmented previews.
+	if dur <= 0 && workPath != videoPath {
+		if err := config.AcquireFFmpegFor(thumbnailFFmpegAcquireTimeout); err != nil {
+			errFn("thumb: could not acquire ffmpeg slot to re-probe remuxed %s: %v", baseName, err)
+		} else {
+			reprobeCtx, reprobeCancel := context.WithTimeout(context.Background(), 60*time.Second)
+			reprobeOut, reprobeErr := config.FFprobeCommandContext(reprobeCtx,
+				"-v", "error",
+				"-show_entries", "format=duration",
+				"-of", "default=noprint_wrappers=1:nokey=1",
+				workPath,
+			).Output()
+			reprobeCancel()
+			config.ReleaseFFmpeg()
+			if reprobeErr == nil {
+				if d, parseErr := strconv.ParseFloat(strings.TrimSpace(string(reprobeOut)), 64); parseErr == nil && d > 0 {
+					dur = d
+					info("thumb: re-probed remuxed seekable %s duration: %.0fs", baseName, dur)
+				}
+			}
+		}
+	}
+
 	thumbDone := make(chan string, 1)
 	spriteDone := make(chan string, 1)
 	previewDone := make(chan string, 1)
@@ -491,7 +517,12 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 			}
 		} else {
 			// No duration available — fall back to fixed 10 s spacing like
-			// the old fps=1/10 filter did.
+			// the old fps=1/10 filter did.  For a long recording this samples
+			// only the first ~2.5 minutes; duration probing (including the
+			// remuxed re-probe above) normally succeeds, so this is a last
+			// resort that keeps the grid usable rather than skipping the
+			// sprite entirely.
+			errFn("sprite: duration unknown for %s — tiles use fixed 10 s spacing (covers only the first %.0fs", baseName, 10.0*float64(spriteFrames))
 			for i := range positions {
 				positions[i] = 10.0 * float64(i)
 			}
@@ -710,11 +741,21 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 
 		var err error
 		if dur <= previewDuration || dur <= 0 {
-			// Short or unmeasurable video — no segmenting needed, just scale.
-			// libwebp needs a constant frame rate, so -r 15 forces CFR.
-			err = runFFmpegFresh(previewTimeout,
-				"-y",
-				"-i", workPath,
+			// Short known video (0 < dur <= previewDuration) — play the whole
+			// thing at normal speed.  libwebp needs a constant frame rate, so
+			// -r 15 forces CFR.
+			// Unknown duration (probe failed): NEVER transcode a possibly
+			// multi-hour recording in full just because the probe failed —
+			// that turned into a 45-minute full-file webp encode.  Bound the
+			// sample to the first previewDuration seconds: identical for
+			// genuinely short videos, and it caps a long recording at 6 s of
+			// work.
+			args := []string{"-y", "-i", workPath}
+			if dur <= 0 {
+				errFn("preview: duration unknown for %s — bounding preview to the first %.0fs", baseName, previewDuration)
+				args = append(args, "-t", fmt.Sprintf("%.2f", previewDuration))
+			}
+			args = append(args,
 				"-vf", fmt.Sprintf("scale=%d:-2:flags=lanczos", previewWidth),
 				"-c:v", "libwebp",
 				"-lossless", "0",
@@ -723,6 +764,7 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 				"-an",
 				previewPath,
 			)
+			err = runFFmpegFresh(previewTimeout, args...)
 		} else {
 			// Extract 12 short clips via keyframe seeks into a temp dir, then
 			// concat them and run ONE final WEBP encode.  Each clip is tiny

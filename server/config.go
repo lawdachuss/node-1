@@ -240,10 +240,21 @@ func validPersistedValue(s string) string {
 // node a deterministic, node-ID-derived offset so deadlines are spread across
 // the fleet and migration always has healthy targets.
 const (
-	// ciSessionStaggerSpread bounds the offset on CI runners, which have a
-	// hard 6h kill and a 348m self-cancel: the offset must stay tiny so no
-	// node's staggered duration crosses the buffer and gets killed mid-file.
-	ciSessionStaggerSpread = 10 * time.Minute
+	// ciSessionStaggerSpread bounds the deadline offset between CI runners.
+	// On CI the offset is SUBTRACTED from the session duration (see
+	// staggerSessionDuration): deadlines spread across the fleet while the
+	// shortest-drain node keeps the full 360m-kill headroom (25m for the
+	// 335m fallback, 40m for a 320m central value).  "Imminent" is monotone
+	// — a node stays in the migration set until its deadline passes — so the
+	// win is not fewer nodes inside the window but ROLLOVER: with a 30-minute
+	// spread the 18 runners' teardown/re-registration cycles roll over 20+
+	// minutes instead of arriving as one synchronized wave.  The old
+	// 10-minute ADD spread fit every deadline inside the 15-minute window at
+	// the same minute, so the whole fleet entered migration together, every
+	// reborn node became imminent again within minutes, and deadline
+	// migration never had a healthy non-imminent target to hand channels to
+	// (the fleet-wide "channel stopped (handoff)" wave + disk wipes).
+	ciSessionStaggerSpread = 30 * time.Minute
 	// permanentSessionStaggerSpread bounds the offset on permanent nodes (no
 	// hard kill). 240 minutes spreads the 15-minute migration windows of a
 	// ~16-node fleet so they essentially never overlap, keeping healthy
@@ -251,20 +262,52 @@ const (
 	permanentSessionStaggerSpread = 240 * time.Minute
 )
 
-// staggerSessionDuration returns d plus a deterministic per-node offset derived
-// from the node ID (fnv hash mod the spread). The offset is stable across
-// restarts and session cycles, so the fleet's relative deadline spacing never
-// collapses back to synchronized. On CI runners the spread is capped small to
-// respect the workflow's hard kill; on permanent nodes it can be large enough
-// to keep migration windows disjoint.
+// staggerNodeKey returns the identifier that drives the per-node deadline
+// offset.  NODE_ID is the fleet contract; when it is unset the hostname is
+// preferred over detectNodeID() because on CI every runner shares the same
+// GITHUB_REPOSITORY — hashing that would give every runner of a repo the SAME
+// offset, silently reintroducing the synchronized-deadline wave the stagger
+// exists to break.  GitHub runner hostnames are unique per runner.  The
+// timestamp fallback in detectNodeID() is avoided here too: an offset that
+// changes every restart would destabilize the persisted session deadline.
+func staggerNodeKey() string {
+	if id := strings.TrimSpace(os.Getenv("NODE_ID")); id != "" && id != "-" {
+		return id
+	}
+	if host, err := os.Hostname(); err == nil && host != "" {
+		return host
+	}
+	return detectNodeID()
+}
+
+// staggerSessionDuration returns d plus or minus a deterministic per-node
+// offset derived from the node id (fnv hash mod the spread). The offset is
+// stable across restarts and session cycles, so the fleet's relative deadline
+// spacing never collapses back to synchronized.
+//
+// On permanent nodes the offset is ADDED: there is no hard kill, so extra
+// session length costs nothing.  On CI runners it is SUBTRACTED: runners are
+// hard-killed 6h after start regardless of the session duration, so adding an
+// offset would silently eat the graceful-drain window before the kill.
+// Subtracting spreads the deadlines across [d-spread, d] while the worst-case
+// headroom before the kill stays 360m-d — the longest-recording node also has
+// the most drain time.  The result is floored at d/2 so a tiny configured
+// duration can never go negative.
 func staggerSessionDuration(d time.Duration) time.Duration {
 	spread := permanentSessionStaggerSpread
-	if os.Getenv("GITHUB_RUN_ID") != "" {
+	ci := os.Getenv("GITHUB_RUN_ID") != ""
+	if ci {
 		spread = ciSessionStaggerSpread
 	}
 	h := fnv.New32a()
-	h.Write([]byte(detectNodeID()))
+	h.Write([]byte(staggerNodeKey()))
 	offset := time.Duration(h.Sum32()%uint32(spread/time.Minute)) * time.Minute
+	if ci {
+		if offset > d/2 {
+			offset = d / 2
+		}
+		return d - offset
+	}
 	return d + offset
 }
 

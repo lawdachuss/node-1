@@ -19,6 +19,14 @@ var (
 	detectedEncoderOnce sync.Once
 )
 
+// encoderProbeAcquireBudget bounds how long encoder detection waits for a heavy
+// ffmpeg slot.  The probe is a one-second lavfi encode with a guaranteed CPU
+// fallback, so a saturated heavy pool (large transcodes hold slots for tens of
+// minutes) must never delay the first compression by the full
+// FFmpegHeavyAcquireTimeout — the raise to 15m turned that from a 5-minute
+// annoyance into a first-compression stall.
+const encoderProbeAcquireBudget = 30 * time.Second
+
 // videoEncoder represents a video encoder configuration
 type videoEncoder struct {
 	name  string   // display name
@@ -42,7 +50,7 @@ var availableEncoders = []videoEncoder{
 
 // detectEncoder finds the best available encoder
 func detectEncoder() (videoEncoder, string) {
-	if err := config.AcquireFFmpegHeavyFor(config.FFmpegHeavyAcquireTimeout); err != nil {
+	if err := config.AcquireFFmpegHeavyFor(encoderProbeAcquireBudget); err != nil {
 		// CPU fallback is always available if ffmpeg is installed; a starved
 		// pool must not block encoder detection forever.
 		return availableEncoders[len(availableEncoders)-1], "CPU"

@@ -178,6 +178,84 @@ func TestSessionMergeFailureReleasesBothFiles(t *testing.T) {
 	}
 }
 
+// TestRecoverConsumedMergeInputRestoresStrandedInput locks the re-merge fix:
+// when a re-merge fails to publish AND to restore its prior merged file, the
+// cumulative recording is parked under "<stable video>.consumed".  The orphan
+// scan must restore it to its original name (only when that name is free) so it
+// is uploaded normally instead of sitting hidden on disk forever.
+func TestRecoverConsumedMergeInputRestoresStrandedInput(t *testing.T) {
+	dir := t.TempDir()
+	starter := filepath.Join(dir, "alice_2025-01-01_12-00-00.mp4.merged.mp4")
+	consumed := starter + ".consumed"
+	if err := os.WriteFile(consumed, []byte("pretend-merged-content"), 0o666); err != nil {
+		t.Fatalf("write consumed stray: %v", err)
+	}
+	past := time.Now().Add(-(orphanSettleWindow + time.Minute))
+	if err := os.Chtimes(consumed, past, past); err != nil {
+		t.Fatalf("age consumed stray: %v", err)
+	}
+
+	got := recoverConsumedMergeInput(dir, filepath.Base(consumed))
+	if got != filepath.Base(starter) {
+		t.Fatalf("recoverConsumedMergeInput = %q, want %q", got, filepath.Base(starter))
+	}
+	if _, err := os.Stat(consumed); err == nil {
+		t.Error("stranded input still at .consumed path — not renamed back")
+	}
+	if _, err := os.Stat(starter); err != nil {
+		t.Errorf("stranded input not restored to stable name: %v", err)
+	}
+	if b, err := os.ReadFile(starter); err != nil || string(b) != "pretend-merged-content" {
+		t.Errorf("restored file content = %q, err %v", b, err)
+	}
+}
+
+// TestRecoverConsumedMergeInputDeduplicatesSuperseded verifies a .consumed
+// stray whose published merge already occupies the stable name is removed
+// (never restored over it, which on POSIX would overwrite the fresh merge).
+func TestRecoverConsumedMergeInputDeduplicatesSuperseded(t *testing.T) {
+	dir := t.TempDir()
+	merged := filepath.Join(dir, "bob_2025-01-01_12-00-00.mp4.merged.mp4")
+	if err := os.WriteFile(merged, []byte("published-merge"), 0o666); err != nil {
+		t.Fatalf("write published merge: %v", err)
+	}
+	consumed := merged + ".consumed"
+	if err := os.WriteFile(consumed, []byte("superseded-old-content"), 0o666); err != nil {
+		t.Fatalf("write consumed duplicate: %v", err)
+	}
+	past := time.Now().Add(-(orphanSettleWindow + time.Minute))
+	if err := os.Chtimes(consumed, past, past); err != nil {
+		t.Fatalf("age consumed duplicate: %v", err)
+	}
+
+	if got := recoverConsumedMergeInput(dir, filepath.Base(consumed)); got != "" {
+		t.Fatalf("superseded duplicate returned name %q, want \"\" (dedup)", got)
+	}
+	if _, err := os.Stat(consumed); err == nil {
+		t.Error("superseded .consumed duplicate was not removed")
+	}
+	if _, err := os.Stat(merged); err != nil {
+		t.Errorf("published merge must never be touched: %v", err)
+	}
+}
+
+// TestRecoverConsumedMergeInputDefersFreshStray verifies a .consumed file
+// touched within the settle window is left alone — a live re-merge may be
+// staging it right now and racing it could clobber the in-flight publish.
+func TestRecoverConsumedMergeInputDefersFreshStray(t *testing.T) {
+	dir := t.TempDir()
+	consumed := filepath.Join(dir, "carol_2025-01-01_12-00-00.mp4.merged.mp4.consumed")
+	if err := os.WriteFile(consumed, []byte("x"), 0o666); err != nil {
+		t.Fatalf("write fresh stray: %v", err)
+	}
+	if got := recoverConsumedMergeInput(dir, filepath.Base(consumed)); got != "" {
+		t.Fatalf("fresh stray returned name %q, want \"\" (deferred)", got)
+	}
+	if _, err := os.Stat(consumed); err != nil {
+		t.Errorf("fresh stray must be left for a later scan: %v", err)
+	}
+}
+
 // TestContinuationClassification locks the fix for ~20-minute fragmentation:
 // Chaturbate's HLS token rotates every ~20 minutes, surfacing as a stall whose
 // reason is "stream session expired (no new segments)" (or "...— reconnecting").

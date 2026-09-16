@@ -410,7 +410,15 @@ const FFmpegAcquireTimeout = 5 * time.Minute
 
 // FFmpegHeavyAcquireTimeout bounds how long a caller waits for a free
 // CPU-bound compression slot.  Same rationale as FFmpegAcquireTimeout.
-const FFmpegHeavyAcquireTimeout = 5 * time.Minute
+// 15m (not the light pool's 5m): the heavy pool is only max(1, NumCPU/2)
+// slots shared by transcode finalize, compress, min-duration merges and
+// session merges — one large transcode legitimately holds a slot for tens
+// of minutes, so a 5m budget produced "could not acquire ffmpeg slot:
+// context deadline exceeded" and dropped merges to fragmented individual
+// uploads.  All heavy callers are async goroutines and the wait is bounded,
+// so the longer ride-out cannot wedge a pipeline; failing the merge never
+// loses content (both inputs are kept), it only fragments it.
+const FFmpegHeavyAcquireTimeout = 15 * time.Minute
 
 // AcquireFFmpeg acquires a lightweight ffmpeg slot, blocking until one is
 // available or ctx is done.  It returns nil on acquisition and ctx.Err()

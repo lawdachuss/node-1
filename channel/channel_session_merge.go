@@ -288,17 +288,73 @@ func mergeTwoFiles(a, b string) (string, error) {
 		}
 	}
 
-	// Success: remove the originals, then publish the merged file under the
-	// stable session-start name.
-	if rmErr := os.Remove(a); rmErr != nil && !os.IsNotExist(rmErr) {
-		_ = rmErr
-	}
-	if rmErr := os.Remove(b); rmErr != nil && !os.IsNotExist(rmErr) {
-		_ = rmErr
+	// Success: publish the merged file FIRST, then remove the inputs.
+	// The old order (remove inputs → rename) destroyed both recordings on
+	// any rename failure: Windows os.Rename fails when the destination
+	// exists (re-merges publish onto input a's own path — X.merged.mp4 +
+	// next → dest == a, so a lingering lock on a is guaranteed to collide),
+	// and os.Remove had already deleted both inputs.  tmp was then deleted
+	// too, so the next ffmpeg call failed with "Impossible to open" and the
+	// "uploading separately" fallback had nothing left to upload — the
+	// dominant merge-failure class in the fleet logs (8 of 11 in 24h).
+	// Publishing first means a failed rename leaves tmp + both inputs, and
+	// the "keep both" fallback is actually true.
+	//
+	// Re-merge: dest == a (X.merged.mp4 + next → same stable name).  Windows
+	// rename fails onto an existing destination, so side-step the OLD merged
+	// file to a scratch name, publish tmp into the vacated slot, then consume
+	// the leftovers.  Any failure restores a and keeps tmp + b intact.
+	if mergedPath == a {
+		oldPath := a + ".consumed"
+		_ = os.Remove(oldPath)
+		if err := os.Rename(a, oldPath); err != nil {
+			return "", fmt.Errorf("stage re-merge input: %w", err)
+		}
+		if err := os.Rename(tmpPath, mergedPath); err != nil {
+			if rerr := os.Rename(oldPath, a); rerr != nil {
+				// The restore also failed: a is stranded at oldPath (.consumed)
+				// and tmp holds the merged a+b output.  NEVER delete either —
+				// deleting tmp here would be the one new data-loss path.  Both
+				// are recovered by the orphan scan: tmp is a normal .mp4 main
+				// video, and CleanupOrphanedFiles restores .consumed strays.  The
+				// caller's "upload both separately" fallback must not be lied to,
+				// so both surviving paths are reported.
+				return "", fmt.Errorf("publish re-merge: %w (restore of %s also failed: %v — original preserved at %s, merged output preserved at %s for orphan recovery)", err, filepath.Base(a), rerr, filepath.Base(oldPath), filepath.Base(tmpPath))
+			}
+			// Restored cleanly: both inputs are intact, so tmp (a third copy of
+			// the combined content) may be dropped to avoid triple duplication.
+			_ = os.Remove(tmpPath)
+			return "", fmt.Errorf("publish re-merge: %w", err)
+		}
+		// Merged content is durably published.  Removing leftovers is now
+		// cosmetic: a locked input just lingers for the orphan scan, which
+		// uploads it separately — duplication at worst, never data loss.
+		_ = os.Remove(oldPath)
+		if rmErr := os.Remove(b); rmErr != nil && !os.IsNotExist(rmErr) {
+			recoveryLogf(filepath.Base(b), "merged file published but consumed input could not be removed (locked?) — leaving it for the orphan scan: %v", rmErr)
+		}
+		return mergedPath, nil
 	}
 	if err := os.Rename(tmpPath, mergedPath); err != nil {
-		_ = os.Remove(tmpPath)
-		return "", fmt.Errorf("rename merged output: %w", err)
+		// Windows: the destination may exist (crash leftovers between runs).
+		// Never destroy the merged content: drop a stale destination and
+		// retry once; if it still fails, PRESERVE tmp and report — callers
+		// keep both inputs and fall back to individual uploads.
+		if rmErr := os.Remove(mergedPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			return "", fmt.Errorf("rename merged output (dest %s unremovable): %w", filepath.Base(mergedPath), rmErr)
+		}
+		if err2 := os.Rename(tmpPath, mergedPath); err2 != nil {
+			return "", fmt.Errorf("rename merged output: %w (merged tmp preserved at %s)", err2, filepath.Base(tmpPath))
+		}
+	}
+	// Inputs are consumed only after the output is durably in place.  A
+	// locked input (Windows AV/indexer) is left for the orphan scan rather
+	// than treated as a failure — the merge itself succeeded.
+	if rmErr := os.Remove(a); rmErr != nil && !os.IsNotExist(rmErr) {
+		recoveryLogf(filepath.Base(a), "merged file published but input could not be removed (locked?) — leaving it for the orphan scan: %v", rmErr)
+	}
+	if rmErr := os.Remove(b); rmErr != nil && !os.IsNotExist(rmErr) {
+		recoveryLogf(filepath.Base(b), "merged file published but input could not be removed (locked?) — leaving it for the orphan scan: %v", rmErr)
 	}
 	return mergedPath, nil
 }
