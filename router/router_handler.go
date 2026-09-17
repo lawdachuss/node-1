@@ -1650,7 +1650,7 @@ func ServeLiveThumb(c *gin.Context) {
 // the browser.  Anything else is rejected so the DVR cannot be used as an open
 // proxy.
 var proxyAllowedSuffixes = []string{
-	"pixhost.to", "catbox.moe", "freeimage.host", "i.ibb.co", "pimpandhost.com", "imgchest.com", "imgbox.com", "imgbb.com",
+	"pixhost.to", "catbox.moe", "freeimage.host", "i.ibb.co", "pimpandhost.com", "imgchest.com", "imgbox.com", "imgbb.com", "iili.io", "s1q2105.com",
 }
 
 // ServeImageProxy streams an external thumbnail/sprite/preview image through the
