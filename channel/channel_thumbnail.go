@@ -362,6 +362,13 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 	// ── Single thumbnail (static frame near the 10% mark) ──────────────────
 	// Independent 90-second context: seeking to a single frame is always fast.
 	go func() {
+		// Hold this asset's upload lifetime open for DeleteSidecarFiles: the
+		// collect below stops waiting for this goroutine after
+		// thumbnailAssetTimeout while it keeps uploading mirrors in the
+		// background, and deleting the sidecar then broke every one of those
+		// remaining attempts ("imgpile: open file: ...").
+		markThumbnailAssetUploadStart(videoPath)
+		defer markThumbnailAssetUploadDone(videoPath)
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("PANIC [thumb] generating thumbnail for %s: %v", baseName, r)
@@ -487,6 +494,10 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 	// shared context would cause SIGKILL ("signal: killed") and silently skip
 	// sprite generation on slow hosts.
 	go func() {
+		// Same lifetime hold as the thumbnail goroutine above — see the
+		// markThumbnailAssetUploadStart comment in upload_tracker.go.
+		markThumbnailAssetUploadStart(videoPath)
+		defer markThumbnailAssetUploadDone(videoPath)
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("PANIC [sprite] generating sprite for %s: %v", baseName, r)
@@ -705,6 +716,12 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 	// Uploaded to Catbox.moe (free, permanent, CDN-backed) with ImgBB
 	// as fallback — both return direct file URLs suitable for embedding.
 	go func() {
+		// Same lifetime hold as the thumbnail goroutine above — the preview is
+		// the asset that actually gets abandoned by the collect deadline (its
+		// 12-clip encode + upload is the slowest), and its late ImgBB/ImgPile
+		// mirrors are what failed on the deleted sidecar.
+		markThumbnailAssetUploadStart(videoPath)
+		defer markThumbnailAssetUploadDone(videoPath)
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("PANIC [preview] generating preview for %s: %v", baseName, r)

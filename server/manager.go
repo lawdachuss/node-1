@@ -29,6 +29,13 @@ type IManager interface {
 	StopSession()
 	StartWatcher()
 	IsFileUploadInFlight(filePath string) bool
+	// IsThumbnailAssetUploadInFlight reports whether a thumb/sprite/preview
+	// upload for the given video may still be reading that video's sidecar
+	// files.  The thumbnail generator abandons an asset goroutine once its
+	// budget expires and deliberately lets it keep uploading mirrors in the
+	// background, so every deleter must consult this before removing the
+	// sidecars — otherwise those uploads fail with "open file" afterwards.
+	IsThumbnailAssetUploadInFlight(filePath string) bool
 	SessionInfo() (time.Duration, bool)
 	// IsProcessingSession reports whether the node is currently in the
 	// post-session drain phase (finalize/compress/upload) rather than recording.

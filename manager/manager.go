@@ -1445,6 +1445,16 @@ func (m *Manager) IsFileUploadInFlight(filePath string) bool {
 	return channel.IsUploadInFlight(filePath)
 }
 
+// IsThumbnailAssetUploadInFlight returns true while a thumb/sprite/preview
+// upload for filePath may still be reading that video's sidecar files.  The
+// disk monitor consults it before deleting sidecars so it can never pull a file
+// out from under a background mirror upload the pipeline deliberately left
+// running (the "imgpile: open file: ..." failures that appeared minutes after
+// a pipeline had already logged "completed ... successfully").
+func (m *Manager) IsThumbnailAssetUploadInFlight(filePath string) bool {
+	return channel.IsThumbnailAssetUploadInFlight(filePath)
+}
+
 // ActiveRecordingFiles returns the absolute paths of files currently being
 // recorded by any channel.  The orphan scan walks the recording directory and
 // uses this to avoid treating a live recording as a stranded orphan.

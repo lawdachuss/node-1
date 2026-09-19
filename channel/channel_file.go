@@ -1343,7 +1343,14 @@ func CleanupOrphanedFiles() {
 					}
 				}
 				if !hasMain {
-					os.Remove(path)
+					// Same ordering rule as DeleteSidecarFiles: an abandoned asset
+					// upload goroutine may still be reading this sidecar (the sidecar
+					// name is "<videoPath>.<kind>", so base is that video path).
+					// Leave it to that goroutine's own deferred os.Remove instead of
+					// deleting it under a live reader.
+					if !IsThumbnailAssetUploadInFlight(filepath.Join(dir, base)) {
+						os.Remove(path)
+					}
 				}
 				break
 			}
@@ -1398,7 +1405,23 @@ func removeStaleFinalizingScratch(dir string) {
 }
 
 // DeleteSidecarFiles removes preview sidecar files associated with a video path.
+//
+// It refuses to remove them while a presentation-asset upload for the same video
+// may still be reading them.  generateThumbnailForFile abandons an asset
+// goroutine after thumbnailAssetTimeout and deliberately lets it keep uploading
+// mirrors in the background, so deleting the sidecar here pulled the file out
+// from under that goroutine: every remaining attempt then failed with "imgpile:
+// open file: ..." / "imgbb: read file: ..." MINUTES after the pipeline had
+// logged "completed ... successfully" (the files were already gone).  The
+// guard is what keeps the two flows ordered — deletion waits for the upload
+// that owns the file.  Each asset goroutine removes its own sidecar when it
+// finishes, and the orphan-sidecar sweep at the end of CleanupOrphanedFiles
+// applies the same guard, so a skipped deletion is never a leak.
 func DeleteSidecarFiles(videoPath string) {
+	if IsThumbnailAssetUploadInFlight(videoPath) {
+		log.Printf("delete: keeping sidecars for %s — thumb/sprite/preview upload still in flight", filepath.Base(videoPath))
+		return
+	}
 	for _, suffix := range []string{".thumb.webp", ".thumb.jpg", ".sprite.webp", ".sprite.jpg", ".preview.webp", ".preview.mp4", ".thumb", ".sprite"} {
 		os.Remove(videoPath + suffix)
 	}

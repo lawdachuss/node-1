@@ -224,10 +224,9 @@ func freeDiskSpace(targetPercent int, diskInfo *entity.DiskInfo) (int, error) {
 			log.Printf("[DISK] failed to delete %s: %v", vf.path, err)
 			continue
 		}
-		// Clean up associated preview sidecar files
-		for _, s := range []string{".thumb.webp", ".thumb.jpg", ".sprite.webp", ".sprite.jpg", ".preview.webp", ".thumb", ".sprite"} {
-			os.Remove(vf.path + s)
-		}
+		// Drop the sidecars too, unless a background thumb/sprite/preview upload
+		// for this video is still reading them.
+		removeSidecarsFor(vf.path)
 		freed += vf.size
 		deleted++
 		log.Printf("[DISK] deleted %s (age: %s, size: %.1f MB)",
@@ -235,6 +234,27 @@ func freeDiskSpace(targetPercent int, diskInfo *entity.DiskInfo) (int, error) {
 	}
 
 	return deleted, nil
+}
+
+// removeSidecarsFor deletes the presentation sidecars belonging to a video that
+// was just removed.
+//
+// It skips them while a thumb/sprite/preview upload for that video may still be
+// reading them.  The thumbnail generator stops waiting for an asset once its
+// 3-minute budget expires and deliberately lets that goroutine keep uploading
+// mirrors in the background, so deleting a sidecar here pulls the file out from
+// under a live reader and every remaining attempt fails with "imgpile: open
+// file: ..." — the same ordering violation the pipeline's own cleanup had.
+// Files old enough to be reaped this way rarely still have uploads running, but
+// the rule has to hold for every deleter.
+func removeSidecarsFor(videoPath string) {
+	if Manager != nil && Manager.IsThumbnailAssetUploadInFlight(videoPath) {
+		log.Printf("[DISK] keeping sidecars for %s — presentation upload still in flight", filepath.Base(videoPath))
+		return
+	}
+	for _, s := range []string{".thumb.webp", ".thumb.jpg", ".sprite.webp", ".sprite.jpg", ".preview.webp", ".thumb", ".sprite"} {
+		os.Remove(videoPath + s)
+	}
 }
 
 // isRecordingUploaded returns true only when the file's recording has at least
@@ -301,10 +321,9 @@ func deleteOldLocalFiles(maxAgeDays int) (int, error) {
 				log.Printf("[DISK] age-cleanup: failed to delete %s: %v", path, err)
 				continue
 			}
-			// Clean up associated preview sidecar files
-			for _, s := range []string{".thumb.webp", ".thumb.jpg", ".sprite.webp", ".sprite.jpg", ".preview.webp", ".thumb", ".sprite"} {
-				os.Remove(path + s)
-			}
+			// Same ordering rule: never delete a sidecar out from under a live
+			// presentation upload (see removeSidecarsFor).
+			removeSidecarsFor(path)
 			deleted++
 			log.Printf("[DISK] age-cleanup: deleted %s (age: %s, size: %.1f MB)",
 				name, time.Since(info.ModTime()).Round(time.Hour), float64(info.Size())/(1024*1024))
