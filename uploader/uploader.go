@@ -335,7 +335,7 @@ func (m *MultiHostUploader) initHosts() {
 		if m.voesx != nil && m.voesx.keys.count() > 0 && !isGloballyDisabled("VOE.sx") {
 			m.hosts["VOE.sx"] = m.voesx.UploadWithProgress
 		}
-		if m.streamtape != nil && m.streamtape.login != "" && m.streamtape.key != "" && !isGloballyDisabled("Streamtape") {
+		if m.streamtape != nil && m.streamtape.creds != nil && m.streamtape.creds.count() > 0 && !isGloballyDisabled("Streamtape") {
 			m.hosts["Streamtape"] = m.streamtape.UploadWithProgress
 		}
 		if m.mixdrop != nil && m.mixdrop.email != "" && m.mixdrop.token != "" && !isGloballyDisabled("Mixdrop") {
