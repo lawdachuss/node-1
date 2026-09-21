@@ -63,6 +63,19 @@ if ($env:BACKFILL_INTERVAL_MIN) {
 $work = if ($env:TEMP) { Join-Path $env:TEMP 'anonmp4' } else { Join-Path $repoDir 'tmp\anonmp4' }
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 
+# Write-JsonArray serializes $Data as a JSON ARRAY even when it holds a single
+# item.  Piping to ConvertTo-Json unwraps a one-element array into a bare
+# object, and anonmp4_capture.js then crashes on "entries is not iterable" —
+# the AnonMP4 sweep silently no-oped for the exact case that matters (a node
+# with a one-file backlog).  -InputObject keeps array-ness; the .NET writer is
+# BOM-free on both PowerShell 5.1 and pwsh 7 (Set-Content -Encoding utf8 mints
+# a UTF-8 BOM under 5.1 that JSON.parse rejects).
+function Write-JsonArray {
+  param([string]$Path, [object]$Data, [int]$Depth = 5)
+  $json = ConvertTo-Json -InputObject @($Data) -Depth $Depth
+  [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
+}
+
 function Resolve-Chrome {
   if ($env:CHROME_BIN -and (Test-Path $env:CHROME_BIN)) { return $env:CHROME_BIN }
   $cands = @(
@@ -113,7 +126,7 @@ function Invoke-AnonMp4 {
   if ($entries.Count -eq 0) { return }
 
   $entriesJson = Join-Path $dir 'anon_entries.json'
-  $entries | ConvertTo-Json -Depth 5 | Set-Content $entriesJson -Encoding utf8
+  Write-JsonArray $entriesJson $entries 5
 
   $chrome = Resolve-Chrome
   if (-not $chrome) { Bf-Log 'anonmp4: no Chrome/Chromium found (set CHROME_BIN) - skipping'; return }
@@ -169,7 +182,7 @@ function Invoke-AnonMp4 {
   if ($ready.Count -eq 0) { return }
 
   $manifest = Join-Path $dir 'anon_manifest.json'
-  $ready | ConvertTo-Json -Depth 10 | Set-Content $manifest -Encoding utf8
+  Write-JsonArray $manifest $ready 10
   Bf-Log 'anonmp4: backfilling via cmd/backfillvoe...'
   & go run ./cmd/backfillvoe $manifest
   Bf-Log "anonmp4: backfillvoe exit $LASTEXITCODE"

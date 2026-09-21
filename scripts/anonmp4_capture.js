@@ -6,7 +6,12 @@
 // 127.0.0.1:9222 (--remote-debugging-port=9222 --headless=new).
 const fs = require('fs');
 
-const entries = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+// Accept a JSON array OR a single object, and tolerate a UTF-8 BOM (an
+// {..}-shaped file appears when backfill-sweep.ps1 writes a one-entry result
+// through a shell that unwraps single-element arrays).
+const raw = fs.readFileSync(process.argv[2], 'utf8');
+const parsed = JSON.parse(raw.replace(/^\uFEFF/, ''));
+const entries = Array.isArray(parsed) ? parsed : [parsed];
 const outFile = process.argv[3];
 const CDP = 'http://127.0.0.1:9222';
 const results = [];
