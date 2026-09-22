@@ -1,4 +1,4 @@
-﻿$repoDir = "$env:REPO_DIR"; $dvrExe = "$repoDir\chaturbate-dvr.exe"; $videosDir = "D:\videos"
+$repoDir = "$env:REPO_DIR"; $dvrExe = "$repoDir\chaturbate-dvr.exe"; $videosDir = "D:\videos"
 $dvrLog = "$repoDir\dvr-output.log"; $tunnelUrlFile = "$repoDir\tunnel-url.txt"; $uploadFlag = "$repoDir\upload-complete.flag"
 $cloudflaredPath = "$repoDir\cloudflared.exe"
 $tsIp = "$env:TAILSCALE_IP"
@@ -292,6 +292,14 @@ function Update-NodeWebUrl {
     hostname       = $env:COMPUTERNAME
     instance_label = $instanceLabel
     current_load   = 0
+  }
+  if ($env:RUN_DEADLINE) {
+    try {
+      $dlEpoch = [int64]$env:RUN_DEADLINE
+      if ($dlEpoch -gt 0) {
+        $payload["session_deadline"] = [DateTimeOffset]::FromUnixTimeSeconds($dlEpoch).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+      }
+    } catch {}
   }
   $body = $payload | ConvertTo-Json -Compress
   $apiUrl = "$sbUrl/rest/v1/nodes?on_conflict=node_id"

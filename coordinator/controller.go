@@ -229,6 +229,21 @@ func (c *Coordinator) runControllerCycle() {
 		}
 		log.Printf("[controller] deadline migration: %d node(s) entering migration (deadline within/min passed): %s (deadlines: %s)",
 			len(deadlineMigrate), strings.Join(names, ","), strings.Join(deadlines, ","))
+
+		// Failsafe: if ALL fresh nodes are in deadline migration (e.g. stale deadlines
+		// after a transient boot outage, or entire fleet started simultaneously), there are
+		// no healthier nodes to migrate to. Dropping active to 0 would unassign the entire
+		// pool and paralyze recording across the fleet. Fall back to keeping all fresh nodes
+		// active so recordings continue.
+		if len(active) == 0 {
+			log.Printf("[controller] WARNING: all %d fresh node(s) are in deadline migration with no alternative receivers — keeping them active to prevent fleet paralysis", len(deadlineMigrate))
+			for _, n := range deadlineMigrate {
+				active = append(active, n)
+				activeSet[n.NodeID] = true
+			}
+			deadlineMigrate = nil
+			deadlineMigrateSet = map[string]bool{}
+		}
 	}
 
 	all, err := c.Client.GetAllAssignments()

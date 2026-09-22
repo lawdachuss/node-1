@@ -134,7 +134,11 @@ func (c *Coordinator) runStuckPauseCheckWith(ctx context.Context, nodes []databa
 		}
 		entries, err := fetchNodePoolEntries(ctx, n.WebURL)
 		if err != nil {
-			log.Printf("[coordinator] stuck-pause check: %s api/pool: %v", n.NodeID, err)
+			if strings.Contains(err.Error(), "dns_resolve") || strings.Contains(err.Error(), "no such host") {
+				log.Printf("[coordinator] stuck-pause check: %s api/pool: tunnel URL unreachable (DNS failure)", n.NodeID)
+			} else {
+				log.Printf("[coordinator] stuck-pause check: %s api/pool: %v", n.NodeID, err)
+			}
 			continue
 		}
 		for _, e := range entries {

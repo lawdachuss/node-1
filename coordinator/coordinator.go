@@ -516,7 +516,8 @@ func (c *Coordinator) Register() {
 			break
 		}
 		if attempt >= maxRegAttempts-1 {
-			log.Printf("[coordinator] WARNING: failed to register node after %d attempts: %v", maxRegAttempts, err)
+			log.Printf("[coordinator] WARNING: failed to register node after %d attempts: %v — continuing registration in background", maxRegAttempts, err)
+			go c.backgroundRegisterNode(node)
 			break
 		}
 		backoff := time.Duration(1<<uint(attempt)) * 2 * time.Second
@@ -525,6 +526,27 @@ func (c *Coordinator) Register() {
 		}
 		log.Printf("[coordinator] node registration failed (attempt %d/%d), retrying in %v: %v", attempt+1, maxRegAttempts, backoff, err)
 		time.Sleep(backoff)
+	}
+}
+
+func (c *Coordinator) backgroundRegisterNode(node *database.Node) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		c.mu.Lock()
+		draining := c.draining
+		c.mu.Unlock()
+		if draining {
+			return
+		}
+		if err := c.Client.UpsertNode(node); err == nil {
+			if node.SessionDeadline != nil {
+				log.Printf("[coordinator] background registration succeeded as node %q on %s (session deadline: %s)", node.NodeID, node.Hostname, node.SessionDeadline.Format(time.RFC3339))
+			} else {
+				log.Printf("[coordinator] background registration succeeded as node %q on %s", node.NodeID, node.Hostname)
+			}
+			return
+		}
 	}
 }
 

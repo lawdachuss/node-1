@@ -1736,10 +1736,20 @@ func (c *Client) UpsertNode(node *Node) error {
 
 // HeartbeatNode updates the last_heartbeat timestamp and current load for a node.
 func (c *Client) HeartbeatNode(nodeID string, currentLoad int) error {
-	return c.patch(fmt.Sprintf("/nodes?node_id=eq.%s", url.QueryEscape(nodeID)), map[string]interface{}{
+	return c.HeartbeatNodeWithDeadline(nodeID, currentLoad, nil)
+}
+
+// HeartbeatNodeWithDeadline updates the last_heartbeat timestamp, current load, and
+// confirms/heals session_deadline for a node.
+func (c *Client) HeartbeatNodeWithDeadline(nodeID string, currentLoad int, deadline *time.Time) error {
+	payload := map[string]interface{}{
 		"last_heartbeat": "now()",
 		"current_load":   currentLoad,
-	})
+	}
+	if deadline != nil && !deadline.IsZero() {
+		payload["session_deadline"] = deadline.Format(time.RFC3339)
+	}
+	return c.patch(fmt.Sprintf("/nodes?node_id=eq.%s", url.QueryEscape(nodeID)), payload)
 }
 
 // EnsureNodeOnline sets status=online for a node that is currently offline or

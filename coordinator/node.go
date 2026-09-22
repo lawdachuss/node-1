@@ -111,7 +111,14 @@ func (c *Coordinator) StartHeartbeatLoop(ctx context.Context) {
 					}
 
 					load := c.currentLoad()
-					if err := c.Client.HeartbeatNode(c.NodeID, load); err != nil {
+					c.mu.Lock()
+					var dl *time.Time
+					if !c.ownDeadline.IsZero() {
+						d := c.ownDeadline
+						dl = &d
+					}
+					c.mu.Unlock()
+					if err := c.Client.HeartbeatNodeWithDeadline(c.NodeID, load, dl); err != nil {
 						failures++
 						log.Printf("[coordinator] heartbeat failed (%d/%d): %v", failures, maxHeartbeatFailures, err)
 						if failures >= maxHeartbeatFailures && c.isActive() {
