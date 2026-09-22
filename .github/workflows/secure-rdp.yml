@@ -31,17 +31,31 @@ permissions:
 
 env:
   GH_TOKEN: ${{ github.token }}
-  # Node 24 is the Actions default since June 16, 2026. Keep the temporary
-  # escape hatch so any action that has not been rebuilt for Node 24 yet can
-  # still run on its old runtime. (FORCE_JAVASCRIPT_ACTIONS_TO_NODE24 was
-  # removed: setting it AND the escape hatch together is flagged by GitHub as
-  # a configuration error, and forcing the default is redundant.)
-  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: 'true'
+  # Every action in this workflow now runs on Node 24 (checkout v5+,
+  # setup-go v6+, cache/restore+save v5+, upload-artifact v6+ — v4/v5 of the
+  # first three are still node20 and produced the "deprecated Node.js actions"
+  # warning on every run). The ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION escape
+  # hatch is therefore gone: keeping it would keep the runner loading a Node 20
+  # runtime that GitHub has already removed from the image.
+  #
+  # Session budget — consumed by the Init step below and by keep-alive.ps1,
+  # which documents the arithmetic. GitHub hard-stops a job at 6h and DROPS ITS
+  # LOG when it does, so the whole session has to finish comfortably before
+  # that: window + reserve = 348m lifetime, with a 355m job timeout as the
+  # clean-cancel backstop (an overrun under our own timeout keeps its log).
+  SESSION_WINDOW_MIN: '340'
+  SESSION_RESERVE_MIN: '8'
+  SESSION_RUN_MAX_MIN: '355'
 
 jobs:
   rdp:
     runs-on: windows-latest
-    timeout-minutes: 420
+    # Backstop, deliberately UNDER GitHub's 360-minute job cap: when the platform
+    # cap is hit the runner is reclaimed mid-step, which skips every
+    # `if: always()` step AND loses the job log (BlobNotFound), leaving a dead
+    # session with nothing to diagnose. Timing out under our own control cancels
+    # the job cleanly and keeps the log.
+    timeout-minutes: 355
     env:
       MINI_ENV: ${{ secrets.MINI_ENV }}
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
@@ -83,7 +97,7 @@ jobs:
       DISABLED_UPLOAD_HOSTS: ${{ secrets.DISABLED_UPLOAD_HOSTS }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Kill stale processes + export runner paths used by the cache/tooling steps.
       - name: Init
@@ -96,10 +110,16 @@ jobs:
           echo "REPO_DIR=D:\repos\$repoName" >> $env:GITHUB_ENV
           Remove-Item "D:\repos\$repoName\tunnel-url.txt" -Force -ErrorAction SilentlyContinue
           echo "START_TIME=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" >> $env:GITHUB_ENV
-          # Self-cancel instead of queuing: if another run is still recording
-          # within its 6h window (<355 min), cancel THIS run and exit.
+          # Self-cancel instead of queuing: if another run may still be
+          # recording, cancel THIS run and exit. The test is SESSION_RUN_MAX_MIN
+          # (the other job's own timeout, not just the keep-alive window): a live
+          # session spends its last ~20 minutes draining uploads past the window,
+          # so a window-sized test said "that run can't be recording" while it
+          # still was — and the new run started on top of it, recording the same
+          # channels twice until the older run's arbiter cancelled the duplicate.
+          $runMaxMin = if ($env:SESSION_RUN_MAX_MIN) { [int]$env:SESSION_RUN_MAX_MIN } else { 355 }
           $r = gh run list --workflow secure-rdp.yml --repo "$env:GITHUB_REPOSITORY" --limit 10 --json databaseId,status,startedAt 2>$null | ConvertFrom-Json
-          if ($r) { foreach ($run in $r) { if ($run.databaseId -ne $env:GITHUB_RUN_ID -and $run.status -eq 'in_progress' -and (([DateTime]::UtcNow - [DateTime]::Parse($run.startedAt).ToUniversalTime()).TotalMinutes -lt 355)) { gh run cancel $env:GITHUB_RUN_ID --repo "$env:GITHUB_REPOSITORY"; Start-Sleep -Seconds 60; exit 1 } } }
+          if ($r) { foreach ($run in $r) { if ($run.databaseId -ne $env:GITHUB_RUN_ID -and $run.status -eq 'in_progress' -and (([DateTime]::UtcNow - [DateTime]::Parse($run.startedAt).ToUniversalTime()).TotalMinutes -lt $runMaxMin)) { gh run cancel $env:GITHUB_RUN_ID --repo "$env:GITHUB_REPOSITORY"; Start-Sleep -Seconds 60; exit 1 } } }
           # A run waiting in the runner queue can NEVER self-cancel (its steps
           # don't execute). Since THIS run has a runner, cancel any queued
           # runs of the same workflow so the account's concurrent-job slot is
@@ -134,7 +154,7 @@ jobs:
       # reached the nodes). parallel-setup.ps1 now ALWAYS builds from current
       # source, so every run ships a fresh binary.
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: '1.26'
 
@@ -202,7 +222,7 @@ jobs:
       - name: Upload Tunnel URL
         if: always() && !cancelled()
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: tunnel-url
           path: ${{ env.REPO_DIR }}\tunnel-url.txt

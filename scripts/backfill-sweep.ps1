@@ -52,7 +52,17 @@ if ($env:START_TIME) { $start = [int64]$env:START_TIME }
 if (-not $start -or $start -le 0) { $start = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
 $deadline = $null
 if ($env:RUN_DEADLINE) { $deadline = [int64]$env:RUN_DEADLINE }
-if (-not $deadline -or $deadline -le $start) { $deadline = $start + (355 * 60) }
+# Fallback for a standalone run (no RUN_DEADLINE from keep-alive.ps1): the
+# session lifetime, NOT the keep-alive loop window — the sweep may keep working
+# through the post-loop drain, and it must still stop before the runner is torn
+# down. Keep in sync with SESSION_WINDOW_MIN + SESSION_RESERVE_MIN (340 + 8).
+if (-not $deadline -or $deadline -le $start) {
+  $lifeMin = 348
+  if ($env:SESSION_WINDOW_MIN -and $env:SESSION_RESERVE_MIN) {
+    $lifeMin = [int]$env:SESSION_WINDOW_MIN + [int]$env:SESSION_RESERVE_MIN
+  }
+  $deadline = $start + ($lifeMin * 60)
+}
 
 $intervalMin = 15
 if ($env:BACKFILL_INTERVAL_MIN) {

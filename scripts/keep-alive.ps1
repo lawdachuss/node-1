@@ -56,12 +56,44 @@ if ($env:BACKFILL_RUNNER -ne 'false' -and (Test-Path $backfillScript)) {
 Remove-Item Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:http_proxy,Env:https_proxy -ErrorAction SilentlyContinue
 # SESSION_DURATION, VIDHIDE_API_KEY, STREAMWISH_API_KEY, UPNSHARE_KEY, etc.
 # are passed via the step's env: block from GitHub secrets — $env:XXX works directly.
-# The runner VM is destroyed when this workflow's 355-min keep-alive window ends.
+# ── Session budget (the ONE place these numbers are defined) ─────────────────
+# GitHub hard-stops a job at 6h, and when it does the runner is reclaimed
+# mid-step: the job log is never uploaded (the API answers BlobNotFound, so the
+# session cannot be diagnosed at all) and every `if: always()` step is skipped
+# (no offline mark, no cache save, no tunnel artifact, no next-run dispatch).
+# That is exactly how the overnight sessions ended: the 355-min keep-alive
+# window + the post-loop handoff + the final steps came to 362-365 min, past the
+# 360-min cap.
+#
+# So the session is budgeted against the cap, and everything else derives from
+# these numbers:
+#   SESSION_WINDOW_MIN  340 — the keep-alive loop below
+#   SESSION_RESERVE_MIN   8 — post-loop handoff: drain wait + offline mark +
+#                             next-run dispatch
+#   => lifetime          348 — the point the Go side already assumes:
+#                             coordinator.computeSessionDeadline() migrates this
+#                             node's channels away at 335m to be safely clear
+#                             of the 348m self-cancel / 360m hard kill.
+# SESSION_RUN_MAX_MIN   355 — the job's timeout-minutes backstop, ~5 min under
+#                             the platform cap, so an overrun is cancelled
+#                             CLEANLY (log kept) instead of being reclaimed.
+# SESSION_RUN_MAX_MIN is also the "is another session still recording?" test in
+# the run arbiter further down: testing the loop window alone is what let a
+# second session start on top of a live one (12 duplicate-in_progress
+# cancellations in a single window) and record the same channels twice.
+$sessionWindowMin   = if ($env:SESSION_WINDOW_MIN)   { [int]$env:SESSION_WINDOW_MIN }   else { 340 }
+$sessionReserveMin  = if ($env:SESSION_RESERVE_MIN)  { [int]$env:SESSION_RESERVE_MIN }  else { 8 }
+$sessionRunMaxMin   = if ($env:SESSION_RUN_MAX_MIN)  { [int]$env:SESSION_RUN_MAX_MIN }  else { 355 }
+$targetDuration     = $sessionWindowMin * 60
+$sessionLifetimeMin = $sessionWindowMin + $sessionReserveMin
+$runStartEpoch = if ($env:START_TIME) { [int64]$env:START_TIME } else { [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
 # Pass that hard deadline to the DVR (Unix seconds) so its session loop stops
 # recording after the final drain instead of resuming into a doomed tail whose
 # files die with the VM at run end.
-$runStartEpoch = if ($env:START_TIME) { [int64]$env:START_TIME } else { [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
-$env:RUN_DEADLINE = "$($runStartEpoch + (355 * 60))"
+$env:RUN_DEADLINE = "$($runStartEpoch + ($sessionLifetimeMin * 60))"
+# Last moment the post-loop handoff may start: the drain wait, the offline mark
+# and the next-run dispatch all have to fit before the job's own timeout.
+$handoffDeadline = $runStartEpoch + ($sessionLifetimeMin * 60)
 $dvr = Start-Process -FilePath $dvrExe -ArgumentList "--no-tunnel --output-dir `"$videosDir`"" -WorkingDirectory $repoDir -NoNewWindow -RedirectStandardOutput $dvrLog -RedirectStandardError "$repoDir\dvr-err.log" -PassThru
 $dvrPid = if ($dvr -and $dvr.Id) { $dvr.Id } else { "?" }
 
@@ -307,12 +339,20 @@ function Update-NodeWebUrl {
       } catch {
         Write-Warning "(WARN) web_url curl attempt $attempt failed: $_"
       }
+      # curl writes nothing usable when it cannot complete the request, which
+      # used to surface as an empty HTTP code in the warning; say 000 so the
+      # log reads as "transport failed", the same way it does for the probe.
+      if ($code -notmatch '^\d{3}$') { $code = "000" }
       if ($code -match '^(2\d\d)$') {
         Write-Host "(OK) Upserted node $nodeId web_url via curl.exe (attempt $attempt, HTTP $code)"
         $ok = $true; break
       }
       Write-Warning "(WARN) web_url curl attempt $attempt returned HTTP $code"
-      if ($attempt -lt 3) { Start-Sleep -Seconds 5 }
+      # Escalating backoff: the failures that matter here are transient edge
+      # errors (530/502 from the Supabase front, 000 when the runner's network
+      # path is mid-churn), which need seconds-to-tens-of-seconds to clear — a
+      # flat 5s retry just re-hit the same outage and gave up for the cycle.
+      if ($attempt -lt 3) { Start-Sleep -Seconds (5 * $attempt) }
     }
   }
 
@@ -504,8 +544,9 @@ if ($shortUrlJob) {
 }
 
 Remove-Item $uploadFlag -Force -ErrorAction SilentlyContinue
-$startTime = if ($env:START_TIME) { [int64]$env:START_TIME } else { [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
-$targetDuration = 355 * 60
+# One clock for the loop, the handoff deadline and RUN_DEADLINE — reading
+# START_TIME twice (with two UtcNow fallbacks) could disagree by seconds.
+$startTime = $runStartEpoch
 
 $lastNotifyTime = 0
 $notifyCooldown = 300
@@ -743,8 +784,8 @@ while ($true) {
   #     session can free the slot);
   #   - among in_progress runs, the OLDEST (earliest startedAt) owns recording;
   #     cancel every newer in_progress duplicate;
-  #   - if THIS run is a newer duplicate and the oldest is still within its
-  #     355-min session window, cancel ourselves.
+  #   - if THIS run is a newer duplicate and the oldest may still be alive
+  #     (inside SESSION_RUN_MAX_MIN, the job's own timeout), cancel ourselves.
   if (-not $lastRunSweep) { $lastRunSweep = -301 }
   if ($elapsed - $lastRunSweep -ge 300) {
     $lastRunSweep = $elapsed
@@ -771,7 +812,7 @@ while ($true) {
           if ($myStart -and $myStart.startedAt) {
             $oldestAgeMin = ([DateTime]::UtcNow - [DateTime]::Parse($oldest.startedAt).ToUniversalTime()).TotalMinutes
             $myIsOldest = ($myStart.databaseId -eq $oldest.databaseId)
-            if (-not $myIsOldest -and $oldestAgeMin -lt 355) {
+            if (-not $myIsOldest -and $oldestAgeMin -lt $sessionRunMaxMin) {
               Write-Host "(ARBITER) Older run $($oldest.databaseId) still recording (${oldestAgeMin}m) — cancelling self"; $null = [System.Console]::Out.Flush()
               gh run cancel $env:GITHUB_RUN_ID --repo "$env:GITHUB_REPOSITORY" 2>$null
             }
@@ -783,8 +824,14 @@ while ($true) {
 
   Start-Sleep -Seconds $sleepSecs
 }
+# Wait for the DVR's upload-complete.flag, but never past the handoff deadline:
+# the offline mark and the next-run dispatch below still have to fit inside the
+# session lifetime, and a 240s wait that pushes the job over its window is how
+# the final steps (and the whole job log) end up never running.
 $waitStart = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-while (-not (Test-Path $uploadFlag) -and ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $waitStart) -lt 240) { Start-Sleep -Seconds 15 }
+while (-not (Test-Path $uploadFlag) -and
+       ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $waitStart) -lt 240 -and
+       ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -lt $handoffDeadline)) { Start-Sleep -Seconds 15 }
 if (Test-Path $uploadFlag) { Remove-Item $uploadFlag -Force }
 
 # This run's cloudflared is about to die with the runner, taking its quick-tunnel
