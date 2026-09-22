@@ -256,6 +256,20 @@ func (c *Coordinator) runControllerCycle() {
 		}
 	}
 
+	// Housekeeping every cycle: drop assignments whose channel no longer exists
+	// in the pool.  Deleting a channel leaves its assignment row behind, and
+	// nothing else removes it — the owning node then polls a dead channel every
+	// interval forever ("channel not found (deleted/renamed)"), burning a probe
+	// and a log line per cycle per row.  Runs BEFORE the assignment snapshot
+	// below is read so the fair-share maths never sees the dead rows.  Leader
+	// only (we are past the lease check), and 'recording' rows are spared inside
+	// the client so an in-progress recording is never cut off.
+	if pruned, err := c.Client.PruneOrphanedAssignments(); err != nil {
+		log.Printf("[controller] prune orphaned assignments error: %v", err)
+	} else if pruned > 0 {
+		log.Printf("[controller] pruned %d orphaned channel assignment(s) whose channel no longer exists", pruned)
+	}
+
 	// ── Assignment gating ──────────────────────────────────────────────────
 	// The fleet gets ONE equal assignment once every node is live (the "startup"
 	// assignment). After that, channels are NOT continuously reshuffled: a

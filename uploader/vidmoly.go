@@ -91,7 +91,15 @@ func (u *VidMolyUploader) UploadWithProgress(filePath string, progress ProgressF
 		}
 	}
 
-	var lastErr error
+	var (
+		lastErr error
+		// lastRejection keeps the most recent failure the host actually
+		// reported.  The retry loop clears lastErr when a key is rotated or a
+		// rate limit is backed off, so without this the terminal error was a
+		// bare "all keys exhausted" that hid the real cause (verified live:
+		// {"status":429,"msg":"Daily API limit reached (50)."}) for days.
+		lastRejection error
+	)
 
 	// Try each key at most once per call (a single-key ring degenerates to a
 	// single attempt loop, preserving prior behavior).
@@ -112,6 +120,7 @@ func (u *VidMolyUploader) UploadWithProgress(filePath string, progress ProgressF
 			downloadLink, err := u.uploadFile(filePath, key, wrapped)
 			if err != nil {
 				lastErr = fmt.Errorf("upload file: %w", err)
+				lastRejection = err
 				// A fully-transmitted body already reached the server; the
 				// failure is only in reading the response. Re-streaming the
 				// same file would double-count it against the daily cap (and
@@ -119,16 +128,24 @@ func (u *VidMolyUploader) UploadWithProgress(filePath string, progress ProgressF
 				if bodyFullySent {
 					return "", lastErr
 				}
+				// Daily budget exhausted, checked BEFORE the generic 429
+				// matcher below.  VidMoly reports its API cap as
+				// {"status":429,"msg":"Daily API limit reached (50)."}, and
+				// isUploadRateLimited matches a bare "429" — so previously this
+				// branch was unreachable: the loop burned all 3 attempts per key
+				// on a limit that resets only at midnight, then reported the
+				// misleading "all keys exhausted" and never disabled the host.
+				// Verified live: the shared key was at used_today 2416 / limit
+				// 50.  Move to the next key; if none is left, the error reaches
+				// the caller, which skips VidMoly until tomorrow.
+				if isVidMolyDailyLimit(err) {
+					u.keys.rotate()
+					break
+				}
 				if isUploadRateLimited(err) {
 					time.Sleep(uploadBackoff(attempt, err))
 					lastErr = nil
 					continue
-				}
-				// Free accounts cap uploads (~50/day). Once today's budget is
-				// gone no retry succeeds today — surface the error so the
-				// caller disables the host until tomorrow.
-				if isVidMolyDailyLimit(err) {
-					return "", lastErr
 				}
 				// Fail fast on host-side capacity failures / dead servers.
 				if isVidMolyFailFast(err) {
@@ -151,7 +168,11 @@ func (u *VidMolyUploader) UploadWithProgress(filePath string, progress ProgressF
 	}
 
 	if lastErr == nil {
-		lastErr = fmt.Errorf("VidMoly upload failed: all keys exhausted")
+		if lastRejection != nil {
+			lastErr = fmt.Errorf("VidMoly upload failed: all keys exhausted (last rejection: %v)", lastRejection)
+		} else {
+			lastErr = fmt.Errorf("VidMoly upload failed: all keys exhausted")
+		}
 	}
 	return "", lastErr
 }

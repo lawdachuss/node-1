@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/teacat/chaturbate-dvr/config"
@@ -43,6 +44,14 @@ const (
 	// PLUS a mirrored-upload wait for the slowest host).
 	thumbnailAssetTimeout = 3 * time.Minute
 
+	// assetTimeoutCap bounds how long ONE asset goroutine may spend on its
+	// ffmpeg work on a slow host.  It is the longest internal budget an asset
+	// can burn without having produced anything, so anything watching an
+	// abandoned asset from the outside (see lateAssetTrackBound in
+	// asset_late.go) must allow longer than this before concluding the asset
+	// is never coming.
+	assetTimeoutCap = 45 * time.Minute
+
 	// thumbnailFFmpegAcquireTimeout bounds how long thumbnail-scoped work
 	// waits for a free lightweight ffmpeg slot.  Much shorter than the global
 	// FFmpegAcquireTimeout (5 min): a wave of sprite/preview extractions can
@@ -63,6 +72,12 @@ type ThumbnailResult struct {
 	ThumbMirrors   map[string]string // host -> URL
 	SpriteMirrors  map[string]string // host -> URL
 	PreviewMirrors map[string]string // host -> URL
+
+	// Unavailable is set when NOTHING was produced because this node could not
+	// run ffmpeg at all (see ErrFFmpegUnavailable) — as opposed to the file
+	// being unthumbnailable.  Callers must keep the recording and retry later
+	// rather than finalizing it without its thumbnail.
+	Unavailable bool
 }
 
 // OnHostUploadFunc is called the instant a single host finishes uploading
@@ -76,6 +91,7 @@ type OnHostUploadFunc func(assetType, host, url string)
 func (ch *Channel) generateThumbnail(videoPath string, onHost OnHostUploadFunc) ThumbnailResult {
 	return generateThumbnailForFile(videoPath,
 		func(f string, a ...interface{}) { ch.Info(f, a...) },
+		func(f string, a ...interface{}) { ch.Warn(f, a...) },
 		func(f string, a ...interface{}) { ch.Error(f, a...) },
 		onHost,
 	)
@@ -86,6 +102,7 @@ func (ch *Channel) generateThumbnail(videoPath string, onHost OnHostUploadFunc) 
 func GenerateThumbnailForFile(videoPath string) ThumbnailResult {
 	return generateThumbnailForFile(videoPath,
 		func(f string, a ...interface{}) { log.Printf("[thumb] "+f, a...) },
+		func(f string, a ...interface{}) { log.Printf("[thumb:warn] "+f, a...) },
 		func(f string, a ...interface{}) { log.Printf("[thumb:err] "+f, a...) },
 		nil,
 	)
@@ -193,6 +210,15 @@ func runFFmpegParallel(workers, n int, fn func(i int) error) error {
 	return firstErr
 }
 
+// acquireFFmpegSlot is an indirection over config.AcquireFFmpegFor so tests can
+// simulate a saturated pool without waiting out the real 30s budget or reaching
+// into the config package's unexported semaphore.  Production always uses the
+// direct call; the point of the seam is that runFFmpegFresh's mapping from a
+// pool wait to `errFFmpegSlotStarved` is itself testable — if that mapping ever
+// regresses, a starved pool silently goes back to being reported (and retried)
+// as a seek failure.
+var acquireFFmpegSlot = config.AcquireFFmpegFor
+
 // runFFmpegFresh runs an ffmpeg command with a fresh timeout context of the
 // given duration, acquiring a global ffmpeg slot for the duration.  Each
 // invocation gets its own context so a retry (slow seek, blank fallback,
@@ -201,8 +227,16 @@ func runFFmpegParallel(workers, n int, fn func(i int) error) error {
 // the retry fails with an immediate "context deadline exceeded" even though it
 // never got a chance to run.
 func runFFmpegFresh(timeout time.Duration, args ...string) error {
-	if err := config.AcquireFFmpegFor(thumbnailFFmpegAcquireTimeout); err != nil {
-		return err
+	if err := acquireFFmpegSlot(thumbnailFFmpegAcquireTimeout); err != nil {
+		// Name the real cause.  AcquireFFmpegFor returns a bare ctx.Err()
+		// ("context deadline exceeded"), and every caller below used to report
+		// that as "fast seek failed … retrying with slow seek" — which is not
+		// just a misleading log line: it sent callers into a slow-seek retry
+		// that needs the same slot, so a starved pool spent 30s+ per tile
+		// discovering nothing.  Wrapping it as both the specific reason and
+		// the node-tool class lets callers skip those fallbacks and lets the
+		// pipeline treat it as "retry after the node recovers".
+		return ffmpegSlotWaitError(thumbnailFFmpegAcquireTimeout)
 	}
 	defer config.ReleaseFFmpeg()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -210,11 +244,24 @@ func runFFmpegFresh(timeout time.Duration, args ...string) error {
 	return config.FFmpegCommandContext(ctx, args...).Run()
 }
 
-func generateThumbnailForFile(videoPath string, info, errFn func(string, ...interface{}), onHost OnHostUploadFunc) ThumbnailResult {
+func generateThumbnailForFile(videoPath string, info, warn, errFn func(string, ...interface{}), onHost OnHostUploadFunc) ThumbnailResult {
 	var result ThumbnailResult
 	ext := strings.ToLower(filepath.Ext(videoPath))
 	if ext != ".mp4" && ext != ".mkv" && ext != ".ts" {
 		return result
+	}
+
+	// Watch every error this run reports for the signature of ffmpeg failing to
+	// START, so the caller can tell a broken node from an unthumbnailable file
+	// (see ffmpeg_unavailable.go).  Wrapping errFn covers every call site at
+	// once, including the three asset goroutines that close over it.
+	var spawnFailures int32
+	rawErrFn := errFn
+	errFn = func(format string, a ...interface{}) {
+		if IsFFmpegSpawnFailureText(fmt.Sprintf(format, a...)) {
+			atomic.AddInt32(&spawnFailures, 1)
+		}
+		rawErrFn(format, a...)
 	}
 
 	st, err := os.Stat(videoPath)
@@ -252,6 +299,13 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 			if parseErr != nil {
 				log.Printf("WARN: could not parse probe duration %q: %v", strings.TrimSpace(string(probeOut)), parseErr)
 			}
+		} else {
+			// Was logged nowhere before, so a node where ffprobe cannot run at
+			// all left only the downstream "duration unknown" traces — which
+			// read as a property of the FILE.  Report the probe failure itself,
+			// and let the wrapper above classify it (it is the earliest and
+			// cheapest signal that this node's tools are unusable).
+			errFn("thumb: duration probe failed for %s: %v — continuing with unknown duration", filepath.Base(videoPath), probeErr)
 		}
 	}
 
@@ -347,12 +401,12 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 	}
 	thumbTimeout := base
 	spriteTimeout := base * 3
-	if spriteTimeout > 45*time.Minute {
-		spriteTimeout = 45 * time.Minute
+	if spriteTimeout > assetTimeoutCap {
+		spriteTimeout = assetTimeoutCap
 	}
 	previewTimeout := base * 3
-	if previewTimeout > 45*time.Minute {
-		previewTimeout = 45 * time.Minute
+	if previewTimeout > assetTimeoutCap {
+		previewTimeout = assetTimeoutCap
 	}
 
 	// Mirror URL maps — populated by goroutines, read after they complete.
@@ -424,7 +478,12 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		// through runFFmpegFresh.
 		err := generateThumb(false)
 
-		if err != nil {
+		if IsFFmpegSlotStarved(err) {
+			// No ffmpeg ran, so this is not a seek failure: the slow-seek retry
+			// would need the same slot and time out identically.  Report the
+			// pool, not the seek.
+			errFn("thumb: %s: %v", baseName, err)
+		} else if err != nil {
 			// Fast seek failed; retry with slow seek (-ss after -i).
 			// This handles certain codecs/formats where fast seek causes
 			// ffmpeg to crash (exit 0xffffffea on Windows).
@@ -568,6 +627,18 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 					tilePath,
 				}
 				err := runFFmpegFresh(spriteTimeout, seekArgs...)
+				if IsFFmpegSlotStarved(err) {
+					// Nothing ran.  Both remaining steps need a slot, so skip them,
+					// but do NOT fall through to a missing tile: the assembly below
+					// reads t0..tN with the image2 demuxer, which STOPS at the first
+					// missing index — a hole would truncate the 4×4 grid into a
+					// nearly-empty sheet that still looks like a real sprite.  For
+					// genuine seek failures the blank-frame fallback exists exactly
+					// to keep the sequence contiguous; on pool starvation that is not
+					// worth another 30s wait, so fail the sprite with the real cause.
+					errFn("sprite: tile %d for %s: %v", i, baseName, err)
+					return err
+				}
 				if err != nil || !fileExists(tilePath) {
 					// Fast seek failed (some codecs crash with -ss before -i on
 					// Windows, exit 0xffffffea).  Retry with slow seek (-ss after
@@ -586,6 +657,13 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 						tilePath,
 					}
 					err = runFFmpegFresh(spriteTimeout, slowArgs...)
+					if IsFFmpegSlotStarved(err) {
+						// The slow seek hit the same wall.  Do not spend one more
+						// acquire wait on a blank frame that cannot be produced
+						// either; report the pool as the cause, same as above.
+						errFn("sprite: tile %d for %s: %v", i, baseName, err)
+						return err
+					}
 				}
 				// If the tile still failed, generate a blank (black) frame so
 				// the 4×4 grid is complete and the sprite can still be used.
@@ -604,8 +682,14 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 						"-q:v", "5",
 						tilePath,
 					}
-					_ = runFFmpegFresh(spriteTimeout, blankArgs...)
+					blankErr := runFFmpegFresh(spriteTimeout, blankArgs...)
 					if !fileExists(tilePath) {
+						if IsFFmpegSlotStarved(blankErr) {
+							// The pool is the problem, so a partially-built grid is
+							// the honest outcome — fail rather than return a sheet
+							// full of holes as if it were complete.
+							return fmt.Errorf("sprite: tile %d at %.0fs: %w", i, pos, blankErr)
+						}
 						// Even the blank-frame fallback failed — log but do not
 						// abort the entire sprite; the grid will have a missing
 						// tile but is still usable.
@@ -826,6 +910,14 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 						clipPath,
 					}
 					seekErr := runFFmpegFresh(previewTimeout, seekArgs...)
+					if IsFFmpegSlotStarved(seekErr) {
+						// Same reasoning as the sprite tiles: every remaining step
+						// (slow seek, black placeholder, concat, WEBP encode) needs a
+						// slot, so bail with the pool as the cause instead of
+						// reporting a seek failure that never happened.
+						errFn("preview: clip %d for %s: %v", i, baseName, seekErr)
+						return seekErr
+					}
 					if seekErr != nil || !fileExists(clipPath) {
 						if seekErr != nil {
 							errFn("preview: clip %d fast seek failed for %s: %v — retrying with slow seek", i, baseName, seekErr)
@@ -845,6 +937,12 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 							clipPath,
 						}
 						seekErr = runFFmpegFresh(previewTimeout, slowArgs...)
+						if IsFFmpegSlotStarved(seekErr) {
+							// Nothing ran, so the black placeholder below would only
+							// wait on the pool again.  Fail with the real cause.
+							errFn("preview: clip %d for %s: %v", i, baseName, seekErr)
+							return seekErr
+						}
 						if seekErr != nil || !fileExists(clipPath) {
 							// Both fast and slow seek failed — generate a black
 							// placeholder clip so the concat step can still run.
@@ -916,7 +1014,12 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 			//
 			// Use a fresh context so the fallback gets its own 5-minute
 			// timeout instead of inheriting a nearly-expired shared context.
-			if err != nil || !fileExists(previewPath) {
+			if IsFFmpegSlotStarved(err) {
+				// The single-clip fallback is another ffmpeg run against the same
+				// saturated pool, so it cannot succeed — skip it and keep the
+				// pool's fault as the reason.
+				errFn("preview: %s: skipping the single-clip fallback — %v", baseName, err)
+			} else if err != nil || !fileExists(previewPath) {
 				if err != nil {
 					errFn("preview: clip extraction failed for %s: %v, trying simple fallback", baseName, err)
 				} else {
@@ -974,56 +1077,36 @@ func generateThumbnailForFile(videoPath string, info, errFn func(string, ...inte
 		previewDone <- ""
 	}()
 
-	// Each asset goroutine is internally bounded (per-ffmpeg-call context
-	// timeouts + image-host HTTP client timeouts + bounded per-host
-	// semaphore acquires + the first-host-success signal in StartAll), so a
-	// healthy file finishes in well under a minute: extraction is fast
-	// keyframe seeks and the mirror wait (sess.Wait()) is capped by each
-	// host's HTTP client timeout.  But the pipeline must NEVER ride along on
-	// a wedged mirror: the goroutine could still linger on a stuck host.
-	// The final collect therefore MUST NOT wait for the goroutines
-	// themselves — it listens on the done channels under ONE shared deadline,
-	// so when any asset floats too long the stage returns and the goroutine
-	// keeps running in the background (its onHost callback still persists late
-	// URLs to the DB, so nothing is lost; the buffered done channel lets it
-	// finish and run its temp-file cleanup instead of leaking).
-	//
-	// All three assets are collected CONCURRENTLY under that shared budget —
-	// the old sequential 3×10-min collect serialized three waits and blew the
-	// pipeline's 15-minute stage cap on node-13 ("timed out after 10m0s"
-	// then "exceeded 15m0s").  An asset that overruns the cap is abandoned
-	// locally but keeps running in the background.
-	type assetCollect struct {
-		name string
-		dst  *string
-		ch   <-chan string
-	}
+	// Collect the three assets under ONE shared deadline.  An asset that
+	// overruns it is abandoned, not failed: the goroutine keeps uploading in
+	// the background and its onHost callback still persists the URL, so the
+	// abandon is logged as informational and the real outcome is recorded
+	// separately.  See asset_late.go — the error-level version of this line
+	// was 6,160 phantom preview "failures" against ~22 actually-missing
+	// thumbnails.
 	assets := []assetCollect{
 		{"thumbnail", &result.ThumbURL, thumbDone},
 		{"sprite", &result.SpriteURL, spriteDone},
 		{"preview", &result.PreviewURL, previewDone},
 	}
-	var collectWG sync.WaitGroup
-	deadline := time.NewTimer(thumbnailAssetTimeout)
-	defer deadline.Stop()
-	for _, a := range assets {
-		collectWG.Add(1)
-		go func(a assetCollect) {
-			defer collectWG.Done()
-			select {
-			case *a.dst = <-a.ch:
-			case <-deadline.C:
-				errFn("%s: timed out after %s waiting for %s asset — continuing without it (late uploads still persist via onHost)", baseName, thumbnailAssetTimeout, a.name)
-			}
-		}(a)
-	}
-	collectWG.Wait()
+	collectAssets(baseName, assets, thumbnailAssetTimeout, info, warn, errFn)
 
 	mirrorsMu.Lock()
 	result.ThumbMirrors = copyMap(thumbMirrors)
 	result.SpriteMirrors = copyMap(spriteMirrors)
 	result.PreviewMirrors = copyMap(previewMirrors)
 	mirrorsMu.Unlock()
+
+	// Nothing at all was produced AND ffmpeg failed to start at least once:
+	// this is a node fault, not an unthumbnailable recording.  Say so loudly
+	// and let the caller keep the file for a later retry instead of finalizing
+	// a row with no thumbnail — which is how 22 recordings lost theirs.
+	failures := atomic.LoadInt32(&spawnFailures)
+	if thumbnailNodeToolUnavailable(result.ThumbURL, failures) {
+		result.Unavailable = true
+		errFn("thumb: ffmpeg could not run on this node (%d failed invocation(s)) — treating %s as retry-later, NOT as an unthumbnailable file",
+			failures, baseName)
+	}
 
 	return result
 }

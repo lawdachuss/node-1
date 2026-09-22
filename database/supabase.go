@@ -581,8 +581,13 @@ type Recording struct {
 	PreviewMirrors   map[string]string `json:"preview_mirrors,omitempty"`   // host -> URL
 	EmbedURL         string            `json:"embed_url,omitempty"`
 	InstanceID       string            `json:"instance_id,omitempty"`
-	CreatedAt        string            `json:"created_at,omitempty"`
-	UpdatedAt        string            `json:"updated_at,omitempty"`
+	// ThumbAttemptAt is the fleet-wide lease stamp for remote-thumbnail
+	// recovery: the last time (by any node) an attempt was started for this
+	// recording. See ClaimRecordingThumbAttempt. Empty when the column has not
+	// been deployed yet (the queries degrade to lease-less behaviour).
+	ThumbAttemptAt string `json:"thumb_attempt_at,omitempty"`
+	CreatedAt      string `json:"created_at,omitempty"`
+	UpdatedAt      string `json:"updated_at,omitempty"`
 }
 
 // SaveRecording creates or updates a recording using Supabase's upsert functionality.
@@ -650,14 +655,196 @@ func (c *Client) GetAllRecordings() ([]Recording, error) {
 	return recordings, err
 }
 
+// ThumbAttemptColumn is the recordings column that carries the fleet-wide
+// remote-thumbnail lease stamp (see the 20260922 migration).
+const ThumbAttemptColumn = "thumb_attempt_at"
+
+// RecordingThumbAttemptColumnMissing reports whether err means the
+// thumb_attempt_at column is absent from the schema, i.e. the 20260922
+// migration has not been applied.  Callers use it to degrade to the lease-less
+// behaviour instead of failing, so deploying the code before the migration
+// never stops thumbnail recovery.
+func RecordingThumbAttemptColumnMissing(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, ThumbAttemptColumn) {
+		return false
+	}
+	// 42703 = undefined_column (Postgres); PGRST204 = PostgREST schema cache miss.
+	return strings.Contains(msg, "42703") || strings.Contains(msg, "PGRST204")
+}
+
 // GetRecordingsMissingThumbnails retrieves only the recording rows whose
-// thumbnail_url is NULL/empty.  This is a small subset of the full table, so
-// the periodic thumbnail-backfill sweep can avoid downloading every row on
-// every node on every tick.
+// thumbnail_url is NULL/empty, together with the fleet-wide attempt lease.  This
+// is a small subset of the full table, so the periodic thumbnail-backfill sweep
+// can avoid downloading every row on every node on every tick.
+//
+// When the lease column has not been deployed yet the query falls back to the
+// pre-lease projection: recovery still works, it just cannot coordinate the
+// fleet (and the per-node cooldown is all that applies).
 func (c *Client) GetRecordingsMissingThumbnails() ([]Recording, error) {
-	var recordings []Recording
-	err := c.getAllPaginated("/recordings?select=id,filename,thumbnail_url,sprite_url,preview_url&thumbnail_url=is.null", &recordings)
-	return recordings, err
+	const base = "/recordings?select=id,filename,thumbnail_url,sprite_url,preview_url"
+	var withLease []Recording
+	if err := c.getAllPaginated(base+","+ThumbAttemptColumn+"&thumbnail_url=is.null", &withLease); err != nil {
+		if !RecordingThumbAttemptColumnMissing(err) {
+			return nil, err
+		}
+		var withoutLease []Recording
+		return withoutLease, c.getAllPaginated(base+"&thumbnail_url=is.null", &withoutLease)
+	}
+	return withLease, nil
+}
+
+// HostBackoffTable is the table carrying fleet-wide upload-host backoffs.
+const HostBackoffTable = "upload_host_backoffs"
+
+// HostBackoff is one fleet-wide upload-host backoff row.  See the 20260922
+// upload_host_backoffs migration: upload credentials are shared by every node,
+// so a per-account quota (VidMoly's 50 API requests/day) is really a fleet cap
+// and one node's discovery must stop the rest from re-discovering it.
+type HostBackoff struct {
+	Host         string `json:"host"`
+	BackoffUntil string `json:"backoff_until"`
+	Reason       string `json:"reason,omitempty"`
+	UpdatedBy    string `json:"updated_by,omitempty"`
+}
+
+// HostBackoffTableMissing reports whether err means the backoff table is not
+// deployed on this project (migration not applied, or not yet in the PostgREST
+// schema cache).  Callers degrade to the in-process timed-disable behaviour
+// instead of failing.
+func HostBackoffTableMissing(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, HostBackoffTable) {
+		return false
+	}
+	// PGRST205 = table not in the schema cache; 42P01 = undefined_table.
+	return strings.Contains(msg, "PGRST205") || strings.Contains(msg, "42P01")
+}
+
+// UntilTime parses a backoff row's expiry.  ok is false when the stamp is
+// missing or unparseable, which callers treat as "no backoff" — a malformed row
+// must never be able to skip a host forever.
+func (b HostBackoff) UntilTime() (time.Time, bool) {
+	t, err := time.Parse(time.RFC3339, b.BackoffUntil)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// ListHostBackoffs returns every stored host backoff row, including the reason
+// and reporting node.  The uploader only needs host -> expiry (GetHostBackoffs),
+// but the admin page shows operators WHY a host is being skipped, so the full
+// row is needed there.
+//
+// Rows with a blank host or an unparseable expiry are dropped here rather than
+// pushed onto callers, so both consumers share one definition of a usable row.
+func (c *Client) ListHostBackoffs() ([]HostBackoff, error) {
+	var rows []HostBackoff
+	if err := c.getAllPaginated("/"+HostBackoffTable+"?select=host,backoff_until,reason,updated_by", &rows); err != nil {
+		return nil, err
+	}
+	usable := make([]HostBackoff, 0, len(rows))
+	for _, r := range rows {
+		r.Host = strings.TrimSpace(r.Host)
+		if r.Host == "" {
+			continue
+		}
+		if _, ok := r.UntilTime(); !ok {
+			continue
+		}
+		usable = append(usable, r)
+	}
+	return usable, nil
+}
+
+// GetHostBackoffs returns every fleet-wide host backoff as host -> expiry.
+// Expired rows are returned too (the caller compares against now), so a clock
+// skew on one node cannot make it drop a still-valid entry.
+func (c *Client) GetHostBackoffs() (map[string]time.Time, error) {
+	rows, err := c.ListHostBackoffs()
+	if err != nil {
+		return nil, err
+	}
+	backoffs := make(map[string]time.Time, len(rows))
+	for _, r := range rows {
+		if until, ok := r.UntilTime(); ok {
+			backoffs[r.Host] = until
+		}
+	}
+	return backoffs, nil
+}
+
+// SetHostBackoff upserts one host's fleet-wide backoff so every other node
+// skips it until the expiry.  Best-effort: a failure only means peers learn
+// about the cap from their own attempt instead of from us.
+func (c *Client) SetHostBackoff(host string, until time.Time, reason, nodeID string) error {
+	if strings.TrimSpace(host) == "" || until.IsZero() {
+		return nil
+	}
+	row := HostBackoff{
+		Host:         host,
+		BackoffUntil: until.UTC().Format(time.RFC3339),
+		Reason:       reason,
+		UpdatedBy:    nodeID,
+	}
+	// post() sends Prefer: resolution=merge-duplicates, so this upserts on the
+	// host primary key rather than duplicating the row.
+	var out []HostBackoff
+	return c.post("/"+HostBackoffTable, row, &out)
+}
+
+// ClaimRecordingThumbAttempt tries to take the exclusive, fleet-wide right to
+// attempt remote-thumbnail recovery for one recording within cooldown.
+//
+// It is a conditional PATCH, not a read-then-write: the filter only matches a
+// row whose lease is unset or older than the cutoff, and PostgREST returns the
+// rows it actually updated (Prefer: return=representation).  Two nodes racing
+// therefore produce one winner — the loser's PATCH matches zero rows — which is
+// what turns "all 15 nodes re-download the same dead file" into one attempt per
+// cooldown.  The stamp is written BEFORE the download begins, so a crashed or
+// timed-out attempt still backs the fleet off instead of re-hammering the host.
+//
+// Returns (false, nil) when another node holds the lease.
+func (c *Client) ClaimRecordingThumbAttempt(filename string, cooldown time.Duration) (bool, error) {
+	if filename == "" {
+		return false, nil
+	}
+	cutoff := time.Now().UTC().Add(-cooldown).Format(time.RFC3339)
+	// The thumbnail_url guard is what makes the claim precise: a node whose
+	// recording list was already stale (another node recovered the thumbnail
+	// moments ago) matches zero rows and stops instead of re-downloading.
+	path := fmt.Sprintf(
+		"/recordings?filename=eq.%s&thumbnail_url=is.null&or=(%s.is.null,%s.lt.%s)&select=id",
+		url.QueryEscape(filename), ThumbAttemptColumn, ThumbAttemptColumn, url.QueryEscape(cutoff))
+
+	resp, err := c.requestWithRetry("PATCH", path, map[string]interface{}{
+		ThumbAttemptColumn: time.Now().UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return false, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var claimed []struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&claimed); err != nil {
+		// A 204/empty body means no row matched (PostgREST returns 200 with
+		// [] for representation PATCHes, so this is defensive).
+		return false, nil
+	}
+	return len(claimed) > 0, nil
 }
 
 // GetRecordingsMissingSpriteOrPreview retrieves recordings that already show a
@@ -2356,6 +2543,100 @@ func (c *Client) RepairOrphanedAssignments() (int, error) {
 	return len(orphaned), nil
 }
 
+// assignmentPruneBatchSize caps how many usernames go into one DELETE filter
+// URL.  Same ~8KB proxy limit as releaseBatchSize: 40 usernames stay well under
+// 1KB even with long performer names, so a prune can never 414.
+const assignmentPruneBatchSize = 40
+
+// channelUsernameRow is the minimal projection of the channels table used to
+// decide whether an assignment still has a channel behind it.
+type channelUsernameRow struct {
+	Username string `json:"username"`
+}
+
+// GetChannelUsernames returns the set of usernames present in the channels
+// table.  Paginated, so the answer stays correct past the server's max_rows cap
+// (Supabase defaults to 1000) rather than silently truncating.
+func (c *Client) GetChannelUsernames() (map[string]bool, error) {
+	var rows []channelUsernameRow
+	if err := c.getAllPaginated("/channels?select=username", &rows); err != nil {
+		return nil, err
+	}
+	usernames := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		if r.Username != "" {
+			usernames[r.Username] = true
+		}
+	}
+	return usernames, nil
+}
+
+// PruneOrphanedAssignments deletes channel_assignments rows whose username no
+// longer exists in the channels table.  Nothing else removes them: when a
+// channel is deleted from the pool its assignment row survives, so the node
+// holding it keeps polling a channel that can never come back and logs
+// "channel not found (deleted/renamed), try again in 1 min(s)" forever.  The
+// live fleet carried 165 such rows (the oldest with a heartbeat 7 weeks old).
+//
+// Rows with status='recording' are deliberately spared — a live recording must
+// never be cut off by a cleanup pass (the same defensive rule
+// reclaim_node_channels applies), and a genuinely stuck recording is reaped by
+// the recording watchdog instead.  For the same reason the DELETE filter carries
+// the status guard rather than relying on the in-memory snapshot alone, so a row
+// that flips to 'recording' between the read and the delete is not removed.
+//
+// Returns the number of assignment rows removed (counted from the snapshot that
+// matched the delete filter; a row that changed state in between is skipped by
+// the server-side status guard and therefore not counted).
+func (c *Client) PruneOrphanedAssignments() (int, error) {
+	channels, err := c.GetChannelUsernames()
+	if err != nil {
+		return 0, fmt.Errorf("load channels: %w", err)
+	}
+
+	var assignments []ChannelAssignment
+	if err := c.getAllPaginated("/channel_assignments?select=username,site,status", &assignments); err != nil {
+		return 0, fmt.Errorf("load assignments: %w", err)
+	}
+
+	// orphanRows counts the rows the prune targets, keyed by username so a
+	// username present on both sites is removed once but counted per row.
+	orphanRows := map[string]int{}
+	for _, a := range assignments {
+		if a.Username == "" || channels[a.Username] || a.Status == "recording" {
+			continue
+		}
+		orphanRows[a.Username]++
+	}
+	if len(orphanRows) == 0 {
+		return 0, nil
+	}
+
+	names := make([]string, 0, len(orphanRows))
+	for name := range orphanRows {
+		names = append(names, name)
+	}
+	sort.Strings(names) // deterministic batching keeps the request count stable
+
+	removed := 0
+	for start := 0; start < len(names); start += assignmentPruneBatchSize {
+		end := start + assignmentPruneBatchSize
+		if end > len(names) {
+			end = len(names)
+		}
+		chunk := names[start:end]
+		if err := c.delete(fmt.Sprintf(
+			"/channel_assignments?username=in.(%s)&status=neq.recording",
+			joinEscaped(chunk))); err != nil {
+			return removed, fmt.Errorf("delete orphaned assignments: %w", err)
+		}
+		for _, name := range chunk {
+			removed += orphanRows[name]
+		}
+	}
+	return removed, nil
+}
+
 // DeleteAssignment removes a channel assignment entirely from the pool.
 func (c *Client) DeleteAssignment(username, site string) error {
 	return c.delete(fmt.Sprintf("/channel_assignments?username=eq.%s&site=eq.%s", url.QueryEscape(username), url.QueryEscape(site)))
@@ -2561,10 +2842,20 @@ func (c *Client) setChannelsLiveChunked(pairs [][2]string, now string) error {
 // is_live only biases fair-share claiming (claim RPCs require assigned_node IS
 // NULL, so assigned channels are never disturbed) and the liveness loop
 // re-runs every cycle.
+//
+// The clear-all excludes status='recording' rows.  A channel that is actively
+// recording IS live by construction, but step 2 only re-marks the pairs the
+// probe confirmed live in THIS cycle — so a recording channel whose probe
+// failed or returned unknown was left with status='recording' + is_live=false,
+// contradicting what the node was actually doing.  Anything keying off is_live
+// (ReleaseNodeOfflineChannels, the fair-share claim RPCs) then treats a live
+// recording as an offline idle row.  Recording rows keep whatever is_live they
+// already had; SetSiteLiveness already applies the same exclusion via
+// filterNonRecording.
 func (c *Client) SetChannelsNotLive(pairs [][2]string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
-	// Step 1: clear every live flag — a single tiny PATCH.
-	if err := c.patch("/channel_assignments?is_live=eq.true",
+	// Step 1: clear every non-recording live flag — a single tiny PATCH.
+	if err := c.patch("/channel_assignments?is_live=eq.true&status=neq.recording",
 		map[string]interface{}{
 			"is_live":         false,
 			"live_checked_at": now,

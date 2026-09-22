@@ -2,6 +2,7 @@ package uploader
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -10,9 +11,17 @@ import (
 	"time"
 )
 
-const (
-	voeSXAPIBase = "https://voe.sx/api"
-)
+// voeSXAPIBase is a var (not const) so tests can point it at a fake server.
+var voeSXAPIBase = "https://voe.sx/api"
+
+// errVoeResponseLost marks a failure that happened AFTER the file body was
+// committed to the connection, where the server's answer could not be read
+// (transport error, or a 2xx whose body would not decode).  That is the one
+// case where a retry is not idempotent: VOE.sx may already hold the file, so
+// re-streaming the same bytes would create a duplicate upload and charge the
+// account twice.  Explicit HTTP rejections (4xx/5xx) are NOT this error — the
+// server told us it did not take the file, so retrying them stays safe.
+var errVoeResponseLost = errors.New("response lost after the file body was transmitted")
 
 // VoeSXUploader handles uploading files to VOE.sx
 type VoeSXUploader struct {
@@ -78,6 +87,22 @@ func (u *VoeSXUploader) UploadWithProgress(filePath string, progress ProgressFun
 	}
 	defer release()
 
+	// Track whether the whole file body was handed to the transport on this
+	// attempt (see the matching guard in vidmoly.go).  VOE.sx is a host we
+	// depend on, so this guard is what makes the retry loop idempotent: once the
+	// bytes are fully sent, the only thing that can fail is reading the
+	// response — and re-streaming the same file would create a duplicate upload
+	// and double-count it against the account's allowance.
+	var bodyFullySent bool
+	wrapped := func(host string, current, total int64) {
+		if total > 0 && current >= total {
+			bodyFullySent = true
+		}
+		if progress != nil {
+			progress(host, current, total)
+		}
+	}
+
 	var lastErr error
 
 	// Try each key at most once per call.  A single-key ring degenerates to a
@@ -96,17 +121,37 @@ func (u *VoeSXUploader) UploadWithProgress(filePath string, progress ProgressFun
 				time.Sleep(uploadBackoff(attempt-2, lastErr))
 			}
 
-			downloadLink, err := u.uploadFile(filePath, key, progress)
+			downloadLink, err := u.uploadFile(filePath, key, wrapped)
 			if err != nil {
 				lastErr = fmt.Errorf("upload file: %w", err)
+				// The complete body already reached VOE.sx and only the response
+				// was lost: re-streaming would duplicate the upload, so surface
+				// the error immediately instead of retrying.  Deliberately not a
+				// blanket bodyFullySent check — an explicit 429/5xx rejection
+				// also happens after the body is written, and that one must still
+				// be retried.
+				if bodyFullySent && errors.Is(err, errVoeResponseLost) {
+					return "", lastErr
+				}
+				// Storage-full for THIS key is a quota rejection, not a transient
+				// one, and must be rotated away from.  Checked BEFORE the generic
+				// 429 matcher below (which matches a bare "429") because VOE.sx
+				// reports quota errors as 429 — retrying a full account forever
+				// is exactly how the daily allowance gets burned (see the
+				// VidMoly daily-limit lesson).
+				if isVoeStorageFull(err) {
+					u.keys.rotate()
+					lastErr = nil
+					break
+				}
 				if isUploadRateLimited(err) {
 					time.Sleep(uploadBackoff(attempt, err))
 					lastErr = nil
 					continue
 				}
-				// Invalid auth (expired/revoked key) or storage-full for THIS
-				// key: rotate to the next key and stop retrying the bad one.
-				if isVoeAuthError(err) || isVoeStorageFull(err) {
+				// Invalid auth (expired/revoked key): rotate to the next key and
+				// stop retrying the bad one.
+				if isVoeAuthError(err) {
 					u.keys.rotate()
 					lastErr = nil
 					break
@@ -189,7 +234,7 @@ func (u *VoeSXUploader) uploadFile(filePath, key string, progress ProgressFunc) 
 
 	resp, err := u.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("do request: %w", err)
+		return "", fmt.Errorf("%w: do request: %v", errVoeResponseLost, err)
 	}
 	defer resp.Body.Close()
 
@@ -200,7 +245,7 @@ func (u *VoeSXUploader) uploadFile(filePath, key string, progress ProgressFunc) 
 
 	var uploadResp voeSXUploadResponse
 	if err := json.NewDecoder(resp.Body).Decode(&uploadResp); err != nil {
-		return "", fmt.Errorf("decode upload response: %w", err)
+		return "", fmt.Errorf("%w: decode upload response: %v", errVoeResponseLost, err)
 	}
 
 	if !uploadResp.Success {

@@ -497,6 +497,13 @@ func TestSetChannelsNotLiveClearsThenSets(t *testing.T) {
 	if len(patchReqs[0].path) > maxFilterURLLen {
 		t.Errorf("clear-all PATCH URL is %d bytes (> %d)", len(patchReqs[0].path), maxFilterURLLen)
 	}
+	// ...and it must spare rows that are actively recording.  Step 2 only
+	// re-marks pairs confirmed live in THIS cycle, so clearing a recording row
+	// left it as status='recording' + is_live=false while the node was in fact
+	// streaming it.
+	if !strings.Contains(patchReqs[0].path, "status=neq.recording") {
+		t.Errorf("clear-all PATCH must exclude recording rows, got: %s", patchReqs[0].path)
+	}
 
 	for i := 1; i < len(patchReqs); i++ {
 		if !strings.Contains(patchReqs[i].path, "or=") {
@@ -521,6 +528,172 @@ func TestSetChannelsNotLiveEmptyClearsAll(t *testing.T) {
 	}
 	if strings.Contains(patchReqs[0].path, "or=") {
 		t.Errorf("clear-all PATCH should have no or= filter, got: %s", patchReqs[0].path)
+	}
+	if !strings.Contains(patchReqs[0].path, "status=neq.recording") {
+		t.Errorf("clear-all PATCH must exclude recording rows, got: %s", patchReqs[0].path)
+	}
+}
+
+// ============================================================================
+// PruneOrphanedAssignments
+// ============================================================================
+
+// fakePruneDB serves the two paginated reads PruneOrphanedAssignments performs
+// (channels, then assignments) and records every DELETE, so the prune logic can
+// be exercised without Supabase.
+type fakePruneDB struct {
+	mu          sync.Mutex
+	channels    []string
+	assignments []ChannelAssignment
+	deletes     []string
+}
+
+func (f *fakePruneDB) handler(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if r.Method == http.MethodDelete {
+		f.deletes = append(f.deletes, r.URL.RequestURI())
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if strings.HasPrefix(r.URL.Path, "/rest/v1/channels") {
+		rows := make([]channelUsernameRow, 0, len(f.channels))
+		for _, u := range f.channels {
+			rows = append(rows, channelUsernameRow{Username: u})
+		}
+		json.NewEncoder(w).Encode(rows)
+		return
+	}
+	json.NewEncoder(w).Encode(f.assignments)
+}
+
+func newPruneTestClient(t *testing.T, fake *fakePruneDB) *Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(fake.handler))
+	t.Cleanup(srv.Close)
+	return &Client{URL: srv.URL, APIKey: "test-key", client: srv.Client()}
+}
+
+// TestPruneOrphanedAssignmentsRemovesOnlyDeadChannels verifies the prune deletes
+// assignments whose channel is gone and leaves existing channels untouched.
+func TestPruneOrphanedAssignmentsRemovesOnlyDeadChannels(t *testing.T) {
+	fake := &fakePruneDB{
+		channels: []string{"alive1", "alive2"},
+		assignments: []ChannelAssignment{
+			{Username: "alive1", Site: "chaturbate", Status: "claimed"},
+			{Username: "alive2", Site: "chaturbate", Status: "claimed"},
+			{Username: "dead1", Site: "chaturbate", Status: "claimed"},
+			{Username: "dead2", Site: "chaturbate", Status: "claimed"},
+		},
+	}
+	c := newPruneTestClient(t, fake)
+
+	removed, err := c.PruneOrphanedAssignments()
+	if err != nil {
+		t.Fatalf("PruneOrphanedAssignments: %v", err)
+	}
+	if removed != 2 {
+		t.Errorf("removed = %d, want 2", removed)
+	}
+	if len(fake.deletes) != 1 {
+		t.Fatalf("DELETE count = %d, want 1", len(fake.deletes))
+	}
+	got := usernamesFromInFilter(fake.deletes[0])
+	if strings.Join(got, ",") != "dead1,dead2" {
+		t.Errorf("deleted usernames = %v, want [dead1 dead2]", got)
+	}
+	for _, name := range got {
+		if name == "alive1" || name == "alive2" {
+			t.Errorf("DELETE must never touch a live channel, got %v", got)
+		}
+	}
+}
+
+// TestPruneOrphanedAssignmentsSparesRecordingRows is the regression guard for
+// cutting off an in-progress recording: a deleted channel's row must survive
+// while it is still marked 'recording'.
+func TestPruneOrphanedAssignmentsSparesRecordingRows(t *testing.T) {
+	fake := &fakePruneDB{
+		channels: []string{"alive1"},
+		assignments: []ChannelAssignment{
+			{Username: "alive1", Site: "chaturbate", Status: "claimed"},
+			{Username: "goneRecording", Site: "chaturbate", Status: "recording"},
+			{Username: "goneIdle", Site: "chaturbate", Status: "claimed"},
+		},
+	}
+	c := newPruneTestClient(t, fake)
+
+	removed, err := c.PruneOrphanedAssignments()
+	if err != nil {
+		t.Fatalf("PruneOrphanedAssignments: %v", err)
+	}
+	if removed != 1 {
+		t.Errorf("removed = %d, want 1 (the recording row must be spared)", removed)
+	}
+	if len(fake.deletes) != 1 {
+		t.Fatalf("DELETE count = %d, want 1", len(fake.deletes))
+	}
+	if got := strings.Join(usernamesFromInFilter(fake.deletes[0]), ","); got != "goneIdle" {
+		t.Errorf("deleted usernames = %q, want \"goneIdle\"", got)
+	}
+	if !strings.Contains(fake.deletes[0], "status=neq.recording") {
+		t.Errorf("DELETE must carry the server-side recording guard, got: %s", fake.deletes[0])
+	}
+}
+
+// TestPruneOrphanedAssignmentsNoOrphansIsNoop ensures a healthy pool issues no
+// writes at all.
+func TestPruneOrphanedAssignmentsNoOrphansIsNoop(t *testing.T) {
+	fake := &fakePruneDB{
+		channels: []string{"a", "b"},
+		assignments: []ChannelAssignment{
+			{Username: "a", Site: "chaturbate"},
+			{Username: "b", Site: "stripchat"},
+		},
+	}
+	c := newPruneTestClient(t, fake)
+
+	removed, err := c.PruneOrphanedAssignments()
+	if err != nil {
+		t.Fatalf("PruneOrphanedAssignments: %v", err)
+	}
+	if removed != 0 || len(fake.deletes) != 0 {
+		t.Errorf("removed = %d, deletes = %d; want 0 and 0", removed, len(fake.deletes))
+	}
+}
+
+// TestPruneOrphanedAssignmentsBatchesUnderURLLimit pins the batching: a large
+// orphan set must be chunked (never one giant username in-list) and every URL
+// must stay far under the ~8KB proxy limit that caused the HTTP 414 deadlock.
+func TestPruneOrphanedAssignmentsBatchesUnderURLLimit(t *testing.T) {
+	const orphans = 95 // 95 / 40 → 3 DELETEs
+	fake := &fakePruneDB{channels: []string{"alive"}}
+	for i := 0; i < orphans; i++ {
+		fake.assignments = append(fake.assignments, ChannelAssignment{
+			Username: fmt.Sprintf("dead%03d_with_a_longer_performer_name", i),
+			Site:     "chaturbate",
+			Status:   "claimed",
+		})
+	}
+	c := newPruneTestClient(t, fake)
+
+	removed, err := c.PruneOrphanedAssignments()
+	if err != nil {
+		t.Fatalf("PruneOrphanedAssignments: %v", err)
+	}
+	if removed != orphans {
+		t.Errorf("removed = %d, want %d", removed, orphans)
+	}
+	if want := (orphans + assignmentPruneBatchSize - 1) / assignmentPruneBatchSize; len(fake.deletes) != want {
+		t.Fatalf("DELETE count = %d, want %d", len(fake.deletes), want)
+	}
+	for i, path := range fake.deletes {
+		if len(path) > maxFilterURLLen {
+			t.Errorf("DELETE %d URL is %d bytes (> %d, 414 risk)", i, len(path), maxFilterURLLen)
+		}
 	}
 }
 

@@ -829,6 +829,45 @@
         </div>
     </details>
 
+    <!-- ════════ UPLOAD HOST BACKOFFS ════════ -->
+    {{ if .HostBackoffs }}
+    <details class="section" open>
+        <summary>
+            <span class="arrow">▶</span>
+            Upload Host Backoffs <span class="count">{{ len .HostBackoffs }}</span>
+            <span class="badge draining">skipped fleet-wide</span>
+        </summary>
+        <div class="section-body">
+            <table class="admin-table">
+                <thead>
+                    <tr>
+                        <th>Host</th>
+                        <th>Resumes</th>
+                        <th>In</th>
+                        <th>Reason</th>
+                        <th>Reported By</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {{ range .HostBackoffs }}
+                    <tr>
+                        <td><strong class="mono">{{ .Host }}</strong></td>
+                        <td class="mono" style="font-size:10px">{{ .Until }}</td>
+                        <td class="mono">{{ .Remaining }}</td>
+                        <td style="font-size:11px">{{ .Reason }}</td>
+                        <td class="mono" style="font-size:10px">{{ .ReportedBy }}</td>
+                    </tr>
+                    {{ end }}
+                </tbody>
+            </table>
+            <div style="margin-top:8px;font-size:11px;color:var(--text-muted)">
+                Upload credentials are shared by every node, so a host capped for one is capped for all.
+                These hosts are skipped fleet-wide until the times above — the entry expires on its own.
+            </div>
+        </div>
+    </details>
+    {{ end }}
+
     <!-- ════════ POOL ASSIGNMENTS ════════ -->
     <details class="section">
         <summary>
@@ -1093,6 +1132,10 @@
                 <div class="detail-item">
                     <div class="label">Stuck / likely lost</div>
                     <div class="val {{ if gt .Recon.Stuck 0 }}recon-critical-text{{ end }}">{{ .Recon.Stuck }} files · {{ .Recon.StuckBytesHuman }}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="label">Never started (0 bytes)</div>
+                    <div class="val {{ if gt .Recon.ZeroByteStuck 0 }}recon-critical-text{{ end }}">{{ .Recon.ZeroByteStuck }} files</div>
                 </div>
             </div>
             <div class="recon-note">

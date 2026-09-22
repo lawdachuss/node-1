@@ -49,8 +49,16 @@ var remoteThumbVidaraHTTP = &http.Client{
 //
 // It is safe to call on every sweep from every node: records whose recovery
 // succeeds drop out of the missing-thumbnail set, and failures are cooled down
-// per-node so the fleet does not re-download the same unfixable file on every
-// 30-minute tick.
+// so the fleet does not re-download the same unfixable file on every 30-minute
+// tick.
+//
+// The cooldown is enforced two ways: a cheap in-process map (remoteThumbLast)
+// and, crucially, a fleet-wide lease on recordings.thumb_attempt_at taken via
+// database.Client.ClaimRecordingThumbAttempt. The per-process map alone cannot
+// coordinate nodes, so before the lease every one of the fleet's nodes
+// independently picked up the same 18 recordings and re-downloaded them — 15x
+// the intended load on Streamtape's ticket limiter. The lease is claimed before
+// the download starts, so one node wins each cooldown window.
 func (m *Manager) SyncRemoteThumbnails() {
 	remoteThumbMu.Lock()
 	if m.remoteThumbScanning {
@@ -112,6 +120,21 @@ func (m *Manager) SyncRemoteThumbnails() {
 		last, seen := remoteThumbLast[rec.Filename]
 		remoteThumbMu.Unlock()
 		if seen && time.Since(last) < remoteThumbCooldown {
+			continue
+		}
+		// Take the fleet-wide lease so only one node in the fleet attempts this
+		// recording per cooldown window. If the lease column is not deployed yet
+		// we degrade to the old per-node behaviour rather than skipping recovery.
+		claimed, err := client.ClaimRecordingThumbAttempt(rec.Filename, remoteThumbCooldown)
+		if err != nil {
+			if !database.RecordingThumbAttemptColumnMissing(err) {
+				log.Printf("[remote-thumb] %s: lease claim failed: %v", rec.Filename, err)
+				continue
+			}
+			claimed = true // pre-migration schema: no fleet coordination available
+		}
+		if !claimed {
+			// Another node holds the lease for this window.
 			continue
 		}
 		// Find a recovery source among the recording's upload links.
@@ -203,6 +226,9 @@ func (m *Manager) SyncRemoteThumbnails() {
 }
 
 // markRemoteThumbFailed records a failed recovery attempt for cooldown tracking.
+// The fleet-wide lease was already stamped by ClaimRecordingThumbAttempt before
+// the attempt began, so a crash mid-download also backs the fleet off instead of
+// re-hammering the host.
 func markRemoteThumbFailed(filename string) {
 	remoteThumbMu.Lock()
 	remoteThumbLast[filename] = time.Now()

@@ -24,17 +24,18 @@ conf/*
 !conf/.gitkeep
 !conf/channels.json
 
-# Database files
+# Database files — ignore local state, never source.
+# These used to be exception-by-FILENAME, so every NEW database/*.go or *.sql
+# file was silently ignored until someone remembered to add it: two database
+# tests and their migrations came within one `git add database/` of never
+# shipping. Patterns instead, so that cannot happen again.
 database/*
 !database/.gitkeep
+!database/*.go
+!database/*.sql
 !database/recordings.json
 !database/settings.json
 !database/tunnel.json
-!database/supabase.go
-!database/supabase_test.go
-!database/orphan_cleanup_test.go
-!database/migrate.sql
-!database/migrate-channel-profiles.sql
 
 # AWS secrets and keys
 aws-secrets/

@@ -201,7 +201,7 @@ func TestVidMolyUploader_DailyLimitDetectedAndTimedDisabled(t *testing.T) {
 func TestVidMolyUploader_DailyLimitSkipsOnFreshUploader(t *testing.T) {
 	defer clearTimedDisablesForTest()
 
-	disableHostFor("VidMoly", 24*time.Hour)
+	disableHostFor("VidMoly", 24*time.Hour, "daily upload limit reached")
 	defer clearTimedDisablesForTest()
 
 	var callCount int

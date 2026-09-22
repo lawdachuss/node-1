@@ -356,6 +356,13 @@ func (p *Pipeline) stageThumbnail(ch *Channel) error {
 	// Return an error when the critical thumbnail is missing so the pipeline
 	// retries later instead of silently proceeding with no thumbnail.
 	if p.ThumbURL == "" {
+		if thumb.Unavailable {
+			// The node's tools could not run at all — a different fault from an
+			// unthumbnailable file, and one that clears on its own.  Report it as
+			// such so the pipeline delays its retry instead of spending the
+			// budget inside the same outage.
+			return nodeToolFailureError(p.Filename)
+		}
 		return fmt.Errorf("thumbnail generation/upload failed for %s — will retry later", p.Filename)
 	}
 	return nil
@@ -765,9 +772,18 @@ func (p *Pipeline) stageSaveMetadata(ch *Channel) error {
 		p.SpriteMirrors = mergeMirrorMaps(p.SpriteMirrors, thumb.SpriteMirrors)
 		p.PreviewMirrors = mergeMirrorMaps(p.PreviewMirrors, thumb.PreviewMirrors)
 		p.mu.Unlock()
-		if generated {
+		switch {
+		case generated:
 			ch.Info("upload: generated missing presentation assets for %s (retry)", p.Filename)
-		} else {
+		case thumb.Unavailable:
+			// Node-level tool outage: fail with the distinguishable error so the
+			// pipeline backs off instead of immediately re-running the same
+			// ~28 ffmpeg invocations inside the same broken window.
+			ch.Error("upload: %s: ffmpeg could not run on this node — keeping recording for a later retry instead of saving it without a thumbnail", p.Filename)
+			err := nodeToolFailureError(p.Filename)
+			p.LastError = err.Error()
+			return err
+		default:
 			ch.Warn("upload: thumbnail generation failed for %s (skipped — local file kept for later retry)", p.Filename)
 		}
 		// If the critical thumbnail is still missing after this retry, fail the
@@ -1018,10 +1034,7 @@ func (pq *PipelineQueue) scheduleRetry(p *Pipeline) bool {
 	}
 
 	retries := p.Retries
-	delay := 30 * time.Second << uint(min(retries-1, 5))
-	if delay > 10*time.Minute {
-		delay = 10 * time.Minute
-	}
+	delay := pipelineRetryDelay(retries, p.LastError)
 	p.retried = true
 	pq.ch.Warn("pipeline: %s will retry in %s (retry %d/%d)", p.Filename, delay, retries, maxPipelineRetries)
 
@@ -1184,6 +1197,11 @@ func (pq *PipelineQueue) processPipeline(p *Pipeline) {
 				// Retries exhausted — keep the recording for recovery instead
 				// of deleting it.  Dropping the state row lets the startup and
 				// periodic orphan scan pick the file up and retry the upload.
+				if IsFFmpegSpawnFailureText(p.LastError) {
+					// Not a bad recording: this node could not run ffmpeg across
+					// every retry, so an operator needs to look at the node.
+					ch.Error("pipeline: %s: ffmpeg could not run on this node across all %d retries — node-level fault, NOT a bad recording (file kept for the recovery scan)", filename, maxPipelineRetries)
+				}
 				ch.Error("pipeline: %s failed %d times, keeping file for recovery", filename, maxPipelineRetries)
 				if delErr := server.DeletePipelineState(p.FileHash); delErr != nil {
 					ch.Warn("pipeline: could not delete abandoned state for %s: %v", filename, delErr)
@@ -1324,6 +1342,18 @@ func (pq *PipelineQueue) processPipeline(p *Pipeline) {
 
 		if thumbErr != nil {
 			ch.Warn("pipeline: thumbnail stage failed for %s: %v — will retry in stageSaveMetadata", filename, thumbErr)
+			// …unless the node itself is broken.  Finalizing metadata now would
+			// write the recording without its thumbnail, and the immediate
+			// stageSaveMetadata retry would just re-run the identical work
+			// inside the same outage.  Fail the pipeline instead: the file is
+			// kept, the retry is delayed (pipelineRetryDelay), and the log names
+			// the node rather than the recording.
+			if IsFFmpegUnavailable(thumbErr) {
+				ch.Error("pipeline: %s: ffmpeg could not run on this node — not finalizing metadata without a thumbnail, will retry after the node recovers", filename)
+				p.Failed = true
+				p.LastError = thumbErr.Error()
+				return
+			}
 		}
 
 		if _, statErr := os.Stat(p.FilePath); statErr == nil {

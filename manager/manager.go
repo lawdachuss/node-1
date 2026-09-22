@@ -337,6 +337,15 @@ func (m *Manager) LoadConfig() error {
 	// orphan-cleanup interval above).
 	startRecordingsThumbSync(m)
 
+	// Watchdog for channels wedged on a zero-byte recording file.  Runs on its
+	// own interval so it does not wait out the (default 60-minute) orphan ticker.
+	startStuckRecordingWatchdog(m)
+
+	// Fleet-wide upload-host backoffs, so a per-account quota (shared by every
+	// node's identical credentials) is discovered once per fleet, not once per
+	// node.
+	startHostBackoffSync()
+
 	// File watcher for real-time orphan detection.
 	// Only watch the output directory — files in the temp "videos/"
 	// directory are either active recordings (which the watcher must
@@ -453,6 +462,13 @@ func (m *Manager) LoadPooledConfig() error {
 	// Dedicated short-interval thumbnail-backfill ticker (independent of the
 	// orphan-cleanup interval above).
 	startRecordingsThumbSync(m)
+
+	// Watchdog for channels wedged on a zero-byte recording file.  Runs on its
+	// own interval so it does not wait out the (default 60-minute) orphan ticker.
+	startStuckRecordingWatchdog(m)
+
+	// Fleet-wide upload-host backoffs (see manager/host_backoff.go).
+	startHostBackoffSync()
 
 	// File watcher
 	if server.Config.OutputDir != "" {

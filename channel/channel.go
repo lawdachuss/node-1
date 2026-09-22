@@ -645,6 +645,42 @@ func (ch *Channel) Stop() {
 	ch.Close()
 }
 
+// ReapStuckRecording abandons the current monitor run and starts a fresh one.
+//
+// The stuck-recording watchdog calls this when a channel has held a ZERO-BYTE
+// recording file well past the grace window.  Such a run is wedged, not slow:
+// the HLS poll never returns, so the 30-second stall detector never fires, the
+// retry loop never rotates the file, and the empty file stays open forever
+// (cleanupLocked only deletes a zero-byte file when it closes).  Cancelling the
+// run is what unwedges it — the monitor's deferred Cleanup then CLOSES and
+// DELETES the empty file.
+//
+// The restart is requested BEFORE the cancel: finishMonitor sees the flag and
+// spawns a new monitor (clearing the pause state), so the channel re-resolves
+// the stream instead of stopping.  Returns false when no monitor is running, so
+// the watchdog skips a channel that is already torn down rather than
+// resurrecting it.
+func (ch *Channel) ReapStuckRecording(reason string) bool {
+	ch.monitorMu.Lock()
+	if !ch.monitorRunning {
+		ch.monitorMu.Unlock()
+		return false
+	}
+	ch.monitorRestartRequested = true
+	ch.monitorMu.Unlock()
+
+	// Set the reason before cancelling: Monitor skips its own classification for
+	// context.Canceled, so this is what cleanupLocked logs and persists.
+	ch.setCloseReason(reason)
+
+	ch.cancelMu.Lock()
+	if ch.CancelFunc != nil {
+		ch.CancelFunc()
+	}
+	ch.cancelMu.Unlock()
+	return true
+}
+
 // Close stops non-recording background goroutines after recording/upload work
 // has been processed.
 func (ch *Channel) Close() {

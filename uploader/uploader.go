@@ -118,14 +118,28 @@ type MultiHostUploader struct {
 	disabledHosts map[string]bool // hosts disabled for the rest of this run
 	disabledMu    sync.Mutex
 	consecFails   failingHosts // consecutive failures per host -> auto-disable at threshold
-	// fullSend records hosts whose previous attempt already transmitted the
-	// file's complete body to the server but lost the response (see
-	// errBodyFullySent).  Persisting across UploadSelectedWithCallback calls
-	// (which stageUploadVideos re-runs once per DoWithRetry attempt, reusing
-	// the same MultiHostUploader) prevents re-uploading a file whose bytes
-	// were already fully pushed.
+	// fullSend records, per (host, file), that a previous attempt already
+	// transmitted the file's complete body to the server but lost the response
+	// (see errBodyFullySent).  Persisting across UploadSelectedWithCallback
+	// calls (which stageUploadVideos re-runs once per DoWithRetry attempt,
+	// reusing the same MultiHostUploader) prevents re-uploading a file whose
+	// bytes were already fully pushed.
+	//
+	// Keyed by host AND file.  Keying by host alone made one lost response on
+	// ONE file a permanent ban on that host, reported with a message claiming
+	// the NEXT file had "already been fully transmitted" when it had in fact
+	// never been sent — and since the skip produces a failure rather than a
+	// success, the marker was never cleared and the host stayed blocked for the
+	// life of the process.
 	fullSendMu sync.Mutex
-	fullSend   map[string]bool
+	fullSend   map[fullSendKey]bool
+}
+
+// fullSendKey identifies one (host, file) pair whose complete body has already
+// been streamed but whose response was lost.
+type fullSendKey struct {
+	host string
+	file string
 }
 
 // package-level set of upload hosts that must never be attempted this run,
@@ -172,14 +186,97 @@ var (
 
 // disableHostFor marks a host unavailable for dur (e.g. 24h after a daily
 // upload cap is hit). Unlike per-instance DisableHost this is package-wide
-// and automatically lifted once dur elapses.
-func disableHostFor(name string, dur time.Duration) {
+// and automatically lifted once dur elapses.  reason is logged and forwarded to
+// the fleet (see publishHostBackoff).
+func disableHostFor(name string, dur time.Duration, reason string) {
+	expiry := time.Now().Add(dur)
 	timedDisabledRWM.Lock()
-	defer timedDisabledRWM.Unlock()
 	if timedDisabled == nil {
 		timedDisabled = map[string]time.Time{}
 	}
-	timedDisabled[name] = time.Now().Add(dur)
+	timedDisabled[name] = expiry
+	timedDisabledRWM.Unlock()
+
+	publishHostBackoff(name, expiry, reason)
+}
+
+// fleetBackoff mirrors the fleet-wide host backoffs stored in Supabase.  The
+// upload credentials are shared by every node, so a per-account quota is really
+// a fleet cap: without this, all 18 nodes spend their own request to discover
+// VidMoly's exhausted 50/day API budget (live: used_today 2416 / limit 50) and
+// every CI restart pays again.  Populated by manager/host_backoff.go.
+//
+// Deliberately consulted only where an ATTEMPT is about to be made, never in
+// AvailableHosts: IsAlreadyFullyUploaded uses that list to decide whether the
+// watcher may delete a local file, so dropping a backed-off host from it would
+// mark a file complete — and delete it — before the host ever received it.
+var (
+	fleetBackoffMu sync.RWMutex
+	fleetBackoff   map[string]time.Time
+)
+
+// publishHostBackoff, when set, records a host backoff fleet-wide so peer nodes
+// skip the host too.  It is best-effort and must never block an upload, so it
+// runs on its own goroutine.
+var publishHostBackoffFn func(host string, until time.Time, reason string)
+
+// SetPublishHostBackoff installs the fleet-wide report sink (a Supabase upsert
+// in production).  Passing nil disables publishing.
+func SetPublishHostBackoff(fn func(host string, until time.Time, reason string)) {
+	publishHostBackoffFn = fn
+}
+
+// publishHostBackoff reports a host backoff to the fleet without blocking the
+// caller, and records it locally so this node is consistent immediately.
+func publishHostBackoff(host string, until time.Time, reason string) {
+	if host == "" || until.IsZero() {
+		return
+	}
+	setFleetHostBackoff(host, until)
+	fn := publishHostBackoffFn
+	if fn == nil {
+		return
+	}
+	go fn(host, until, reason)
+}
+
+// setFleetHostBackoff records one host's fleet-wide expiry in the local cache.
+func setFleetHostBackoff(host string, until time.Time) {
+	fleetBackoffMu.Lock()
+	defer fleetBackoffMu.Unlock()
+	if fleetBackoff == nil {
+		fleetBackoff = map[string]time.Time{}
+	}
+	fleetBackoff[host] = until
+}
+
+// SetFleetHostBackoffs replaces the cached fleet-wide backoffs with a fresh read
+// of the shared table.  Rows already expired are kept (they compare as inactive)
+// so the refresh cannot resurrect a host that another node just took offline.
+func SetFleetHostBackoffs(backoffs map[string]time.Time) {
+	fleetBackoffMu.Lock()
+	defer fleetBackoffMu.Unlock()
+	fleetBackoff = make(map[string]time.Time, len(backoffs))
+	for host, until := range backoffs {
+		fleetBackoff[host] = until
+	}
+}
+
+// isFleetHostBackedOff reports whether another node has taken this host offline
+// for a shared-credential quota.
+func isFleetHostBackedOff(name string) bool {
+	fleetBackoffMu.RLock()
+	defer fleetBackoffMu.RUnlock()
+	expiry, ok := fleetBackoff[name]
+	return ok && time.Now().Before(expiry)
+}
+
+// fleetHostBackoffUntil returns the fleet-wide expiry for a host (zero when
+// none), for log messages that name when the host comes back.
+func fleetHostBackoffUntil(name string) time.Time {
+	fleetBackoffMu.RLock()
+	defer fleetBackoffMu.RUnlock()
+	return fleetBackoff[name]
 }
 
 // isHostTimedOut reports whether the host is inside a timed-disable window
@@ -199,11 +296,20 @@ func hostTimedOutUntil(name string) time.Time {
 	return timedDisabled[name]
 }
 
-// clearTimedDisablesForTest removes all timed disables (test hook).
+// clearTimedDisablesForTest removes all timed disables — and the fleet-wide
+// cache they mirror, since disableHostFor records both (test hook).
 func clearTimedDisablesForTest() {
 	timedDisabledRWM.Lock()
 	timedDisabled = nil
 	timedDisabledRWM.Unlock()
+	clearFleetBackoffsForTest()
+}
+
+// clearFleetBackoffsForTest removes all fleet-wide backoffs (test hook).
+func clearFleetBackoffsForTest() {
+	fleetBackoffMu.Lock()
+	fleetBackoff = nil
+	fleetBackoffMu.Unlock()
 }
 
 // DisableHost marks a host as unavailable for the remainder of this run (e.g.
@@ -239,29 +345,30 @@ func (m *MultiHostUploader) recordHostSuccess(name string) {
 	m.consecFails.recordSuccess(name)
 }
 
-// markFullSend records that the given host's last attempt streamed the file's
+// markFullSend records that the given host's last attempt streamed FILE's
 // complete body (progress reached total).  See the fullSend field comment.
-func (m *MultiHostUploader) markFullSend(name string) {
+func (m *MultiHostUploader) markFullSend(file, name string) {
 	m.fullSendMu.Lock()
 	defer m.fullSendMu.Unlock()
 	if m.fullSend == nil {
-		m.fullSend = map[string]bool{}
+		m.fullSend = map[fullSendKey]bool{}
 	}
-	m.fullSend[name] = true
+	m.fullSend[fullSendKey{host: name, file: file}] = true
 }
 
 // hasFullSend reports whether the host already received the complete body of
-// the current file on a prior attempt, so we must not re-stream it.
-func (m *MultiHostUploader) hasFullSend(name string) bool {
+// THIS file on a prior attempt, so we must not re-stream it.  The file is part
+// of the key: see the fullSend field comment.
+func (m *MultiHostUploader) hasFullSend(file, name string) bool {
 	m.fullSendMu.Lock()
 	defer m.fullSendMu.Unlock()
-	return m.fullSend[name]
+	return m.fullSend[fullSendKey{host: name, file: file}]
 }
 
-// clearFullSend forgets a host's full-send marker on success.
-func (m *MultiHostUploader) clearFullSend(name string) {
+// clearFullSend forgets a host's full-send marker for FILE on success.
+func (m *MultiHostUploader) clearFullSend(file, name string) {
 	m.fullSendMu.Lock()
-	delete(m.fullSend, name)
+	delete(m.fullSend, fullSendKey{host: name, file: file})
 	m.fullSendMu.Unlock()
 }
 
@@ -272,16 +379,16 @@ func errBodyFullySent(host string) error {
 	return fmt.Errorf("%s upload: file body was already fully transmitted in a previous attempt but the response was lost — not re-uploading this file to avoid duplicates", host)
 }
 
-// trackFullSend wraps a progress callback so the MultiHostUploader records the
-// moment a host's upload stream reaches 100% of the file.  Used by
+// trackFullSend wraps a progress callback for FILE so the MultiHostUploader
+// records the moment a host's upload stream reaches 100% of that file.  Used by
 // UploadSelectedWithCallback and UploadSelectedPriority so that a file whose
 // complete body was already pushed to a host on a prior DoWithRetry attempt is
 // NOT re-streamed (stageUploadVideos re-runs the uploader once per attempt
 // while reusing the same MultiHostUploader).
-func (m *MultiHostUploader) trackFullSend(progressFn ProgressFunc) ProgressFunc {
+func (m *MultiHostUploader) trackFullSend(file string, progressFn ProgressFunc) ProgressFunc {
 	return func(host string, current, total int64) {
 		if total > 0 && current >= total {
-			m.markFullSend(host)
+			m.markFullSend(file, host)
 		}
 		if progressFn != nil {
 			progressFn(host, current, total)
@@ -451,6 +558,27 @@ func isUploadAuthError(err error) bool {
 		strings.Contains(msg, "api key not configured")
 }
 
+// keysExhaustedCooldown is how long a host is skipped once EVERY configured key
+// has failed.  The three key-rotating hosts (VidMoly, VOE.sx, Vidara) all end
+// their retry loop with "<Host> upload failed: all keys exhausted", and no
+// retry inside one run can fix that — the keys have to be rotated or the host's
+// own quota has to lapse.  Without a window, each file re-walks every dead key
+// (VidMoly alone produced ~2,000 such errors and 686 "failed 3 files in a row"
+// auto-disables across the fleet in 24h, burning minutes of upload time per
+// file).  Six hours stops the churn while still self-healing within the same
+// day if the operator rotates keys mid-flight.
+const keysExhaustedCooldown = 6 * time.Hour
+
+// isKeysExhausted reports whether an upload error means every key the host was
+// configured with was tried and rejected in this attempt.  Matches the shared
+// wording all three key-rotating uploaders use as their terminal error.
+func isKeysExhausted(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "all keys exhausted")
+}
+
 // isHostDead reports whether an upload error indicates the host is permanently
 // unreachable (DNS resolution succeeded but TCP connection failed — the server
 // is down, not just slow).  Unlike isFailFastError, this excludes transient
@@ -523,7 +651,7 @@ func (m *MultiHostUploader) UploadSelectedWithCallback(filePath string, hosts []
 	var mu sync.Mutex
 	results := []UploadResult{}
 
-	progressFn := m.trackFullSend(m.progress)
+	progressFn := m.trackFullSend(filePath, m.progress)
 	for _, name := range hosts {
 		if m.isHostDisabled(name) {
 			m.log.Info("upload: skipping disabled host %s for %s", name, filePath)
@@ -531,6 +659,10 @@ func (m *MultiHostUploader) UploadSelectedWithCallback(filePath string, hosts []
 		}
 		if isHostTimedOut(name) {
 			m.log.Info("upload: skipping %s for %s — daily upload limit reached (auto re-enables at %s)", name, filePath, hostTimedOutUntil(name).Format(time.RFC3339))
+			continue
+		}
+		if isFleetHostBackedOff(name) {
+			m.log.Info("upload: skipping %s for %s — a peer node reported this host exhausted on the shared credentials (auto re-enables at %s)", name, filePath, fleetHostBackoffUntil(name).Format(time.RFC3339))
 			continue
 		}
 		uploadFn, ok := m.hosts[name]
@@ -542,7 +674,7 @@ func (m *MultiHostUploader) UploadSelectedWithCallback(filePath string, hosts []
 			defer wg.Done()
 			var link string
 			var err error
-			if m.hasFullSend(host) {
+			if m.hasFullSend(filePath, host) {
 				// A previous attempt already pushed the file's complete body to
 				// this host but lost the response.  Re-streaming the same bytes
 				// would create a duplicate upload on the host, so fail this
@@ -560,7 +692,11 @@ func (m *MultiHostUploader) UploadSelectedWithCallback(filePath string, hosts []
 					m.DisableHost(host)
 				} else if isVidMolyDailyLimit(err) {
 					m.log.Error("upload: %s hit its daily upload limit — skipping it for ~24 hours (auto re-enables)", host)
-					disableHostFor(host, 24*time.Hour)
+					disableHostFor(host, 24*time.Hour, "daily upload limit reached")
+					m.DisableHost(host)
+				} else if isKeysExhausted(err) {
+					m.log.Error("upload: %s has no working keys left — skipping it for %s (auto re-enables; rotate its keys to restore)", host, keysExhaustedCooldown)
+					disableHostFor(host, keysExhaustedCooldown, "all configured keys exhausted")
 					m.DisableHost(host)
 				} else if isUploadAuthError(err) {
 					m.log.Error("upload: %s rejected our credentials — disabling it for the rest of this run", host)
@@ -575,7 +711,7 @@ func (m *MultiHostUploader) UploadSelectedWithCallback(filePath string, hosts []
 			} else {
 				m.log.Info("upload: %s successful for %s: %s", host, filePath, link)
 				m.recordHostSuccess(host)
-				m.clearFullSend(host)
+				m.clearFullSend(filePath, host)
 				if onHost != nil {
 					onHost(host, link)
 				}
@@ -611,7 +747,7 @@ func (m *MultiHostUploader) UploadSelectedPriority(filePath string, hosts []stri
 	}
 
 	var results []UploadResult
-	progressFn := m.trackFullSend(m.progress)
+	progressFn := m.trackFullSend(filePath, m.progress)
 
 	for _, host := range priorityHosts {
 		if m.isHostDisabled(host) {
@@ -622,13 +758,17 @@ func (m *MultiHostUploader) UploadSelectedPriority(filePath string, hosts []stri
 			m.log.Info("upload: skipping %s for %s — daily upload limit reached (auto re-enables at %s)", host, filePath, hostTimedOutUntil(host).Format(time.RFC3339))
 			continue
 		}
+		if isFleetHostBackedOff(host) {
+			m.log.Info("upload: skipping %s for %s — a peer node reported this host exhausted on the shared credentials (auto re-enables at %s)", host, filePath, fleetHostBackoffUntil(host).Format(time.RFC3339))
+			continue
+		}
 		fn, ok := m.hosts[host]
 		if !ok {
 			continue
 		}
 		var link string
 		var err error
-		if m.hasFullSend(host) {
+		if m.hasFullSend(filePath, host) {
 			m.log.Error("upload: skipping %s for %s — file body was already fully transmitted in a previous attempt (response lost)", host, filePath)
 			err = errBodyFullySent(host)
 		} else {
@@ -643,7 +783,11 @@ func (m *MultiHostUploader) UploadSelectedPriority(filePath string, hosts []stri
 				m.DisableHost(host)
 			} else if isVidMolyDailyLimit(err) {
 				m.log.Error("upload: %s hit its daily upload limit — skipping it for ~24 hours (auto re-enables)", host)
-				disableHostFor(host, 24*time.Hour)
+				disableHostFor(host, 24*time.Hour, "daily upload limit reached")
+				m.DisableHost(host)
+			} else if isKeysExhausted(err) {
+				m.log.Error("upload: %s has no working keys left — skipping it for %s (auto re-enables; rotate its keys to restore)", host, keysExhaustedCooldown)
+				disableHostFor(host, keysExhaustedCooldown, "all configured keys exhausted")
 				m.DisableHost(host)
 			} else if isUploadAuthError(err) {
 				m.log.Error("upload: %s rejected our credentials — disabling it for the rest of this run", host)
@@ -658,7 +802,7 @@ func (m *MultiHostUploader) UploadSelectedPriority(filePath string, hosts []stri
 		} else {
 			m.log.Info("upload: %s (priority) successful for %s: %s", host, filePath, link)
 			m.recordHostSuccess(host)
-			m.clearFullSend(host)
+			m.clearFullSend(filePath, host)
 		}
 	}
 

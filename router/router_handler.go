@@ -143,6 +143,83 @@ type AdminData struct {
 	// Recording reconciliation: on-disk recordings vs Supabase metadata, to
 	// surface recordings that were produced locally but never reached the cloud.
 	Recon *RecordingReconciliation
+
+	// HostBackoffs lists the fleet-wide upload-host backoffs that are currently
+	// active, so an operator can see WHY a host is being skipped instead of
+	// inferring it from absent uploads. Empty (and the section hidden) when no
+	// host is backed off.
+	HostBackoffs []HostBackoffView
+}
+
+// HostBackoffView is one active fleet-wide upload-host backoff rendered on the
+// admin page. Upload credentials are shared by every node, so a host that one
+// node found exhausted (VidMoly's 50 requests/day API cap, an exhausted key
+// ring) is skipped by the whole fleet — which otherwise looks like silent
+// missing uploads.
+type HostBackoffView struct {
+	Host       string
+	Until      string // local time the host becomes usable again
+	Remaining  string // compact time left, e.g. "18h24m"
+	Reason     string // the host's own wording
+	ReportedBy string // node that discovered it
+}
+
+// formatBackoffRemaining renders a backoff's remaining time compactly
+// ("3d4h", "18h24m", "12m").  Any non-positive duration reads as "expired" so a
+// row that lapsed between the read and the render never shows a negative time.
+func formatBackoffRemaining(d time.Duration) string {
+	if d <= 0 {
+		return "expired"
+	}
+	days := int(d / (24 * time.Hour))
+	hours := int(d/time.Hour) % 24
+	minutes := int(d/time.Minute) % 60
+	switch {
+	case days > 0:
+		return fmt.Sprintf("%dd%dh", days, hours)
+	case hours > 0:
+		return fmt.Sprintf("%dh%dm", hours, minutes)
+	default:
+		return fmt.Sprintf("%dm", minutes)
+	}
+}
+
+// loadHostBackoffs returns the currently-active fleet-wide upload-host
+// backoffs, sorted by host.  Best-effort by design: this is a diagnostic panel,
+// so an unreachable or not-yet-migrated table yields nothing rather than
+// breaking the whole admin page.
+func loadHostBackoffs() []HostBackoffView {
+	client := server.GetDBClient()
+	if client == nil {
+		return nil
+	}
+	rows, err := client.ListHostBackoffs()
+	if err != nil {
+		if !database.HostBackoffTableMissing(err) {
+			fmt.Printf("[WARN] admin: failed to load host backoffs: %v\n", err)
+		}
+		return nil
+	}
+
+	now := time.Now()
+	views := make([]HostBackoffView, 0, len(rows))
+	for _, r := range rows {
+		until, ok := r.UntilTime()
+		if !ok || !until.After(now) {
+			// Expired rows are not "being skipped" — listing them would make
+			// operators chase hosts that are already working again.
+			continue
+		}
+		views = append(views, HostBackoffView{
+			Host:       r.Host,
+			Until:      until.Local().Format("2006-01-02 15:04:05"),
+			Remaining:  formatBackoffRemaining(until.Sub(now)),
+			Reason:     r.Reason,
+			ReportedBy: r.UpdatedBy,
+		})
+	}
+	sort.Slice(views, func(i, j int) bool { return views[i].Host < views[j].Host })
+	return views
 }
 
 // RecordingReconciliation compares recordings physically present on THIS node's
@@ -167,14 +244,38 @@ type RecordingReconciliation struct {
 	// stuck threshold — the real "permanently lost" candidates.
 	Stuck          int
 	StuckBytesHuman string
-	Verdict        string // "healthy" | "warning" | "critical"
-	VerdictDetail  string
+	// ZeroByteStuck is the subset of Stuck that never received a single byte:
+	// the channel opened its output file and no segment ever arrived.  Tracked
+	// separately because these have no bytes to lose yet are the clearest sign
+	// of a wedged recording, and they were previously excluded from Stuck
+	// entirely (which is how one node sat on 25 dead files showing HEALTHY).
+	ZeroByteStuck int
+	Verdict       string // "healthy" | "warning" | "critical"
+	VerdictDetail string
 }
 
 // stuckOrphanThreshold: an orphan younger than this is assumed still working
 // its way through the upload pipeline; older than this with no upload activity
 // is treated as stranded.
 const stuckOrphanThreshold = 30 * time.Minute
+
+// zeroByteStuckThreshold: how long a zero-byte orphan may sit before it is
+// reported as stuck.  Shorter than stuckOrphanThreshold because it is already
+// known to be empty — there is no upload to wait on — but long enough that the
+// ordinary gap between opening a file and the first segment (and the manager's
+// 10-minute reap grace) never trips it.
+const zeroByteStuckThreshold = 15 * time.Minute
+
+// isZeroByteStuck reports whether a zero-byte orphan file should be counted as
+// a wedged recording: it is not currently being written (so it is not simply
+// still filling) and it has been empty past the threshold.  Split out from the
+// reconciliation walk so the rule can be tested without a live disk scan.
+func isZeroByteStuck(filename string, mod, now time.Time, activeRecs map[string]bool) bool {
+	if activeRecs[filename] {
+		return false
+	}
+	return now.Sub(mod) > zeroByteStuckThreshold
+}
 
 // computeRecordingReconciliation builds the RecordingReconciliation for the
 // admin panel from the on-disk scan helpers and the live upload state.
@@ -208,21 +309,45 @@ func computeRecordingReconciliation(uploads *entity.UploadsResponse) *RecordingR
 	}
 	r.InFlight = len(inFlight)
 
+	// Files a channel is recording RIGHT NOW.  A zero-byte file that is still
+	// being appended to is normal (the playlist head has not arrived yet), so it
+	// must never be reported as a stuck recording; every other zero-byte file
+	// past the threshold is a recording that produced nothing.
+	activeRecs := map[string]bool{}
+	if server.Manager != nil {
+		for _, p := range server.Manager.ActiveRecordingFiles() {
+			activeRecs[filepath.Base(p)] = true
+		}
+	}
+
 	orphans := scanOrphanFiles()
 	var orphanBytes, stuckBytesAcc int64
 	now := time.Now()
 	for _, o := range orphans {
 		// Session-continuity merge intermediates are held on disk by design
-		// (no cloud metadata yet) and 0-byte leftovers have no content to lose,
-		// so neither is a "permanent loss" candidate.
-		if o.Size == 0 || strings.Contains(o.Filename, ".merged.") {
+		// (no cloud metadata yet), so they are not a "permanent loss"
+		// candidate.
+		if strings.Contains(o.Filename, ".merged.") {
 			continue
 		}
-		orphanBytes += o.Size
 		mod, err := time.Parse(time.RFC3339Nano, o.ModTime)
 		if err != nil {
 			continue
 		}
+		if o.Size == 0 {
+			// No content to lose, but still the footprint of a recording that
+			// never started producing — the channel opened its file and no
+			// segment ever arrived (an edge/CF cut at session start, or a
+			// wedged HLS poll).  Reporting these is the point: skipping them is
+			// what let a node accumulate 25 dead files while reading HEALTHY.
+			if !isZeroByteStuck(o.Filename, mod, now, activeRecs) {
+				continue
+			}
+			r.ZeroByteStuck++
+			r.Stuck++
+			continue
+		}
+		orphanBytes += o.Size
 		if !inFlight[o.Filename] && now.Sub(mod) > stuckOrphanThreshold {
 			r.Stuck++
 			stuckBytesAcc += o.Size
@@ -235,7 +360,11 @@ func computeRecordingReconciliation(uploads *entity.UploadsResponse) *RecordingR
 	switch {
 	case r.Stuck > 0:
 		r.Verdict = "critical"
-		r.VerdictDetail = fmt.Sprintf("%d recording(s) on disk have no cloud metadata and are not in the upload pipeline — likely permanent loss.", r.Stuck)
+		if r.ZeroByteStuck > 0 {
+			r.VerdictDetail = fmt.Sprintf("%d recording(s) on disk have no cloud metadata and are not in the upload pipeline — likely permanent loss (%d never wrote a single byte: the stream was cut before the first segment).", r.Stuck, r.ZeroByteStuck)
+		} else {
+			r.VerdictDetail = fmt.Sprintf("%d recording(s) on disk have no cloud metadata and are not in the upload pipeline — likely permanent loss.", r.Stuck)
+		}
 	case r.Orphans > r.InFlight:
 		r.Verdict = "warning"
 		r.VerdictDetail = fmt.Sprintf("%d orphan file(s) exceed the active upload queue (%d); verify the upload pipeline is draining.", r.Orphans-r.InFlight, r.InFlight)
@@ -388,6 +517,8 @@ func AdminPage(c *gin.Context) {
 		TotalNodeLoad: totalNodeLoad,
 		PoolMode:      server.ChannelPoolMode(),
 		MyNodeID:      server.NodeID(),
+
+		HostBackoffs: loadHostBackoffs(),
 	})
 }
 
