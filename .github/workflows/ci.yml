@@ -1,0 +1,43 @@
+name: CI
+
+# Every node builds the DVR from the branch it checks out, so a tree that does not
+# compile, fails vet, or breaks a test takes the whole fleet down at its next
+# session — with the failure only visible in a node's setup step hours later.
+# This runs the same three commands locally done by hand, on every push and PR.
+#
+# Deliberately no gofmt gate: several pre-existing files use CRLF/mixed line
+# endings, so a tree-wide `gofmt -l` fails on files nobody is touching. Keep
+# edited files formatted instead of normalising the repository in a CI change.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      # Same Go line as the recording workflow, with the module/build cache.
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # The suite is self-contained (httptest fakes, fixtures): no Supabase, no
+      # network, no secrets.  The only test that needs a real project
+      # (coordinator_integration_test.go) skips itself when SUPABASE_URL is unset.
+      - name: Test
+        run: go test ./...

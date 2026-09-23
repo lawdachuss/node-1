@@ -1122,7 +1122,15 @@
                     <div class="val">{{ if .Recon.HasSupabase }}{{ .Recon.SupabaseTotal }} rows{{ else }}unavailable{{ end }}</div>
                 </div>
                 <div class="detail-item">
-                    <div class="label">Orphans (no metadata)</div>
+                    <div class="label">No host at all (global)</div>
+                    <div class="val {{ if gt .Recon.NoHosts 0 }}recon-critical-text{{ end }}">{{ if .Recon.HasNoHosts }}{{ .Recon.NoHosts }} rows{{ else }}unavailable{{ end }}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="label">Link writes (this node)</div>
+                    <div class="val{{ if and .Recon.LinkWritePathChecked (not .Recon.LinkWritePathOK) }} recon-critical-text{{ end }}"{{ if .Recon.LinkWritePathDetail }} title="{{ .Recon.LinkWritePathDetail }}"{{ end }}>{{ if not .Recon.LinkWritePathChecked }}not checked yet{{ else if .Recon.LinkWritePathOK }}ok{{ else }}FAILING{{ end }}</div>
+                </div>
+                <div class="detail-item">
+                    <div class="label">Orphans (not in any host)</div>
                     <div class="val">{{ .Recon.Orphans }} files · {{ .Recon.OrphanBytesHuman }}</div>
                 </div>
                 <div class="detail-item">
@@ -1139,8 +1147,10 @@
                 </div>
             </div>
             <div class="recon-note">
-                Supabase totals are fleet-wide (recordings aren't node-scoped), while disk counts are for this node only.
-                The reliable loss signal is <b>Stuck</b> — files on disk with no cloud metadata that aren't being uploaded.
+                Supabase totals and the no-host count are fleet-wide (recordings aren't node-scoped), while disk counts are for this node only.
+                <b>No host at all</b> counts recordings whose content never reached a host: a recordings row is written at enqueue time, so a row is not proof of an upload.
+                <b>Link writes</b> is a canary: this node writes a probe upload link and removes it, so a database-side rule that rejects the insert (a broken trigger, a type mismatch) shows up here instead of as a fleet of recordings that never get a host.
+                The reliable loss signal is <b>Stuck</b> — files on disk with no uploaded copy that aren't being uploaded.
             </div>
             {{ else }}
             <div class="empty-state">Reconciliation unavailable.</div>

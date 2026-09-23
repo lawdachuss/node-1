@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -147,6 +148,13 @@ func supabaseKey() string {
 		return Config.SupabaseServiceRoleKey
 	}
 	return supabaseRestAPIKey()
+}
+
+// ResetDBClient drops the cached Supabase client so the next GetDBClient call
+// rebuilds it from the current Config.  Needed whenever Config changes at runtime
+// (and by callers that point the fleet at a different project).
+func ResetDBClient() {
+	dbClient = nil
 }
 
 // GetDBClient returns the Supabase database client
@@ -1861,14 +1869,41 @@ func DeleteJournalByHash(fileHash string) error {
 // upsert by recording_id, host).  It is safe to run alongside active
 // pipelines — upsert semantics mean a concurrent link save ends the same way.
 //
+// The sweep is driven by the recordings that currently have ZERO upload links
+// (~160 fleet-wide), not by a recent journal window: a gap left by a crash weeks
+// ago is repaired by the next sweep, and the cost scales with the broken set
+// instead of with the journal's whole history.  Only those filenames are asked
+// about, in releaseBatchSize-sized batches.
+//
 // Returns the number of links restored.
-func ReconcileMissingUploadLinks(limit int) int {
+func ReconcileMissingUploadLinks() int {
 	client := GetDBClient()
 	if client == nil {
 		return 0
 	}
 
-	entries, err := client.GetJournalSuccessWithLinks(limit)
+	// Preflight: while the database is rejecting upload_links writes there is
+	// nothing to restore, and marching through hundreds of doomed inserts would
+	// bury the one line that matters (see server/write_path_check.go).
+	if !uploadLinkWritePathReady() {
+		return 0
+	}
+
+	missing, err := client.RecordingsWithoutUploadLinks()
+	if err != nil {
+		if database.NoHostsFuncMissing(err) {
+			fmt.Printf("[WARN] reconcile: recordings_without_upload_links() is not deployed (apply migration 20260923000000) — sweep skipped\n")
+		} else {
+			fmt.Printf("[WARN] reconcile: could not list recordings with no host: %v\n", err)
+		}
+		return 0
+	}
+	sort.Strings(missing) // deterministic batching keeps the request count stable
+	if len(missing) == 0 {
+		return 0
+	}
+
+	entries, err := client.GetJournalSuccessWithLinksFor(missing)
 	if err != nil {
 		fmt.Printf("[WARN] reconcile: could not load journal successes: %v\n", err)
 		return 0
@@ -1894,48 +1929,124 @@ func ReconcileMissingUploadLinks(limit int) int {
 		return 0
 	}
 
-	restored := 0
+	// Every filename here came from the zero-link set, so there is no per-host
+	// "already linked" check to make: SaveUploadLink upserts on
+	// (recording_id, host), which also covers a link a live pipeline wrote
+	// between the two reads.
+	ids, _, err := client.LookupRecordingLinkState(order)
+	if err != nil {
+		fmt.Printf("[WARN] reconcile: could not resolve recording ids: %v\n", err)
+		return 0
+	}
+
+	restored, attempted, failed := 0, 0, 0
+	var lastErr error
 	for _, filename := range order {
-		links := byFilename[filename]
-
-		rec, err := client.GetRecording(filename)
-		if err != nil || rec == nil || rec.ID == "" {
-			// No recording row (e.g. the temp-file upload anomaly or the row
-			// was never created) — nothing to attach links to.
+		recID := ids[filename]
+		if recID == "" {
+			// No recording row (e.g. the temp-file upload anomaly or the row was
+			// never created) — nothing to attach links to.
 			continue
 		}
-
-		existing, err := client.GetUploadLinkHosts(rec.ID)
-		if err != nil {
-			fmt.Printf("[WARN] reconcile: could not read links for %s: %v\n", filename, err)
-			continue
-		}
-		have := make(map[string]bool, len(existing))
-		for _, h := range existing {
-			have[h] = true
-		}
-
-		for host, link := range links {
-			if have[host] {
-				continue
-			}
+		for host, link := range byFilename[filename] {
+			attempted++
 			if err := client.SaveUploadLink(&database.UploadLink{
-				RecordingID: rec.ID,
+				RecordingID: recID,
 				Host:        host,
 				URL:         link,
 				InstanceID:  DBInstanceID(),
 			}); err != nil {
-				fmt.Printf("[WARN] reconcile: restore %s/%s: %v\n", filename, host, err)
+				failed++
+				lastErr = err
 				continue
 			}
-			have[host] = true
 			restored++
 		}
 	}
 
+	if failed > 0 {
+		fmt.Printf("[WARN] reconcile: %d of %d link restore(s) failed\n", failed, attempted)
+	}
+	// The canary insert succeeded, but not one real restore did: report it as the
+	// same broken write path rather than letting the sweep look like "nothing to
+	// repair".
+	if attempted > 0 && restored == 0 {
+		alertUploadLinkWriteFailure("Upload-link restore failed for every recording that needs one", lastErr)
+	}
+
 	if restored > 0 {
-		fmt.Printf("[startup] reconcile: restored %d upload link(s) from journal for %d recording(s)\n", restored, len(order))
+		fmt.Printf("[startup] reconcile: restored %d upload link(s) from journal\n", restored)
 		cacheClear()
 	}
 	return restored
+}
+
+// recordingUploadLinkIndexTTL is how long the fleet-wide link index below is
+// reused.  The admin panel polls /api/orphans (which needs it) every few seconds
+// while the panel is open, and the index is a whole-table read.
+const recordingUploadLinkIndexTTL = 60 * time.Second
+
+var (
+	recordingUploadLinkIndexMu   sync.Mutex
+	recordingUploadLinkIndexAt   time.Time
+	recordingUploadLinkIndexAll  map[string]bool
+	recordingUploadLinkIndexSafe map[string]bool
+)
+
+// RecordingUploadLinkIndex returns, for the whole fleet:
+//
+//   - all: every filename that has a recordings row;
+//   - safeInCloud: the subset whose recording has at least one upload link, i.e.
+//     whose content is actually safe on a host.
+//
+// The two differ for a recording whose upload leg died before its first link was
+// persisted.  A recordings row is written at ENQUEUE time, so row existence alone
+// cannot answer "is this file in the cloud?" — and the difference is exactly the
+// set /api/orphans must report and the admin panel counts as "no host at all".
+//
+// Cost is one paged read of recordings.filename plus one call to the
+// recordings_without_upload_links() function, which returns only the broken set
+// (~160 names).  Diffing client-side is not an option: upload_links holds ~125k
+// rows, and an embedded upload_links(host) select fails outright because the
+// deployed schema has no foreign key from upload_links to recordings (PGRST200).
+//
+// The result is cached for recordingUploadLinkIndexTTL and the maps are shared:
+// callers must not modify them.  A caller that needs to add names (the preview
+// prune adds local files to its keep set) must copy first.
+func RecordingUploadLinkIndex() (map[string]bool, map[string]bool, error) {
+	client := GetDBClient()
+	if client == nil {
+		return nil, nil, fmt.Errorf("Supabase not configured")
+	}
+
+	recordingUploadLinkIndexMu.Lock()
+	defer recordingUploadLinkIndexMu.Unlock()
+
+	if recordingUploadLinkIndexAll != nil && time.Since(recordingUploadLinkIndexAt) < recordingUploadLinkIndexTTL {
+		return recordingUploadLinkIndexAll, recordingUploadLinkIndexSafe, nil
+	}
+
+	all, err := client.GetRecordingFilenames()
+	if err != nil {
+		return nil, nil, fmt.Errorf("load recordings index: %w", err)
+	}
+	noHosts, err := client.RecordingsWithoutUploadLinks()
+	if err != nil {
+		if database.NoHostsFuncMissing(err) {
+			return nil, nil, fmt.Errorf("recordings_without_upload_links() is not deployed (apply migration 20260923000000): %w", err)
+		}
+		return nil, nil, fmt.Errorf("load recordings with no host: %w", err)
+	}
+
+	safe := make(map[string]bool, len(all))
+	for name := range all {
+		safe[name] = true
+	}
+	for _, name := range noHosts {
+		delete(safe, name)
+	}
+
+	recordingUploadLinkIndexAll, recordingUploadLinkIndexSafe = all, safe
+	recordingUploadLinkIndexAt = time.Now()
+	return all, safe, nil
 }

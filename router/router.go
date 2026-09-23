@@ -130,6 +130,12 @@ func SetupViews(r *gin.Engine) {
 	r.GET("/logs", LogsPage)
 	r.GET("/api/logs", LogsAPI)
 
+	// ── Health API ────────────────────────────────────────────────────────
+	// JSON readiness for monitors: database reachability plus the upload_links
+	// write-path canary, so a closed write path is machine-detectable instead of
+	// hiding in a log line.  503 when either is bad.
+	r.GET("/api/health", HealthAPI)
+
 }
 
 // LoadHTMLFromEmbedFS loads specific HTML templates from an embedded filesystem and registers them with Gin.

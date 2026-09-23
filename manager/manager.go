@@ -310,10 +310,10 @@ func (m *Manager) LoadConfig() error {
 		m.ScanThumbnails()
 		server.SyncRecordingsThumbnails()
 		// Restore upload_links for recordings whose per-host link save never
-		// landed (node died between journal-write and link-save).  Bounded to
-		// the most recent maxUploadJournalReconcile journal successes so the
-		// sweep can't balloon on huge journals.
-		if restored := server.ReconcileMissingUploadLinks(maxUploadJournalReconcile); restored > 0 {
+		// landed (node died between journal-write and link-save).  The sweep is
+		// driven by the recordings that currently have zero links, so old gaps
+		// are repaired too — not just those inside a recent-journal window.
+		if restored := server.ReconcileMissingUploadLinks(); restored > 0 {
 			fmt.Printf("[recover] restored %d upload link(s) missing from previous runs\n", restored)
 		}
 	}()
@@ -327,8 +327,17 @@ func (m *Manager) LoadConfig() error {
 				channel.CleanupOrphanedFiles()
 				m.ScanThumbnails()
 				server.SyncRecordingsThumbnails()
-				server.ReconcileMissingUploadLinks(maxUploadJournalReconcile)
+				// Canary for the upload_links write path: a database-side rule that
+				// rejects the insert leaves every recording host-less while the
+				// fleet happily keeps recording, so it is checked, logged and
+				// alerted on this tick instead of being discovered later.
+				server.CheckUploadLinkWritePath()
+				server.ReconcileMissingUploadLinks()
 				server.CleanupOldLogs(server.Config.LogRetentionDays)
+				// Drop preview_images rows whose recording is long gone; they can
+				// never be displayed or repaired, and nothing else removes them
+				// (the table's cascade never fires for a NULL recording_id).
+				server.CleanupOrphanedPreviewImages()
 			}
 		}()
 	}
@@ -454,7 +463,9 @@ func (m *Manager) LoadPooledConfig() error {
 				channel.CleanupOrphanedFiles()
 				m.ScanThumbnails()
 				server.SyncRecordingsThumbnails()
+				server.CheckUploadLinkWritePath()
 				server.CleanupOldLogs(server.Config.LogRetentionDays)
+				server.CleanupOrphanedPreviewImages()
 			}
 		}()
 	}
@@ -712,10 +723,6 @@ const (
 	// this keeps recordings.thumbnail_url current without waiting for the
 	// (default 60-minute) orphan-cleanup ticker.
 	thumbSyncInterval = 30 * time.Minute
-	// maxUploadJournalReconcile bounds how many recent successful journal
-	// entries ReconcileMissingUploadLinks scans per sweep.  It only restores
-	// links for hosts whose recording row exists, so 1000 covers a large run.
-	maxUploadJournalReconcile = 1000
 )
 
 // startRecordingsThumbSync runs SyncRecordingsThumbnails (the cheap DB->DB copy)

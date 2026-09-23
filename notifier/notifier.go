@@ -16,6 +16,9 @@ const (
 	KeyDiskWarning  = "disk_warning:%s"  // % path
 	KeyDiskCritical = "disk_critical:%s" // % path
 	KeyStuckPause   = "stuck_pause"      // fleet-wide paused-but-still-assigned channels
+	// KeyUploadLinkWriteFailure is the database rejecting upload_links writes, so
+	// no recording can be marked as uploaded at all (see server/write_path_check.go).
+	KeyUploadLinkWriteFailure = "upload_link_write_failure"
 )
 
 // Default is the package-level notifier singleton.

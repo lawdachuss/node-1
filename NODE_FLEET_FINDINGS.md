@@ -450,3 +450,93 @@ escape hatch is gone.
 8. **#C5 masking secret** — clear the `-` placeholder secret; it is the only finding here that needs a
    repository setting rather than code, and it is the reason the fleet's CI logs read like
    `[2026***09***21]`. Everything else in the C-series is fixed and only needs this commit deployed.
+
+---
+
+## 2026-09-23 — the write path itself was broken (fixed, with guards)
+
+Found while clearing the `preview_images` backlog and running the upload-link
+reconcile sweep. This one cost a day of link data and was invisible to every
+existing health check.
+
+### W1. `notify_requesters_on_upload()` rejected **every** `upload_links` insert
+A site-side `AFTER INSERT` trigger on `public.upload_links` (added 2026-09-22)
+called a function whose first statement joined
+
+```sql
+public.user_notification_preferences unp ON unp.user_id = rq.user_id   -- uuid = text
+```
+
+`user_notification_preferences.user_id` is `uuid`, `requests.user_id` is `text`.
+PL/pgSQL plans a statement when it is first reached, so the trigger raised
+`42883 operator does not exist: uuid = text` at **parse analysis for every insert,
+regardless of data** — PostgREST surfaced it as HTTP 404 on
+`POST /rest/v1/upload_links`. The second branch had the mirror-image bug
+(`performer_follows.user_id` uuid → `user_notifications.user_id` text).
+
+Consequence: the fleet could not mark any recording as uploaded. It kept
+recording and uploading the whole time, so every recording was stored with the
+enqueue-time row and **zero hosts**:
+
+| day | recordings | with ≥1 upload link |
+|---|---|---|
+| 09-21 and earlier | 603–1218/day | 100% |
+| 09-22 | 345 | 264 |
+| 09-23 (before fix) | 98 | 0 |
+| 09-23 (after fix) | 107 | 103 |
+
+Fixed in `supabase/migrations/20260923010000_fix_notify_requesters_on_upload.sql`
+(the two casts plus a pinned `search_path`), applied to the live project. The site
+repo owns that function: carry the same body there or its next deploy reverts it.
+
+**Repair:** `go run ./cmd/reconcilelinks` rebuilt **958** upload links across 175
+recordings from the upload journal (5–6 hosts each); 924 of the recreated rows
+were verified link-for-link against the journal entry they came from. Host-less
+recordings went 178 → 3, and 09-22 coverage is back to 345/345. The 3 that remain
+have no journal success carrying a link — they never landed on any host.
+
+### W2. Nothing could see it: the failure was silent by construction
+A link is written by a background pipeline step whose failure is a log line
+nobody reads, while the recording itself keeps looking fine. A read-only health
+check (`/app_settings`), the PostgREST schema cache and `select 1` all stayed
+green with the write path closed. Two other gaps made the recovery blind:
+`/api/orphans` filtered on *row existence* (row = written at enqueue, so a
+host-less recording looked uploaded) and the reconcile sweep was bounded to the
+newest 1,000 journal successes, so older gaps could never be repaired.
+
+### Guards now in place
+| guard | what it catches | where |
+|---|---|---|
+| Upload-link write-path canary — inserts one probe row (reserved host `__write_path_probe__`, all-zero recording id) and deletes it | any database-side rule that rejects the insert: broken trigger, type mismatch, revoked privilege, missing column. Only a real INSERT can see this class | `server/write_path_check.go`, run at startup and on the maintenance ticker |
+| Fleet alert on a closed write path (ntfy/Discord, cooldown-keyed, cleared on recovery) | nobody noticing: the alert says the fleet cannot mark uploads as done | `main.go` wires `notifier.Notify` |
+| Admin panel line **Link writes (this node)**: ok / FAILING / not checked yet | the operator-facing signal, next to **No host at all (global)** | `router/view/templates/admin.html` |
+| `GET /api/health` JSON, `503` unless the write path is *verified* open | monitors and audit scripts: a closed write path is machine-detectable instead of hiding in a log line. `unchecked` is not reported as healthy either | `router/health_handler.go` |
+| Sweep preflight — the reconcile sweep refuses to run, and reports, while links cannot be written | hundreds of doomed inserts burying the one line that matters | `server/db.go` |
+| Reconcile alerts when every restore fails even though the probe passed | a per-row rejection the canary cannot see | `server/db.go` |
+| `/api/orphans` decided by upload LINKS, not row existence; every `*.merged.mp4` output judged like any other file | stranded recordings being invisible to the rescue path | `router/router_handler.go` |
+| Unbounded reconcile sweep scoped to the zero-link set | crash gaps older than a journal window | `server/db.go`, `database.GetJournalSuccessWithLinksFor` |
+| `preview_images` prune of rows whose recording is gone, on the maintenance ticker | 10,691 rows of litter that nothing else removed (all had `recording_id NULL`, so the table's cascade never fired) | `server/preview_prune.go`, `cmd/pruneorphanpreviews` |
+| CI: `go build ./... && go vet ./... && go test ./...` on every push/PR | a broken tree reaching the fleet, which rebuilds from source every session | `.github/workflows/ci.yml` |
+
+### Open item: the alerts have no destination
+Checked live on 2026-09-23: **no notification backend is configured anywhere** —
+no `DISCORD_WEBHOOK`/`NTFY_URL` in the fleet `.env`, no ntfy/discord keys in
+`app_settings`. `notifier.Notify` therefore logs and drops every alert the fleet
+raises, which today includes disk warning/critical and stuck-pause as well as the
+new write-path alert. The node now says so once at startup
+(`[WARN] no notification destination configured …`), and the state is visible on
+`/api/health`, but until an ntfy topic or Discord webhook is set, "who gets
+told?" is the weakest link in this whole chain.
+
+### Rule: apply the migration before the code that needs it
+Two migrations now gate behaviour: `20260923000000` (the no-host lookup used by
+`/api/orphans`, the panel and the sweep) and `20260923010000` (the trigger fix).
+Both are idempotent. Without them the code degrades with a clear log line instead
+of failing — but the guards above exist because a silent degraded mode is how
+this got to a day of lost links:
+
+```bash
+node _live_sql.js --file supabase/migrations/20260923000000_recordings_without_upload_links.sql
+node _live_sql.js --file supabase/migrations/20260923010000_fix_notify_requesters_on_upload.sql
+go run ./cmd/reconcilelinks   # reports the write path, then rebuilds missing links
+```

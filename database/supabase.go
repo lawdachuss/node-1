@@ -626,19 +626,106 @@ func (c *Client) GetRecording(filename string) (*Recording, error) {
 // time (SaveRecordingBasics) — BEFORE any upload — so "row exists" is not proof
 // that the file's content reached a host.  Disk cleanup must only delete local
 // files whose content is actually safe in the cloud.
+//
+// It resolves through LookupRecordingLinkState rather than an embedded
+// `upload_links(host)` select: the deployed schema has no foreign key between
+// upload_links and recordings, so PostgREST rejects that embed with PGRST200 and
+// an embed-based check answers "no links" (with an error) for every file.
 func (c *Client) HasUploadedLinks(filename string) (bool, error) {
-	var recordings []struct {
-		UploadLinks []UploadLink `json:"upload_links"`
-	}
-	err := c.getN(fmt.Sprintf("/recordings?filename=eq.%s&select=upload_links(host)&limit=1",
-		url.QueryEscape(filename)), &recordings, metadataSaveMaxRetries)
+	_, hasLinks, err := c.LookupRecordingLinkState([]string{filename})
 	if err != nil {
 		return false, err
 	}
-	if len(recordings) == 0 {
-		return false, nil
+	return hasLinks[filename], nil
+}
+
+// GetRecordingFilenames returns every filename in the recordings table.
+//
+// Used by callers that need "which files does the database know about?" — e.g.
+// deciding which preview_images rows belong to a recording.  It deliberately
+// selects nothing but the filename: the table is large and the answer is a set.
+func (c *Client) GetRecordingFilenames() (map[string]bool, error) {
+	var rows []struct {
+		Filename string `json:"filename"`
 	}
-	return len(recordings[0].UploadLinks) > 0, nil
+	if err := c.getAllPaginated("/recordings?select=filename", &rows); err != nil {
+		return nil, err
+	}
+	filenames := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		if r.Filename != "" {
+			filenames[r.Filename] = true
+		}
+	}
+	return filenames, nil
+}
+
+// LookupRecordingLinkState resolves, for each given filename, the recordings row
+// id and whether that recording has at least one upload link.  A filename missing
+// from ids has no recordings row at all; a name in ids but not in hasLinks has a
+// row but zero upload links — the state a recording is left in when its upload leg
+// died and nothing ever repaired it.
+//
+// This is the FK-free way to ask "does this recording have a host?": upload_links
+// has no foreign key to recordings in the deployed schema, so PostgREST rejects an
+// embedded `upload_links(host)` select with PGRST200 ("no relationship between
+// recordings and upload_links") — an embed-based check cannot work against this
+// project at all.  Both sides are queried by hand instead, two small requests per
+// releaseBatchSize filenames, and only the ids are sent to the second query.
+func (c *Client) LookupRecordingLinkState(filenames []string) (map[string]string, map[string]bool, error) {
+	ids := make(map[string]string, len(filenames))
+	hasLinks := make(map[string]bool, len(filenames))
+	if len(filenames) == 0 {
+		return ids, hasLinks, nil
+	}
+
+	for start := 0; start < len(filenames); start += releaseBatchSize {
+		end := start + releaseBatchSize
+		if end > len(filenames) {
+			end = len(filenames)
+		}
+		batch := filenames[start:end]
+
+		var rows []struct {
+			ID       string `json:"id"`
+			Filename string `json:"filename"`
+		}
+		path := "/recordings?select=id,filename&filename=in.(" + joinEscaped(batch) + ")"
+		if err := c.get(path, &rows); err != nil {
+			return nil, nil, fmt.Errorf("lookup recordings batch %d: %w", start/releaseBatchSize+1, err)
+		}
+
+		byID := make(map[string]string, len(rows))
+		recIDs := make([]string, 0, len(rows))
+		for _, r := range rows {
+			if r.ID == "" || r.Filename == "" {
+				continue
+			}
+			ids[r.Filename] = r.ID
+			byID[r.ID] = r.Filename
+			recIDs = append(recIDs, r.ID)
+		}
+
+		for s := 0; s < len(recIDs); s += releaseBatchSize {
+			e := s + releaseBatchSize
+			if e > len(recIDs) {
+				e = len(recIDs)
+			}
+			var links []struct {
+				RecordingID string `json:"recording_id"`
+			}
+			filter := fmt.Sprintf("/upload_links?select=recording_id&recording_id=in.(%s)", strings.Join(recIDs[s:e], ","))
+			if err := c.get(filter, &links); err != nil {
+				return nil, nil, fmt.Errorf("lookup upload links batch %d: %w", s/releaseBatchSize+1, err)
+			}
+			for _, l := range links {
+				if name := byID[l.RecordingID]; name != "" {
+					hasLinks[name] = true
+				}
+			}
+		}
+	}
+	return ids, hasLinks, nil
 }
 
 // GetRecordingsByUsername retrieves all recordings for a username
@@ -1064,9 +1151,101 @@ func (c *Client) DeletePreviewImage(filename string) error {
 	return c.delete(fmt.Sprintf("/preview_images?filename=eq.%s", url.QueryEscape(filename)))
 }
 
+// DeleteOrphanedPreviewImages removes preview_images rows that no longer belong
+// to a recording: older than cutoff and whose filename is not in keep.
+//
+// These rows are invisible litter that nothing cleans up on its own.  The table
+// has `recording_id UUID REFERENCES recordings(id) ON DELETE CASCADE`, but every
+// stale row in practice has recording_id NULL (it was written by the preview-link
+// paths, which know only the filename), so the cascade can never reach them.  A
+// thumbnail-less recordings row can't be the trigger either: the row is gone.
+//
+// keep is the caller's "do not touch" set — filenames that still have a
+// recordings row (their DB assets are the last copy of the presentation images
+// once the local file is gone) plus any video file still present on disk.
+//
+// The scan is cursor-based (id > last-seen) rather than offset-based on purpose:
+// kept rows stay in the table, so an offset scan would revisit them forever.
+func (c *Client) DeleteOrphanedPreviewImages(cutoff time.Time, keep map[string]bool) (int, error) {
+	return c.pruneOrphanedPreviewImages(cutoff, keep, true)
+}
+
+// CountOrphanedPreviewImages reports how many rows DeleteOrphanedPreviewImages
+// would remove, without deleting anything.  It shares the scan, so a dry run can
+// never drift from what the real sweep does.
+func (c *Client) CountOrphanedPreviewImages(cutoff time.Time, keep map[string]bool) (int, error) {
+	return c.pruneOrphanedPreviewImages(cutoff, keep, false)
+}
+
+// pruneOrphanedPreviewImages walks preview_images older than cutoff and, per row
+// whose filename is not in keep, either deletes it (in small id=in.(...) batches,
+// well under the proxy's URL limit) or merely counts it.
+func (c *Client) pruneOrphanedPreviewImages(cutoff time.Time, keep map[string]bool, remove bool) (int, error) {
+	const (
+		pageSize    = 500
+		deleteBatch = 50
+	)
+
+	total := 0
+	cursor := ""
+	for {
+		path := fmt.Sprintf("/preview_images?select=id,filename&uploaded_at=lt.%s&order=id.asc&limit=%d",
+			url.QueryEscape(cutoff.UTC().Format(time.RFC3339)), pageSize)
+		if cursor != "" {
+			path += "&id=gt." + url.QueryEscape(cursor)
+		}
+
+		var page []struct {
+			ID       string `json:"id"`
+			Filename string `json:"filename"`
+		}
+		if err := c.get(path, &page); err != nil {
+			return total, fmt.Errorf("page orphaned preview images: %w", err)
+		}
+		if len(page) == 0 {
+			return total, nil
+		}
+		cursor = page[len(page)-1].ID
+
+		ids := make([]string, 0, len(page))
+		for _, row := range page {
+			if row.ID == "" || keep[row.Filename] {
+				continue
+			}
+			ids = append(ids, row.ID)
+		}
+		if remove {
+			for start := 0; start < len(ids); start += deleteBatch {
+				end := start + deleteBatch
+				if end > len(ids) {
+					end = len(ids)
+				}
+				batch := ids[start:end]
+				if err := c.delete(fmt.Sprintf("/preview_images?id=in.(%s)", strings.Join(batch, ","))); err != nil {
+					return total, fmt.Errorf("delete orphaned preview images (%d row batch): %w", len(batch), err)
+				}
+			}
+		}
+		total += len(ids)
+
+		if len(page) < pageSize {
+			return total, nil
+		}
+	}
+}
+
 // DeleteUploadLinksByRecordingID removes all upload links for a recording
 func (c *Client) DeleteUploadLinksByRecordingID(recordingID string) error {
 	return c.delete(fmt.Sprintf("/upload_links?recording_id=eq.%s", url.QueryEscape(recordingID)))
+}
+
+// DeleteUploadLinksByHost removes every upload link recorded for one host.  Used
+// by the upload-link write-path canary (server.VerifyUploadLinkWritePath) to
+// remove its probe row — and, because it filters on the host rather than the
+// probe's id, to clear up a probe row left behind by a run that was killed
+// between its insert and its delete.
+func (c *Client) DeleteUploadLinksByHost(host string) error {
+	return c.delete(fmt.Sprintf("/upload_links?host=eq.%s", url.QueryEscape(host)))
 }
 
 // ============================================================================
@@ -1611,16 +1790,73 @@ func (c *Client) GetJournalEntriesByStatus(status string) ([]UploadJournal, erro
 	return entries, err
 }
 
-// GetJournalSuccessWithLinks retrieves recent upload-journal success entries
-// that carry a persisted download link.  These are the rows from which a
-// recording's missing upload_links can be rebuilt after a crash (see
+// GetJournalSuccessWithLinksFor retrieves the upload-journal success entries
+// that carry a persisted download link for exactly the given filenames — the rows
+// from which a recording's missing upload_links can be rebuilt after a crash (see
 // server.ReconcileMissingUploadLinks).  `link=like.*` matches every non-null,
 // non-empty string; NULL rows are excluded automatically.
-func (c *Client) GetJournalSuccessWithLinks(limit int) ([]UploadJournal, error) {
-	var entries []UploadJournal
-	path := "/upload_journal?status=eq.success&link=like.*&select=file_hash,filename,host,link&order=updated_at.desc&limit=" + strconv.Itoa(limit)
-	err := c.get(path, &entries)
-	return entries, err
+//
+// Deliberately not limited by recency (no limit, no order): the previous "most
+// recent N successes" window left every gap older than the window permanently
+// unfixable.  Scoping by filename is what keeps that affordable — the caller asks
+// only about the recordings that currently have zero upload links (a few hundred
+// out of ~27k), so the sweep never pages the whole journal, and each request stays
+// inside the proxy's URL budget at releaseBatchSize filenames.
+func (c *Client) GetJournalSuccessWithLinksFor(filenames []string) ([]UploadJournal, error) {
+	entries := make([]UploadJournal, 0, len(filenames))
+	for start := 0; start < len(filenames); start += releaseBatchSize {
+		end := start + releaseBatchSize
+		if end > len(filenames) {
+			end = len(filenames)
+		}
+		var page []UploadJournal
+		path := "/upload_journal?select=file_hash,filename,host,link&status=eq.success&link=like.*&filename=in.(" +
+			joinEscaped(filenames[start:end]) + ")"
+		if err := c.get(path, &page); err != nil {
+			return nil, fmt.Errorf("lookup journal successes batch %d: %w", start/releaseBatchSize+1, err)
+		}
+		entries = append(entries, page...)
+	}
+	return entries, nil
+}
+
+// RecordingsWithoutUploadLinks returns the filenames of every recording that has
+// no upload link at all, via the recordings_without_upload_links() SQL function
+// (migration 20260923000000).
+//
+// A row's presence is not proof of an upload — the row is written at ENQUEUE time
+// — and upload_links has no foreign key to recordings, so this question cannot be
+// asked with an embedded select (PGRST200) or by diffing client-side without
+// downloading ~125k link rows.  The function answers it exactly in one request;
+// it is additive and read-only, so callers degrade to "unavailable" when it has
+// not been applied yet (see NoHostsFuncMissing).
+func (c *Client) RecordingsWithoutUploadLinks() ([]string, error) {
+	var rows []struct {
+		Filename string `json:"filename"`
+	}
+	if err := c.get("/rpc/recordings_without_upload_links", &rows); err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if r.Filename != "" {
+			names = append(names, r.Filename)
+		}
+	}
+	return names, nil
+}
+
+// NoHostsFuncMissing reports whether err means the
+// recordings_without_upload_links() SQL function is not available — either the
+// migration has not been applied or PostgREST has not reloaded its schema cache
+// yet (PGRST202 "function not found", 42883 undefined_function).
+func NoHostsFuncMissing(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "recordings_without_upload_links") &&
+		(strings.Contains(msg, "PGRST202") || strings.Contains(msg, "42883"))
 }
 
 // GetUploadLinkHosts returns the set of hosts for which a recording already

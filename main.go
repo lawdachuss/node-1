@@ -762,6 +762,30 @@ func start(c *cli.Context) error {
 	// Route disk-threshold alerts through the notifier (Discord/ntfy).
 	server.DiskAlert = notifier.Notify
 
+	// Same wiring for the upload-link write-path canary.  The recovery hook clears
+	// the alert cooldown, so a path that breaks again after a repair is reported
+	// immediately rather than after the previous alert's cooldown.
+	server.LinkPathWriteAlert = notifier.Notify
+	server.LinkPathWriteRecovered = notifier.Default.ResetCooldown
+
+	// An alert with nowhere to go is just a log line, and the upload-link write
+	// path is exactly the kind of failure that needs to leave the node.  Say so
+	// once at startup rather than assuming someone configured ntfy/Discord.
+	if !((server.Config.NtfyURL != "" && server.Config.NtfyTopic != "") || server.Config.DiscordWebhookURL != "") {
+		fmt.Println("[WARN] no notification destination configured (ntfy-url + ntfy-topic, or discord-webhook) — " +
+			"alerts such as a broken upload-link write path will only appear in this node's log and on /api/health")
+	}
+
+	// Verify the upload_links write path once at startup, before the pipelines can
+	// produce recordings that could never be marked as uploaded.  A broken write
+	// path is reported here (and by every later check) instead of surfacing hours
+	// later as a pile of host-less recordings.
+	go func() {
+		if err := server.CheckUploadLinkWritePath(); err != nil {
+			fmt.Printf("[startup] upload-link write path is BROKEN: %v\n", err)
+		}
+	}()
+
 	// ── Startup orphan cleanup ──────────────────────────────────────────
 	// Delete DB rows left behind when a previous runner was killed mid-pipeline.
 	// SaveRecordingBasics creates a row at enqueue time; if the runner dies

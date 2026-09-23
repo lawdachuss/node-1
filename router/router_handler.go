@@ -237,7 +237,7 @@ type RecordingReconciliation struct {
 	LocalBytesHuman string // human-readable total size of LocalFiles
 	SupabaseTotal   int    // GLOBAL recording rows in Supabase (all nodes)
 	HasSupabase     bool   // true when the count query succeeded
-	Orphans         int    // on-disk files with no Supabase metadata row
+	Orphans         int    // on-disk files not provably uploaded (no metadata row, or no upload link)
 	OrphanBytesHuman string
 	InFlight        int    // files currently queued/active in the upload pipeline
 	// Stuck = orphan files not in the upload pipeline AND older than the
@@ -252,6 +252,24 @@ type RecordingReconciliation struct {
 	ZeroByteStuck int
 	Verdict       string // "healthy" | "warning" | "critical"
 	VerdictDetail string
+
+	// NoHosts is the GLOBAL count of recordings with zero upload links — rows
+	// whose content never reached a host.  A recordings row alone does not mean
+	// the video is safe: it is created at enqueue time, before any upload.  The
+	// ones whose local copy is already gone can never be re-uploaded, so this is
+	// the fleet-wide "upload never landed" tally the orphan list only shows for
+	// files still on this node's disk.
+	NoHosts    int
+	HasNoHosts bool // true when the upload-link index query succeeded
+
+	// LinkWritePath is this node's upload-link write-path canary (see
+	// server.VerifyUploadLinkWritePath).  It answers the question NoHosts only
+	// raises: can the fleet save a link AT ALL right now?  A database-side rule
+	// that rejects the insert makes every recording host-less no matter how well
+	// the uploads themselves go, and nothing else in the panel would say so.
+	LinkWritePathChecked bool
+	LinkWritePathOK      bool
+	LinkWritePathDetail  string
 }
 
 // stuckOrphanThreshold: an orphan younger than this is assumed still working
@@ -295,6 +313,19 @@ func computeRecordingReconciliation(uploads *entity.UploadsResponse) *RecordingR
 			r.SupabaseTotal = n
 			r.HasSupabase = true
 		}
+	}
+	// Recordings with no host at all (fleet-wide).  Served from the same cached
+	// upload-link index scanOrphanFiles uses, so it costs no extra query.
+	if all, links, err := server.RecordingUploadLinkIndex(); err == nil {
+		r.NoHosts = len(all) - len(links)
+		r.HasNoHosts = true
+	}
+	// Canary result, from the last periodic check (no extra request here: the
+	// panel must not turn a page load into a write against the database).
+	if st := server.UploadLinkWritePathStatus(); st.Checked {
+		r.LinkWritePathChecked = true
+		r.LinkWritePathOK = st.OK
+		r.LinkWritePathDetail = st.Detail
 	}
 
 	// in-flight filenames (queued + actively uploading)
@@ -361,16 +392,16 @@ func computeRecordingReconciliation(uploads *entity.UploadsResponse) *RecordingR
 	case r.Stuck > 0:
 		r.Verdict = "critical"
 		if r.ZeroByteStuck > 0 {
-			r.VerdictDetail = fmt.Sprintf("%d recording(s) on disk have no cloud metadata and are not in the upload pipeline — likely permanent loss (%d never wrote a single byte: the stream was cut before the first segment).", r.Stuck, r.ZeroByteStuck)
+			r.VerdictDetail = fmt.Sprintf("%d recording(s) on disk have no uploaded copy and are not in the upload pipeline — likely permanent loss (%d never wrote a single byte: the stream was cut before the first segment).", r.Stuck, r.ZeroByteStuck)
 		} else {
-			r.VerdictDetail = fmt.Sprintf("%d recording(s) on disk have no cloud metadata and are not in the upload pipeline — likely permanent loss.", r.Stuck)
+			r.VerdictDetail = fmt.Sprintf("%d recording(s) on disk have no uploaded copy and are not in the upload pipeline — likely permanent loss.", r.Stuck)
 		}
 	case r.Orphans > r.InFlight:
 		r.Verdict = "warning"
 		r.VerdictDetail = fmt.Sprintf("%d orphan file(s) exceed the active upload queue (%d); verify the upload pipeline is draining.", r.Orphans-r.InFlight, r.InFlight)
 	default:
 		r.Verdict = "healthy"
-		r.VerdictDetail = "Every on-disk recording is either in Supabase or currently moving through the upload pipeline."
+		r.VerdictDetail = "Every on-disk recording has an uploaded copy or is currently moving through the upload pipeline."
 	}
 	return r
 }
@@ -698,7 +729,7 @@ func UpdateConfig(c *gin.Context) {
 	}
 
 	// Update uploader credentials (VOE.sx / Streamtape / Mixdrop / Vidara)
-if req.VoeSXAPIKey != "" || req.StreamtapeLogin != "" || req.StreamtapeKey != "" || req.MixdropEmail != "" || req.MixdropToken != "" || req.VidaraKey != "" || req.VidMolyKey != "" {
+	if req.VoeSXAPIKey != "" || req.StreamtapeLogin != "" || req.StreamtapeKey != "" || req.MixdropEmail != "" || req.MixdropToken != "" || req.VidaraKey != "" || req.VidMolyKey != "" {
 			server.UpdateUploaderCredentials(req.VoeSXAPIKey, req.StreamtapeLogin, req.StreamtapeKey, req.MixdropEmail, req.MixdropToken, req.VidaraKey, req.VidMolyKey)
 	}
 
@@ -1412,8 +1443,55 @@ func ListNodeFiles(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"files": scanAllVideoFiles()})
 }
 
+// orphanNeedsUpload reports whether an on-disk video file still has to be
+// uploaded — i.e. its content is not demonstrably in the cloud.
+//
+// hasRow is every filename with a recordings row; safeInCloud is the subset that
+// is proven safe (at least one upload link, or — when the link index is
+// unavailable — a recordings row, the old conservative rule).
+//
+// This replaces a plain "is the filename in the recordings table?" test, which
+// answered a different question: the recordings row is written at ENQUEUE time
+// (SaveRecordingBasics), long before any host has the file.  So a recording whose
+// upload never landed (no embed URL, no upload_links) looked identical to a
+// healthy one, kept its local copy out of every consumer of this list —
+// including the /api/orphans/retry rescue path — and stayed host-less forever.
+//
+// Session-continuity merge intermediates (.merged.mp4) are held on disk by design
+// until the live session ends and have no recordings row at all; a .merged. file
+// that DOES have a row is a published recording, so it is judged like any other.
+func orphanNeedsUpload(name string, hasRow, safeInCloud map[string]bool) bool {
+	if strings.Contains(name, ".merged.") && !hasRow[name] {
+		return false
+	}
+	return !safeInCloud[name]
+}
+
+// orphanIndexWarnThrottle keeps the degraded-mode warning to one line per
+// interval: /api/orphans is polled every few seconds while the admin panel is
+// open, so a persistent cause (typically the migration that adds the no-host
+// function not being applied yet) would otherwise flood the log.
+const orphanIndexWarnInterval = 5 * time.Minute
+
+var (
+	orphanIndexWarnMu   sync.Mutex
+	orphanIndexWarnedAt time.Time
+)
+
+func logOrphanIndexUnavailable(err error) {
+	orphanIndexWarnMu.Lock()
+	defer orphanIndexWarnMu.Unlock()
+	if time.Since(orphanIndexWarnedAt) < orphanIndexWarnInterval {
+		return
+	}
+	orphanIndexWarnedAt = time.Now()
+	log.Printf("[orphans] upload-link index unavailable (%v) — falling back to recordings-row existence", err)
+}
+
 // scanOrphanFiles scans videos/ and the configured OutputDir for video files
-// that exist on disk but have no Supabase recording entry (orphans).
+// that exist on disk but are not provably in the cloud yet (orphans).  That is
+// either a file with no recordings row at all, or one whose recording has zero
+// upload links.
 // Sidecar parts (.video./.audio./.muxed.) are excluded — they are handled by
 // the recovery pipeline (CleanupOrphanedFiles), not the orphan list.
 func scanOrphanFiles() []orphanEntry {
@@ -1422,12 +1500,23 @@ func scanOrphanFiles() []orphanEntry {
 		dirs = append(dirs, server.Config.OutputDir)
 	}
 
-	// Load all recordings once to avoid N+1 queries
-	uploaded := map[string]bool{}
+	// Decide on upload LINKS, not row existence (see orphanNeedsUpload), using
+	// the shared cached index — the admin panel polls this list every few seconds
+	// and the reconciliation panel consults the same index.
+	hasRow, safeInCloud := map[string]bool{}, map[string]bool{}
 	if dbClient := server.GetDBClient(); dbClient != nil {
-		if allRecs, err := dbClient.GetAllRecordings(); err == nil {
-			for i := range allRecs {
-				uploaded[allRecs[i].Filename] = true
+		if all, links, err := server.RecordingUploadLinkIndex(); err == nil {
+			hasRow, safeInCloud = all, links
+		} else {
+			// Degrade to the old row-existence rule: with no link index the only
+			// defensible answer is "a recordings row exists", so a Supabase
+			// hiccup can never turn this list into every file on disk.
+			logOrphanIndexUnavailable(err)
+			if allRecs, rErr := dbClient.GetAllRecordings(); rErr == nil {
+				for i := range allRecs {
+					hasRow[allRecs[i].Filename] = true
+					safeInCloud[allRecs[i].Filename] = true
+				}
 			}
 		}
 	}
@@ -1456,13 +1545,8 @@ func scanOrphanFiles() []orphanEntry {
 			if channel.IsFinalizingTemp(name) || strings.Contains(name, ".deleting.") {
 				continue
 			}
-			// Session-continuity merge intermediates (.merged.mp4) are held
-			// intentionally until the live session ends; not orphans.
-			if strings.Contains(name, ".merged.") {
+			if !orphanNeedsUpload(name, hasRow, safeInCloud) {
 				continue
-			}
-			if uploaded[name] {
-				continue // not orphaned — already uploaded
 			}
 			info, err := e.Info()
 			if err != nil {
@@ -1900,12 +1984,12 @@ func sumNodeLoad(nodes []database.Node) int {
 
 // NodesData represents the data structure for the nodes page.
 type NodesData struct {
-	Nodes        []database.Node
-	OnlineCount  int
+	Nodes         []database.Node
+	OnlineCount   int
 	DrainingCount int
-	TotalLoad    int
-	Mode         string
-	MyNodeID     string
+	TotalLoad     int
+	Mode          string
+	MyNodeID      string
 }
 
 // NodesPage renders the nodes dashboard.
@@ -2101,11 +2185,11 @@ func poolEntries() ([]PoolEntry, string) {
 				status = "connecting"
 			}
 			e := PoolEntry{
-				Username:   ch.Username,
-				Site:       ch.Site,
-				Status:     status,
-				IsLive:     ch.IsOnline,
-				Source:     "local",
+				Username: ch.Username,
+				Site:     ch.Site,
+				Status:   status,
+				IsLive:   ch.IsOnline,
+				Source:   "local",
 			}
 			poolEntryLocalState(&e, localInfo, localPending)
 			entries = append(entries, e)
@@ -2153,9 +2237,9 @@ func GetPoolJSON(c *gin.Context) {
 
 // PoolCheckResponse is the JSON response for the realtime pool channel checker.
 type PoolCheckResponse struct {
-	Exists bool   `json:"exists"`
-	Source string `json:"source,omitempty"`
-	IsLive bool   `json:"isLive"`
+	Exists  bool   `json:"exists"`
+	Source  string `json:"source,omitempty"`
+	IsLive  bool   `json:"isLive"`
 	Message string `json:"message"`
 }
 
@@ -2231,11 +2315,11 @@ func CheckPoolChannel(c *gin.Context) {
 
 // PoolAddRequest is the request body for adding a channel to the pool.
 type PoolAddRequest struct {
-	Site       string `json:"site" form:"site"`
-	Username   string `json:"username" form:"username" binding:"required"`
-	Resolution int    `json:"resolution" form:"resolution"`
-	Framerate  int    `json:"framerate" form:"framerate"`
-	MaxDuration int   `json:"max_duration" form:"max_duration"`
+	Site        string `json:"site" form:"site"`
+	Username    string `json:"username" form:"username" binding:"required"`
+	Resolution  int    `json:"resolution" form:"resolution"`
+	Framerate   int    `json:"framerate" form:"framerate"`
+	MaxDuration int    `json:"max_duration" form:"max_duration"`
 }
 
 // AddToPool adds a channel to the pool.  In pooled mode this creates a
@@ -2278,12 +2362,12 @@ func AddToPool(c *gin.Context) {
 			return
 		}
 		conf := &entity.ChannelConfig{
-			Site:       req.Site,
-			Username:   req.Username,
-			Framerate:  req.Framerate,
-			Resolution: req.Resolution,
+			Site:        req.Site,
+			Username:    req.Username,
+			Framerate:   req.Framerate,
+			Resolution:  req.Resolution,
 			MaxDuration: req.MaxDuration,
-			CreatedAt:  time.Now().Unix(),
+			CreatedAt:   time.Now().Unix(),
 		}
 		if err := server.Manager.CreateChannel(conf, true); err != nil {
 			c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": err.Error()})
@@ -2300,11 +2384,11 @@ func AddToPool(c *gin.Context) {
 	}
 
 	assignment := database.ChannelAssignment{
-		Username:   req.Username,
-		Site:       req.Site,
-		Status:     "unassigned",
-		Resolution: req.Resolution,
-		Framerate:  req.Framerate,
+		Username:    req.Username,
+		Site:        req.Site,
+		Status:      "unassigned",
+		Resolution:  req.Resolution,
+		Framerate:   req.Framerate,
 		MaxDuration: req.MaxDuration,
 	}
 
