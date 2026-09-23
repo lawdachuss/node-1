@@ -90,10 +90,25 @@ func setStubManager(t *testing.T, m *stubManager) {
 	t.Cleanup(func() { server.Manager = nil })
 }
 
+// testIsolatedMode pins the pool mode every test in this file assumes.
+//
+// detectPoolMode() treats any GITHUB_REPOSITORY containing "node-" as pooled,
+// which is exactly what a GitHub Actions runner provides (lawdachuss/node-1) — so
+// without this, these tests pass on a developer machine and fail in CI with a
+// pooled-mode 400 ("Supabase not configured") or an empty assignment list.  The
+// explicit env var wins over the repository name, and SyncNodeEnvironment()
+// recomputes the cached value the handlers read.
+func testIsolatedMode(t *testing.T) {
+	t.Helper()
+	t.Setenv("CHANNEL_POOL_MODE", entity.PoolModeIsolated)
+	server.SyncNodeEnvironment()
+}
+
 // TestPoolChannelCheckFindsConfigured verifies the realtime checker reports a
 // channel that already exists locally as a configured channel.
 func TestPoolChannelCheckFindsConfigured(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	testIsolatedMode(t)
 	server.Config = nil
 	setStubManager(t, &stubManager{channels: []*entity.ChannelInfo{
 		{Username: "Alice", Site: "chaturbate", IsOnline: true},
@@ -124,6 +139,7 @@ func TestPoolChannelCheckFindsConfigured(t *testing.T) {
 // available (exists=false) even when the database is not configured.
 func TestPoolChannelCheckAvailable(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	testIsolatedMode(t)
 	server.Config = nil
 	setStubManager(t, &stubManager{})
 
@@ -148,6 +164,7 @@ func TestPoolChannelCheckAvailable(t *testing.T) {
 // TestPoolChannelCheckRequiresUsername verifies the checker rejects empty input.
 func TestPoolChannelCheckRequiresUsername(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	testIsolatedMode(t)
 	server.Config = nil
 	setStubManager(t, &stubManager{})
 
@@ -167,6 +184,7 @@ func TestPoolChannelCheckRequiresUsername(t *testing.T) {
 // channel_assignments row.
 func TestAddToPoolIsolatedCreatesLocalChannel(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	testIsolatedMode(t)
 	server.Config = &entity.Config{}
 	stub := &stubManager{}
 	setStubManager(t, stub)
@@ -199,6 +217,7 @@ func TestAddToPoolIsolatedCreatesLocalChannel(t *testing.T) {
 // 409 and a clear message before anything is created.
 func TestAddToPoolIsolatedRejectsDuplicate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	testIsolatedMode(t)
 	server.Config = &entity.Config{}
 	stub := &stubManager{channels: []*entity.ChannelInfo{
 		{Username: "alice", Site: "chaturbate"},
@@ -232,6 +251,7 @@ func TestAddToPoolIsolatedRejectsDuplicate(t *testing.T) {
 // local channel in isolated mode.
 func TestRemoveFromPoolIsolatedStopsChannel(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	testIsolatedMode(t)
 	server.Config = &entity.Config{}
 	stub := &stubManager{}
 	setStubManager(t, stub)
@@ -258,6 +278,7 @@ func TestRemoveFromPoolIsolatedStopsChannel(t *testing.T) {
 // table renders with "undefined" usernames.
 func TestPoolJSONUsesSnakeCaseKeys(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	testIsolatedMode(t)
 	server.Config = &entity.Config{}
 	setStubManager(t, &stubManager{channels: []*entity.ChannelInfo{
 		{Username: "alice", Site: "chaturbate", IsOnline: true},
@@ -288,6 +309,7 @@ func TestPoolJSONUsesSnakeCaseKeys(t *testing.T) {
 // each node's pool API to flag paused-but-still-assigned channels.
 func TestPoolJSONIncludesPausedFlags(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	testIsolatedMode(t)
 	server.Config = &entity.Config{}
 	setStubManager(t, &stubManager{channels: []*entity.ChannelInfo{
 		{Username: "bob", Site: "stripchat", IsPaused: true, PauseReason: "manual"},
@@ -329,6 +351,7 @@ func TestPoolJSONIncludesPausedFlags(t *testing.T) {
 // channels in isolated mode instead of showing an empty page.
 func TestPoolPageRendersLocalChannels(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	testIsolatedMode(t)
 	server.Config = &entity.Config{}
 	setStubManager(t, &stubManager{channels: []*entity.ChannelInfo{
 		{Username: "alice", Site: "chaturbate", IsOnline: true},
