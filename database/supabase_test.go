@@ -811,6 +811,94 @@ func TestEnsureChannelExistsEmptyUsernameIsNoop(t *testing.T) {
 }
 
 // ============================================================================
+// AssignmentExistsFold (case-insensitive pool duplicate guard)
+// ============================================================================
+
+// fakeFoldDB serves one channel_assignments read and records the query so the
+// case-insensitive pool check can be exercised without Supabase.
+type fakeFoldDB struct {
+	mu   sync.Mutex
+	rows []ChannelAssignment
+	path string
+}
+
+func (f *fakeFoldDB) handler(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	f.path = r.URL.RequestURI()
+	rows := f.rows
+	f.mu.Unlock()
+
+	// Stands in for PostgREST's ilike: it returns whatever the test declares
+	// matches, including deliberate over-matches.
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(rows)
+}
+
+func newFoldTestClient(t *testing.T, fake *fakeFoldDB) *Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(fake.handler))
+	t.Cleanup(srv.Close)
+	return &Client{URL: srv.URL, APIKey: "test-key", client: srv.Client()}
+}
+
+// TestAssignmentExistsFoldMatchesAnyCasing pins the reason the helper exists:
+// the pool key is case-sensitive but performer names are not, so adding
+// "lunaleoncouplewife" while "LunaLeonCoupleWife" is already pooled must be seen
+// as a duplicate (otherwise two nodes record the same room).
+func TestAssignmentExistsFoldMatchesAnyCasing(t *testing.T) {
+	fake := &fakeFoldDB{rows: []ChannelAssignment{{Username: "LunaLeonCoupleWife"}}}
+	c := newFoldTestClient(t, fake)
+
+	got, err := c.AssignmentExistsFold("lunaleoncouplewife", "chaturbate")
+	if err != nil {
+		t.Fatalf("AssignmentExistsFold: %v", err)
+	}
+	if !got {
+		t.Error("AssignmentExistsFold = false, want true (same room, different casing)")
+	}
+	if !strings.Contains(fake.path, "username=ilike.") {
+		t.Errorf("path = %q, want an ilike filter", fake.path)
+	}
+	if !strings.Contains(fake.path, "site=eq.chaturbate") {
+		t.Errorf("path = %q, want the site filter (the pool key is username+site)", fake.path)
+	}
+}
+
+// TestAssignmentExistsFoldRejectsOverMatch guards the other direction: '_' is a
+// SQL single-character wildcard, so ilike can return names that merely share the
+// pattern.  Only a real case-insensitive name match counts, or a legitimate add
+// would be refused.
+func TestAssignmentExistsFoldRejectsOverMatch(t *testing.T) {
+	fake := &fakeFoldDB{rows: []ChannelAssignment{
+		{Username: "lunaXleoncouplewife"}, // '_' in the query matched an arbitrary char
+	}}
+	c := newFoldTestClient(t, fake)
+
+	got, err := c.AssignmentExistsFold("luna_leoncouplewife", "chaturbate")
+	if err != nil {
+		t.Fatalf("AssignmentExistsFold: %v", err)
+	}
+	if got {
+		t.Error("AssignmentExistsFold = true for an ilike over-match, want false")
+	}
+}
+
+// TestAssignmentExistsFoldEmptyUsernameIsNoop makes sure a blank username never
+// reaches the API (the caller trims, but be explicit).
+func TestAssignmentExistsFoldEmptyUsernameIsNoop(t *testing.T) {
+	fake := &fakeFoldDB{}
+	c := newFoldTestClient(t, fake)
+
+	got, err := c.AssignmentExistsFold("   ", "chaturbate")
+	if err != nil || got {
+		t.Fatalf("blank username: got (%v, %v), want (false, nil)", got, err)
+	}
+	if fake.path != "" {
+		t.Errorf("blank username must not issue a request, got %s", fake.path)
+	}
+}
+
+// ============================================================================
 // TouchChannelRecordings (owned-but-idle last_recorded_at refresh)
 // ============================================================================
 

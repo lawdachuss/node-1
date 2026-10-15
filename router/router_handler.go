@@ -2268,6 +2268,13 @@ func poolChannelExists(username, site string) (bool, string, string) {
 		if a, err := client.GetAssignment(username, site); err == nil && a != nil {
 			return true, "pool", fmt.Sprintf("Channel %q is already in the pool", username)
 		}
+		// The pool key is case-sensitive but cam-site usernames are not, so an
+		// exact lookup misses a differently-cased duplicate (the catalogue holds
+		// both LunaLeonCoupleWife and lunaleoncouplewife) and the add would create
+		// a second row — two nodes recording the same room.
+		if fold, err := client.AssignmentExistsFold(username, site); err == nil && fold {
+			return true, "pool", fmt.Sprintf("Channel %q is already in the pool", username)
+		}
 	}
 
 	// 3. Supabase channels table (case-insensitive).  Only a duplicate in

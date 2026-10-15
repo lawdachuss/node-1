@@ -3020,6 +3020,44 @@ func (c *Client) GetAssignment(username, site string) (*ChannelAssignment, error
 	return &assignments[0], nil
 }
 
+// AssignmentExistsFold reports whether the pool already holds this channel under
+// any casing.
+//
+// channel_assignments is keyed on (username, site) case-SENSITIVELY, but cam-site
+// usernames are case-insensitive — chaturbate.com/LunaLeonCoupleWife and
+// /lunaleoncouplewife are the same room — so an exact lookup (GetAssignment)
+// misses a differently-cased duplicate and the add then creates a second row,
+// i.e. a second node recording the same room.  The catalogue really does carry
+// such a pair today (LunaLeonCoupleWife / lunaleoncouplewife), so this is not
+// hypothetical.
+//
+// The ilike filter can over-match, because '_' is a SQL single-character
+// wildcard and performer names use it, so the rows are matched again in Go with
+// EqualFold and only an actual (case-insensitive) name match counts.
+func (c *Client) AssignmentExistsFold(username, site string) (bool, error) {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return false, nil
+	}
+
+	path := fmt.Sprintf("/channel_assignments?select=username&username=ilike.%s",
+		url.QueryEscape(username))
+	if site != "" {
+		path += fmt.Sprintf("&site=eq.%s", url.QueryEscape(site))
+	}
+
+	var rows []ChannelAssignment
+	if err := c.get(path, &rows); err != nil {
+		return false, err
+	}
+	for _, r := range rows {
+		if strings.EqualFold(r.Username, username) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // GetAssignmentsByStatus returns all assignments with a given status.
 func (c *Client) GetAssignmentsByStatus(status string) ([]ChannelAssignment, error) {
 	var assignments []ChannelAssignment
