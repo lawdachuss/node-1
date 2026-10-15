@@ -13,9 +13,18 @@
  *   - Never removes channels.
  *   - Keeps ~`target_buffer` unassigned channels ready per category (auto
  *     refills as nodes claim/record them). Configurable without redeploy.
+ *   - Registers every channel it adds in the `channels` catalogue (best-effort,
+ *     after the assignment). Nothing deletes channels automatically any more:
+ *     the Go controller's orphan prune used to drop any `channel_assignments`
+ *     row whose username was missing from `channels`, which silently undid
+ *     freshly added channels (they have no catalogue row until a node records
+ *     them) — the "we add channels but the pool never grows" bug. The prune has
+ *     been removed on operator instruction; deletions are manual.
  *   - Manual removals stick: channels the worker has auto-added before are
  *     remembered in `pool_autopilot` and are NOT re-added if they later
- *     disappear from the pool.
+ *     disappear from the pool — but only when the channel also reached the
+ *     `channels` catalogue. An auto-added entry that never got that far was
+ *     removed by the old prune, not by an operator, so it stays eligible.
  *   - Only PUBLIC rooms with num_users > min_viewers qualify.
  *   - Cloudflare/custom anti-bot challenge: a headless Chromium (Browser
  *     Rendering binding) loads Chaturbate, lets the challenge clear, then
@@ -916,13 +925,21 @@ async function runScan(env, dryrun = false, trigger = 'unknown', force = false) 
     });
 
     const addRows = [];
+    const channelRows = [];
     const autoRows = [];
     const logRows = [];
     for (const c of candidates) {
       let reason = null;
-      if (inPoolSet.has(c.username)) reason = 'already in pool / claimed by a node';
-      else if (autoAddedSet.has(c.username)) reason = 'previously auto-added then removed (blocklist)';
-      else if (channelsSet.has(c.username)) reason = 'exists in isolated channels table';
+      if (inPoolSet.has(c.username)) {
+        reason = 'already in pool / claimed by a node';
+      } else if (autoAddedSet.has(c.username) && channelsSet.has(c.username)) {
+        // Only an operator removal leaves BOTH an auto-add record and a
+        // channels-catalogue row.  An auto-added entry that never reached the
+        // catalogue was deleted by the controller's orphan prune before any node
+        // could record it (the old "fresh add has no channels row" race), so it
+        // must stay eligible instead of being blocklisted forever.
+        reason = 'previously auto-added then removed (blocklist)';
+      }
 
       if (reason) {
         result.skipped.push({ category: c.category, username: c.username, reason });
@@ -940,6 +957,14 @@ async function runScan(env, dryrun = false, trigger = 'unknown', force = false) 
         status: 'unassigned',
         resolution: 2160,
         framerate: 60,
+      });
+      // Catalogue row (best-effort, written after the assignment): it keeps the
+      // channels table listing every pooled channel for external tools. It is
+      // no longer what protects the row from deletion — the controller no longer
+      // prunes assignments against the catalogue.
+      channelRows.push({
+        username: c.username,
+        created_at: Math.floor(Date.now() / 1000),
       });
       autoRows.push({
         username: c.username,
@@ -969,6 +994,19 @@ async function runScan(env, dryrun = false, trigger = 'unknown', force = false) 
           autoRows,
           { Prefer: 'resolution=merge-duplicates' }
         );
+        // Best-effort catalogue registration: keeps the channels table listing
+        // every pooled channel. The controller no longer deletes assignments
+        // against that table, so a failure here must never lose the add.
+        try {
+          await sbPostMany(
+            env,
+            'channels?on_conflict=username',
+            channelRows,
+            { Prefer: 'resolution=ignore-duplicates' }
+          );
+        } catch (e) {
+          result.errors.push(`catalogue register failed: ${e.message}`);
+        }
         await logMany(env, logRows);
       } catch (e) {
         result.errors.push(`batch write failed: ${e.message}`);

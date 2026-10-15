@@ -20,6 +20,20 @@ func (c *Coordinator) ReleaseChannel(username, site string) {
 	}
 }
 
+// DeleteChannelAssignment removes a channel from the shared pool entirely.
+// Called when an operator deletes a channel from a node dashboard.
+func (c *Coordinator) DeleteChannelAssignment(username, site string) error {
+	if !c.IsPooled() || c.Client == nil {
+		return nil
+	}
+	// Deliberately DeleteAssignment, NOT ReleaseChannel: releasing only clears
+	// assigned_node/status='unassigned', and the controller re-claims the row
+	// onto some node on its next cycle — so the "deleted" channel was recorded
+	// again about a minute later.  Deleting the row is what makes the operator's
+	// manual delete stick (the same thing the pool editor's Remove does).
+	return c.Client.DeleteAssignment(username, site)
+}
+
 // CreateChannelAssignment creates a channel_assignments row for a new channel.
 // The row is created with status='unassigned' so any node can claim it.
 func (c *Coordinator) CreateChannelAssignment(conf *entity.ChannelConfig) error {
@@ -41,6 +55,15 @@ func (c *Coordinator) CreateChannelAssignment(conf *entity.ChannelConfig) error 
 		MinDurationBeforeUpload: conf.MinDurationBeforeUpload,
 	}
 
+	if err := c.Client.EnsureChannelExists(conf.Username); err != nil {
+		// Best-effort only: the catalogue row keeps the channels table listing
+		// every pooled channel (external tools and the isolated-mode duplicate
+		// check read it), but it is no longer load-bearing — the controller no
+		// longer prunes assignments against the catalogue — so a catalogue
+		// hiccup must never block adding a channel.
+		log.Printf("[coordinator] register %s/%s in channels catalogue: %v (non-fatal)", conf.Site, conf.Username, err)
+	}
+
 	if err := c.Client.BulkInsertAssignments([]database.ChannelAssignment{ca}); err != nil {
 		return err
 	}
@@ -54,15 +77,6 @@ func (c *Coordinator) CreateChannelAssignment(conf *entity.ChannelConfig) error 
 	log.Printf("[coordinator] created channel %s/%s (unassigned) — controller will assign it", conf.Site, conf.Username)
 
 	return nil
-}
-
-// DeleteChannelAssignment removes the channel_assignments row for a channel.
-func (c *Coordinator) DeleteChannelAssignment(username, site string) error {
-	if !c.IsPooled() || c.Client == nil {
-		return nil
-	}
-
-	return c.Client.ReleaseChannel(username, site)
 }
 
 // ConfigFromAssignment converts a ChannelAssignment back to a ChannelConfig.

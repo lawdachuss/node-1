@@ -963,8 +963,14 @@ func (m *Manager) CreateChannel(conf *entity.ChannelConfig, shouldSave bool) err
 //     ffmpeg can take several seconds, and blocking the HTTP handler for that
 //     long causes browser timeouts and duplicate click events. The OS will clean
 //     up any still-running ffmpeg processes if the app exits before Stop returns.
-//  4. Delete the secondary channels-table row in a goroutine — best-effort FK
-//     cleanup that never needs to block the response.
+//
+// In pooled mode the shared channel_assignments row is DELETED (not merely
+// released): ReleaseChannel only clears assigned_node/status, which the
+// controller re-claims onto some node on its next cycle — so a channel deleted
+// from a node dashboard came back about a minute later. Deleting the row is what
+// makes the operator's manual delete stick; the node's assignment-sync then
+// stops the local monitor ("a row released to unassigned … or deleted is
+// respected").
 func (m *Manager) StopChannel(username string) error {
 	thing, ok := m.Channels.Load(username)
 	if !ok {
@@ -978,9 +984,16 @@ func (m *Manager) StopChannel(username string) error {
 	m.Channels.Delete(username)
 	m.ResetCFBlock(username) // a deleted channel is no longer this node's problem
 
-	// Step 2: in pooled mode, release the assignment first
+	// Step 2: in pooled mode, delete the shared pool row. Keep going even if it
+	// fails (the local monitor must still be torn down) but report it: a row that
+	// survives is re-claimed by the controller and the channel comes straight
+	// back.
+	var poolErr error
 	if server.IsPooledMode() && m.Coordinator != nil {
-		m.Coordinator.ReleaseChannel(username, ch.Config.Site)
+		if err := m.Coordinator.DeleteChannelAssignment(username, ch.Config.Site); err != nil {
+			poolErr = fmt.Errorf("delete pool assignment: %w", err)
+			fmt.Printf("[ERROR] delete pool assignment for %q: %v\n", username, err)
+		}
 	}
 
 	// Step 3: synchronous PATCH to the authoritative app_settings blob.
@@ -996,7 +1009,7 @@ func (m *Manager) StopChannel(username string) error {
 		ch.Stop()
 	}()
 
-	return nil
+	return poolErr
 }
 
 // StopWatcher signals the fsnotify file watcher to shut down, releasing

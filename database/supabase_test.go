@@ -697,6 +697,119 @@ func TestPruneOrphanedAssignmentsBatchesUnderURLLimit(t *testing.T) {
 	}
 }
 
+// TestPruneOrphanedAssignmentsSparesFreshRows is the regression guard for the
+// "we add channels but the pool never grows" bug: a brand-new assignment has no
+// channels-catalogue row yet (that row only appears once a node starts
+// recording it), so pruning on the catalogue alone deleted the row before the
+// fleet could ever claim it.  Anything inside assignmentPruneGrace must be safe.
+func TestPruneOrphanedAssignmentsSparesFreshRows(t *testing.T) {
+	fresh := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano)
+	stale := time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339Nano)
+
+	fake := &fakePruneDB{
+		assignments: []ChannelAssignment{
+			{Username: "freshAdd", Site: "chaturbate", Status: "unassigned", CreatedAt: fresh},
+			{Username: "oldDead", Site: "chaturbate", Status: "claimed", CreatedAt: stale},
+		},
+	}
+	c := newPruneTestClient(t, fake)
+
+	removed, err := c.PruneOrphanedAssignments()
+	if err != nil {
+		t.Fatalf("PruneOrphanedAssignments: %v", err)
+	}
+	if removed != 1 {
+		t.Errorf("removed = %d, want 1 (the fresh add must be spared)", removed)
+	}
+	if len(fake.deletes) != 1 {
+		t.Fatalf("DELETE count = %d, want 1", len(fake.deletes))
+	}
+	if got := strings.Join(usernamesFromInFilter(fake.deletes[0]), ","); got != "oldDead" {
+		t.Errorf("deleted usernames = %q, want \"oldDead\"", got)
+	}
+}
+
+// fakeCatalogueDB records the POST EnsureChannelExists issues.
+type fakeCatalogueDB struct {
+	mu       sync.Mutex
+	method   string
+	path     string
+	prefer   string
+	body     string
+	respCode int
+}
+
+func (f *fakeCatalogueDB) handler(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+
+	f.mu.Lock()
+	f.method = r.Method
+	f.path = r.URL.RequestURI()
+	f.prefer = r.Header.Get("Prefer")
+	f.body = string(body)
+	code := f.respCode
+	f.mu.Unlock()
+
+	if code != 0 {
+		w.WriteHeader(code)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+}
+
+// TestEnsureChannelExistsUpsertsWithoutClobbering pins the contract the pool add
+// paths rely on: a minimal insert (username + the one NOT NULL column without a
+// default) upserted by username with resolution=ignore-duplicates, so an
+// existing catalogue row (and its scraped profile) is never overwritten.
+func TestEnsureChannelExistsUpsertsWithoutClobbering(t *testing.T) {
+	fake := &fakeCatalogueDB{}
+	srv := httptest.NewServer(http.HandlerFunc(fake.handler))
+	t.Cleanup(srv.Close)
+	c := &Client{URL: srv.URL, APIKey: "test-key", client: srv.Client()}
+
+	if err := c.EnsureChannelExists("  newchannel  "); err != nil {
+		t.Fatalf("EnsureChannelExists: %v", err)
+	}
+
+	if fake.method != http.MethodPost {
+		t.Errorf("method = %q, want POST", fake.method)
+	}
+	if !strings.HasPrefix(fake.path, "/rest/v1/channels?on_conflict=username") {
+		t.Errorf("path = %q, want /rest/v1/channels?on_conflict=username", fake.path)
+	}
+	if !strings.Contains(fake.prefer, "resolution=ignore-duplicates") {
+		t.Errorf("Prefer = %q, want resolution=ignore-duplicates", fake.prefer)
+	}
+	// SaveChannel posts a single object (PostgREST treats it as a one-row
+	// insert), so the body is one JSON object, not an array.
+	var row map[string]interface{}
+	if err := json.Unmarshal([]byte(fake.body), &row); err != nil {
+		t.Fatalf("body is not a JSON object: %v (%s)", err, fake.body)
+	}
+	if row["username"] != "newchannel" {
+		t.Errorf("username = %v, want trimmed \"newchannel\"", row["username"])
+	}
+	if _, ok := row["created_at"]; !ok {
+		t.Error("body must carry created_at (NOT NULL, no DB default)")
+	}
+}
+
+// TestEnsureChannelExistsEmptyUsernameIsNoop makes sure a blank username never
+// reaches the API (which would 400 on the NOT NULL username column).
+func TestEnsureChannelExistsEmptyUsernameIsNoop(t *testing.T) {
+	fake := &fakeCatalogueDB{}
+	srv := httptest.NewServer(http.HandlerFunc(fake.handler))
+	t.Cleanup(srv.Close)
+	c := &Client{URL: srv.URL, APIKey: "test-key", client: srv.Client()}
+
+	if err := c.EnsureChannelExists("   "); err != nil {
+		t.Fatalf("EnsureChannelExists(blank): %v", err)
+	}
+	if fake.method != "" {
+		t.Errorf("blank username must not issue a request, got %s %s", fake.method, fake.path)
+	}
+}
+
 // ============================================================================
 // TouchChannelRecordings (owned-but-idle last_recorded_at refresh)
 // ============================================================================

@@ -74,6 +74,34 @@ func (c *Client) request(method, path string, body interface{}) (*http.Response,
 	return c.client.Do(req)
 }
 
+// requestPrefer is request() with an explicit PostgREST Prefer header.  Needed
+// for `resolution=ignore-duplicates`, where request()'s merge-duplicates default
+// would overwrite existing columns with whatever the caller happened to send.
+func (c *Client) requestPrefer(method, path string, body interface{}, prefer string) (*http.Response, error) {
+	var bodyReader io.Reader
+	if body != nil {
+		jsonData, err := json.Marshal(body)
+		if err != nil {
+			return nil, fmt.Errorf("marshal body: %w", err)
+		}
+		bodyReader = bytes.NewReader(jsonData)
+	}
+
+	req, err := http.NewRequest(method, c.URL+"/rest/v1"+path, bodyReader)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	req.Header.Set("apikey", c.APIKey)
+	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Prefer", prefer)
+	}
+
+	return c.client.Do(req)
+}
+
 // defaultMaxRetries is used for all Supabase calls unless a call opts into
 // more (metadata saves use metadataSaveMaxRetries so a transient outage at
 // finalize time cannot strand a recording without its DB row).
@@ -309,6 +337,59 @@ func (c *Client) SaveChannel(ch *Channel) error {
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 	return nil
+}
+
+// EnsureChannelExists registers username in the channels table if it is not
+// there yet, leaving an existing row (and its scraped profile) untouched.
+//
+// In pooled mode channel_assignments is what the fleet records from, and the
+// channels table is the shared catalogue (external tools read it, and the
+// isolated-mode "already exists" check consults it).  A pooled channel used to
+// get its catalogue row only as a side effect of the on-demand profile scrape —
+// i.e. AFTER a node had already claimed and started monitoring it.  That gap
+// was what made the controller's old orphan prune delete freshly added
+// channels; the prune is gone now, and this is a best-effort consistency write
+// so the catalogue lists every pooled channel too.
+//
+// created_at is the one NOT NULL channel column with no database default, so it
+// is supplied explicitly.  resolution=ignore-duplicates makes concurrent adds
+// (and re-adds of an already-recorded channel) no-ops instead of clobbering
+// stored config/profile columns.
+func (c *Client) EnsureChannelExists(username string) error {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return nil
+	}
+
+	body := map[string]interface{}{
+		"username":   username,
+		"created_at": time.Now().Unix(),
+	}
+
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		resp, err := c.requestPrefer("POST", "/channels?on_conflict=username", body, "resolution=ignore-duplicates")
+		if err != nil {
+			lastErr = err
+		} else {
+			if resp.StatusCode < 400 {
+				resp.Body.Close()
+				return nil
+			}
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+			// Only 408/429/5xx are worth another try.
+			if resp.StatusCode != 408 && resp.StatusCode != 429 && resp.StatusCode < 500 {
+				return lastErr
+			}
+		}
+		if attempt < maxAttempts-1 {
+			time.Sleep(retryBackoff(attempt))
+		}
+	}
+	return fmt.Errorf("ensure channel %q: %w", username, lastErr)
 }
 
 // ChannelProfile holds the full-profile fields scraped from the site's
@@ -2794,6 +2875,15 @@ func (c *Client) RepairOrphanedAssignments() (int, error) {
 // 1KB even with long performer names, so a prune can never 414.
 const assignmentPruneBatchSize = 40
 
+// assignmentPruneGrace is how long a channel_assignments row is immune from
+// PruneOrphanedAssignments after it was created.  A brand-new pooled channel
+// gets its channels-catalogue row from EnsureChannelExists (add paths) or from
+// the on-demand profile scrape once a node records it — the latter can take
+// several controller cycles — so an explicitly invoked prune must never treat
+// "not in channels" as "orphan" for a row that has not had a chance to be
+// recorded.
+const assignmentPruneGrace = 30 * time.Minute
+
 // channelUsernameRow is the minimal projection of the channels table used to
 // decide whether an assignment still has a channel behind it.
 type channelUsernameRow struct {
@@ -2824,12 +2914,25 @@ func (c *Client) GetChannelUsernames() (map[string]bool, error) {
 // "channel not found (deleted/renamed), try again in 1 min(s)" forever.  The
 // live fleet carried 165 such rows (the oldest with a heartbeat 7 weeks old).
 //
+// NOT CALLED AUTOMATICALLY ANY MORE.  This used to run every controller cycle,
+// which silently deleted freshly added channels: a brand-new pool entry has no
+// channels row until a node records it, so the next cycle pruned it before any
+// node could claim it ("we add channels but the pool never grows").  The
+// operator's rule is now "no channel is ever deleted automatically — deletions
+// are done by hand from the node dashboards", so the controller no longer calls
+// this.  It is kept (and still tested) as an explicitly-invoked one-shot
+// cleanup for a fleet that has accumulated rows for channels deleted by hand.
+//
 // Rows with status='recording' are deliberately spared — a live recording must
 // never be cut off by a cleanup pass (the same defensive rule
 // reclaim_node_channels applies), and a genuinely stuck recording is reaped by
 // the recording watchdog instead.  For the same reason the DELETE filter carries
 // the status guard rather than relying on the in-memory snapshot alone, so a row
 // that flips to 'recording' between the read and the delete is not removed.
+//
+// Rows created within assignmentPruneGrace are also spared, so an explicitly
+// invoked prune can never delete a pool entry that has not yet had a chance to
+// be recorded (and therefore registered in the catalogue).
 //
 // Returns the number of assignment rows removed (counted from the snapshot that
 // matched the delete filter; a row that changed state in between is skipped by
@@ -2841,15 +2944,23 @@ func (c *Client) PruneOrphanedAssignments() (int, error) {
 	}
 
 	var assignments []ChannelAssignment
-	if err := c.getAllPaginated("/channel_assignments?select=username,site,status", &assignments); err != nil {
+	if err := c.getAllPaginated("/channel_assignments?select=username,site,status,created_at", &assignments); err != nil {
 		return 0, fmt.Errorf("load assignments: %w", err)
 	}
+
+	graceCutoff := time.Now().Add(-assignmentPruneGrace)
 
 	// orphanRows counts the rows the prune targets, keyed by username so a
 	// username present on both sites is removed once but counted per row.
 	orphanRows := map[string]int{}
 	for _, a := range assignments {
 		if a.Username == "" || channels[a.Username] || a.Status == "recording" {
+			continue
+		}
+		// Spare anything added recently: the channels-catalogue row for a pooled
+		// channel only appears once a node starts recording it, which can take
+		// longer than one controller cycle.
+		if t, err := time.Parse(time.RFC3339Nano, a.CreatedAt); err == nil && t.After(graceCutoff) {
 			continue
 		}
 		orphanRows[a.Username]++

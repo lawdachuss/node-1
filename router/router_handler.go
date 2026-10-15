@@ -2270,9 +2270,17 @@ func poolChannelExists(username, site string) (bool, string, string) {
 		}
 	}
 
-	// 3. Supabase channels table (case-insensitive).
-	if exists, err := client.ChannelExists(username); err == nil && exists {
-		return true, "database", fmt.Sprintf("Channel %q already exists in the database", username)
+	// 3. Supabase channels table (case-insensitive).  Only a duplicate in
+	// isolated mode, where the catalogue is what the node records from.  In
+	// pooled mode channel_assignments is authoritative and the catalogue is just
+	// "channels we have recorded at some point": refusing to pool those made
+	// every previously-recorded channel impossible to re-add (the pool editor
+	// answered "already exists in the database" and the pool could never grow
+	// past the historical set), even though nothing was recording them.
+	if !server.IsPooledMode() {
+		if exists, err := client.ChannelExists(username); err == nil && exists {
+			return true, "database", fmt.Sprintf("Channel %q already exists in the database", username)
+		}
 	}
 
 	return false, "", ""
@@ -2390,6 +2398,14 @@ func AddToPool(c *gin.Context) {
 		Resolution:  req.Resolution,
 		Framerate:   req.Framerate,
 		MaxDuration: req.MaxDuration,
+	}
+
+	// Register the channel in the channels catalogue (best-effort). The pool is
+	// authoritative — the controller no longer deletes assignments against the
+	// catalogue — but keeping the row there means external tools and the
+	// isolated-mode duplicate check still see every pooled channel.
+	if err := client.EnsureChannelExists(req.Username); err != nil {
+		fmt.Printf("[WARN] AddToPool: register %q in channels catalogue: %v\n", req.Username, err)
 	}
 
 	if err := client.BulkInsertAssignments([]database.ChannelAssignment{assignment}); err != nil {
