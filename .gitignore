@@ -126,4 +126,5 @@ st_manifest.json
 _preview_scan.py
 manager/upload-complete.flag
 *.flag
+tunnel-url.txt
 
