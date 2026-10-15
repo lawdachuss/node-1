@@ -30,8 +30,15 @@ CB_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (K
 #   CB_ALERT_WEBHOOK   = (optional) webhook URL fired on scan failure / stale heartbeat
 #   CB_SUCCESS_WEBHOOK = (optional) webhook URL fired when channels are auto-added
 
-# Run the scan every 15 minutes, plus a separate 20-min health check that
-# alerts if the last successful scan is older than the configured threshold.
+# Tick every 15 minutes, plus a separate 20-min health check that alerts if the
+# last successful scan is older than the configured threshold.
+#
+# NOTE: the 15-minute cron is only a *tick* — the Worker itself enforces the real
+# scan cadence (autopilot_config.scan_interval_minutes, default 45) and skips the
+# in-between ticks. This is deliberate: the account is limited to 5 Cron Triggers
+# in total (Workers Free), so we cannot express an exact 45-minute schedule with
+# several offset cron expressions. It also keeps Browser Rendering usage (Free
+# plan: 10 browser-minutes/day) spread out instead of bursting every 15 minutes.
 [triggers]
-crons = ["0 * * * *", "*/20 * * * *"]
+crons = ["*/15 * * * *", "*/20 * * * *"]
 
