@@ -22,12 +22,37 @@ type Client struct {
 	client *http.Client
 }
 
-// NewClient creates a new Supabase client
+// newSupabaseHTTPTransport clones Go's default transport and raises the
+// per-host idle-connection pool. The worker issues concurrent REST requests
+// while claiming channels and saving recording/upload metadata; the standard
+// default of only two idle connections per host can cause needless TLS
+// handshakes during bursts. Keep all other defaults (proxy, HTTP/2, keepalive).
+func newSupabaseHTTPTransport() *http.Transport {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 16,
+			IdleConnTimeout:     90 * time.Second,
+		}
+	}
+	transport := base.Clone()
+	transport.MaxIdleConns = 100
+	transport.MaxIdleConnsPerHost = 16
+	transport.IdleConnTimeout = 90 * time.Second
+	return transport
+}
+
+// NewClient creates a new Supabase client with reusable HTTP connections so
+// concurrent PostgREST operations can reuse established TLS sessions.
 func NewClient(url, apiKey string) *Client {
 	return &Client{
 		URL:    url,
 		APIKey: apiKey,
-		client: &http.Client{Timeout: 60 * time.Second},
+		client: &http.Client{
+			Timeout:   60 * time.Second,
+			Transport: newSupabaseHTTPTransport(),
+		},
 	}
 }
 
