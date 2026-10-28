@@ -191,13 +191,40 @@ func supabaseRequest(method, path string, body []byte) (*http.Response, error) {
 	return supabaseRequestWithRetry(method, path, body, prefer, supabaseHTTPClient)
 }
 
+// Shared connection pool for the raw PostgREST helpers. Reuse TLS
+// connections across concurrent worker requests instead of repeatedly paying
+// DNS/TCP/TLS setup cost for settings, channel claims and heartbeats.
+func newSupabaseRESTTransport() *http.Transport {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 16,
+			IdleConnTimeout:     90 * time.Second,
+		}
+	}
+	transport := base.Clone()
+	transport.MaxIdleConns = 100
+	transport.MaxIdleConnsPerHost = 16
+	transport.IdleConnTimeout = 90 * time.Second
+	return transport
+}
+
+var supabaseRESTTransport = newSupabaseRESTTransport()
+
 // Shared HTTP client with connection pooling for the supabaseRequest helper.
-// Avoids creating a new TCP+TLS connection on every call.
-var supabaseHTTPClient = &http.Client{Timeout: 60 * time.Second}
+var supabaseHTTPClient = &http.Client{
+	Timeout:   60 * time.Second,
+	Transport: supabaseRESTTransport,
+}
 
 // fastHTTPClient is used for startup calls (LoadSettingsFromDB, LoadChannelsFromDB)
 // so the web server starts quickly even when Supabase is slow or unreachable.
-var fastHTTPClient = &http.Client{Timeout: 10 * time.Second}
+// It shares the same pool while keeping its shorter per-request deadline.
+var fastHTTPClient = &http.Client{
+	Timeout:   10 * time.Second,
+	Transport: supabaseRESTTransport,
+}
 
 // supabaseRequestWithPrefer is the low-level HTTP helper with retry. Pass an empty string
 // for prefer to omit the header entirely.
