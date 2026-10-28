@@ -84,6 +84,24 @@ func (f *fakeSupabase) handler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func TestNewClientUsesPooledHTTPTransport(t *testing.T) {
+	c := NewClient("https://supabase.example", "test-key")
+	transport, ok := c.client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", c.client.Transport)
+	}
+	if transport.MaxIdleConnsPerHost < 16 {
+		t.Errorf("MaxIdleConnsPerHost = %d, want at least 16", transport.MaxIdleConnsPerHost)
+	}
+	if transport.MaxIdleConns < 100 {
+		t.Errorf("MaxIdleConns = %d, want at least 100", transport.MaxIdleConns)
+	}
+	if transport.IdleConnTimeout != 90*time.Second {
+		t.Errorf("IdleConnTimeout = %v, want 90s", transport.IdleConnTimeout)
+	}
+	c.client.CloseIdleConnections()
+}
+
 func newTestClient(t *testing.T, fake *fakeSupabase) *Client {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(fake.handler))
