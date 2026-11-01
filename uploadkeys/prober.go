@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -16,8 +17,7 @@ import (
 const (
 	// probeInterval is how old a key's status may get before the sweep
 	// re-probes it.  Probes are genuine upload round-trips (one tiny ~2 KB
-	// file, deleted again right after), and VidMoly probes count against its
-	// ~50 API calls/day cap, so this must stay comfortably above hourly — and
+	// file, deleted again right after), so this must stay comfortably above hourly — and
 	// the fleet-wide lease below ensures only ONE node probes per interval,
 	// not all 18.
 	probeInterval = 2 * time.Hour
@@ -179,9 +179,47 @@ func reapDead() int {
 // without anyone re-typing 18 .env files.
 func seedFromConfig() {
 	s, err := Load()
-	// A Managed store is the operator's — even when every list in it is empty
-	// (they deliberately deleted all keys), env must not resurrect them.
-	if err != nil || s == nil || s.Managed || s.nonEmpty() {
+	if err != nil || s == nil {
+		return
+	}
+	if s.Managed || s.nonEmpty() {
+		// A Managed store is the operator's — even when every list in it is empty
+		// (they deliberately deleted all keys), env must not resurrect them.
+		// Exception: image/sprite/preview hosts joined the central store after
+		// these lists were env-only, so an empty image list means "not managed
+		// yet" and gets seeded from env before bailing out.
+		if len(s.Catbox) == 0 && len(s.ImgBB) == 0 && len(s.FreeImage) == 0 && len(s.ImgPile) == 0 && len(s.ImgChest) == 0 {
+			envCred := func(v string) []Cred {
+				v = strings.TrimSpace(v)
+				if v == "" {
+					return nil
+				}
+				return []Cred{{Key: v}}
+			}
+			if len(s.Catbox) == 0 {
+				s.Catbox = envCred(os.Getenv("CATBOX_USERHASH"))
+			}
+			if len(s.ImgBB) == 0 {
+				s.ImgBB = envCred(os.Getenv("IMGBB_API_KEY"))
+			}
+			if len(s.FreeImage) == 0 {
+				s.FreeImage = envCred(os.Getenv("FREEIMAGEHOST_API_KEY"))
+			}
+			if len(s.ImgPile) == 0 {
+				s.ImgPile = envCred(os.Getenv("IMGPILE_KEY"))
+			}
+			if len(s.ImgChest) == 0 {
+				s.ImgChest = envCred(os.Getenv("IMGCHEST_TOKEN"))
+			}
+			if err := Save(s); err != nil {
+				fmt.Printf("[uploadkeys] seed centrally-managed image host keys: %v\n", err)
+				return
+			}
+			mu.Lock()
+			current = s
+			mu.Unlock()
+			fmt.Printf("[uploadkeys] seeded centrally-managed image host keys from env (%d host(s))\n", countHosts(s))
+		}
 		return
 	}
 	csvCreds := func(v string) []Cred {
@@ -201,8 +239,21 @@ func seedFromConfig() {
 	seed := &Set{
 		VoeSX:   csvCreds(server.Config.VoeSXAPIKey),
 		Vidara:  csvCreds(server.Config.VidaraKey),
-		VidMoly: csvCreds(server.Config.VidMolyKey),
 	}
+	// Seed image/sprite/preview hosts from env (these have no Config fields,
+	// so read them straight from the environment).
+	imgCreds := func(v string) []Cred {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return nil
+		}
+		return []Cred{{Key: v}}
+	}
+	seed.Catbox = imgCreds(os.Getenv("CATBOX_USERHASH"))
+	seed.ImgBB = imgCreds(os.Getenv("IMGBB_API_KEY"))
+	seed.FreeImage = imgCreds(os.Getenv("FREEIMAGEHOST_API_KEY"))
+	seed.ImgPile = imgCreds(os.Getenv("IMGPILE_KEY"))
+	seed.ImgChest = imgCreds(os.Getenv("IMGCHEST_TOKEN"))
 	logins := strings.Split(server.Config.StreamtapeLogin, ",")
 	keys := strings.Split(server.Config.StreamtapeKey, ",")
 	n := len(logins)
@@ -266,8 +317,8 @@ func refresh() {
 }
 
 // probeStale probes every configured credential whose status is missing or
-// older than probeInterval, behind a fleet-wide lease so VidMoly's daily API
-// cap is not burned by every node probing independently. Each probe is a real
+// older than probeInterval, behind a fleet-wide lease so daily API
+// caps are not burned by every node probing independently. Each probe is a real
 // (tiny) upload round-trip, so the recorded verdict reflects what uploads will
 // actually do on every node.
 func probeStale() {
@@ -338,7 +389,6 @@ var probeFuncs = map[string]func(Cred) uploader.ProbeResult{
 	"VoeSX":      func(c Cred) uploader.ProbeResult { return uploader.VerifyVoeSX(c.Key) },
 	"Streamtape": func(c Cred) uploader.ProbeResult { return uploader.VerifyStreamtape(c.Login, c.Key) },
 	"Vidara":     func(c Cred) uploader.ProbeResult { return uploader.VerifyVidara(c.Key) },
-	"VidMoly":    func(c Cred) uploader.ProbeResult { return uploader.VerifyVidMoly(c.Key) },
 }
 
 // probeOne checks a single credential against its host API and records the
