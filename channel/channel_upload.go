@@ -35,7 +35,9 @@ func embedURLFromLink(host, link string) string {
 	case "LuluStream":
 		code := strings.TrimSuffix(link[strings.LastIndex(link, "/")+1:], ".html")
 		if code != "" {
-			return "https://lulustream.com/e/" + code
+			// "/embed/{code}" is the iframe-capable player; "/e/{code}" is the
+			// watch page, which frame-busts out of embedded contexts.
+			return "https://lulustream.com/embed/" + code
 		}
 		return link
 	case "DoodStream":

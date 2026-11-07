@@ -43,6 +43,27 @@ func TestStreamtapeVideoURLRelay(t *testing.T) {
 	}
 }
 
+func TestLuluStreamEmbedURL(t *testing.T) {
+	cases := []struct {
+		host, link, want string
+	}{
+		{"LuluStream", "https://lulustream.com/AbC123xY.html", "https://lulustream.com/embed/AbC123xY"},
+		{"LuluStream", "https://lulustream.com/e/AbC123xY", "https://lulustream.com/embed/AbC123xY"},
+		{"LuluStream", "https://lulustream.com/embed/AbC123xY", "https://lulustream.com/embed/AbC123xY"},
+		{"LuluStream", "https://luluvdo.com/AbC123xY.html", "https://lulustream.com/embed/AbC123xY"},
+		{"lulustream", "https://luluvdo.com/e/AbC123xY", "https://lulustream.com/embed/AbC123xY"},
+		{"LuluStream", "", ""},
+	}
+	for _, cse := range cases {
+		if got := embedURLForHostLink(cse.host, cse.link); got != cse.want {
+			t.Errorf("embedURLForHostLink(%q,%q) = %q, want %q", cse.host, cse.link, got, cse.want)
+		}
+		if got := videoURLForHostLink(cse.host, cse.link); got != cse.want {
+			t.Errorf("videoURLForHostLink(%q,%q) = %q, want %q", cse.host, cse.link, got, cse.want)
+		}
+	}
+}
+
 func TestIsStreamtapeLink(t *testing.T) {
 	cases := map[string]bool{
 		"https://streamtape.com/e/AbCdEf1234/": true,

@@ -1256,6 +1256,15 @@ func VideoDetail(c *gin.Context) {
 		}
 	}
 
+	// Older rows store LuluStream's "/e/" watch URL, which frame-busts out of
+	// iframes. Rewrite it on read so already-uploaded recordings play too.
+	if lowerEmbed := strings.ToLower(embedURL); strings.Contains(lowerEmbed, "lulustream.com/") ||
+		strings.Contains(lowerEmbed, "luluvdo.com/") {
+		if canonical := embedURLForHostLink("LuluStream", embedURL); canonical != "" {
+			embedURL = canonical
+		}
+	}
+
 	// A Streamtape embed as the page-level <iframe> shows "video not available"
 	// (cookie/referer policies). Its playback goes through the same-origin relay
 	// (hostPlayer.VideoURL), so never surface a Streamtape embed at page level.
@@ -1388,9 +1397,15 @@ func embedURLForHostLink(host, link string) string {
 		}
 		return link
 	}
-	if strings.Contains(normalizedHost, "lulustream") || strings.Contains(normalizedLink, "lulustream.com/") {
+	if strings.Contains(normalizedHost, "lulustream") ||
+		strings.Contains(normalizedLink, "lulustream.com/") ||
+		strings.Contains(normalizedLink, "luluvdo.com/") {
+		// LuluStream (now LuluVDO) deliberately frame-busts its "/e/" watch
+		// page: the page detects window.top !== self and replaces the embedding
+		// site with its own homepage. "/embed/{code}" is the real iframe player
+		// (no X-Frame-Options), so always canonicalise to it.
 		if code := extractFileCode(link); code != "" {
-			return "https://lulustream.com/e/" + code
+			return "https://lulustream.com/embed/" + code
 		}
 		return link
 	}
@@ -1441,9 +1456,13 @@ func videoURLForHostLink(host, link string) string {
 			return "https://vidara.so/e/" + code
 		}
 		return link
-	case strings.Contains(normalizedHost, "lulustream") || strings.Contains(normalizedLink, "lulustream.com/"):
+	case strings.Contains(normalizedHost, "lulustream") ||
+		strings.Contains(normalizedLink, "lulustream.com/") ||
+		strings.Contains(normalizedLink, "luluvdo.com/"):
+		// "/embed/{code}" is the only LuluStream URL that can be iframed; the
+		// "/e/" watch page frame-busts out of embedded contexts.
 		if code := extractFileCode(link); code != "" {
-			return "https://lulustream.com/e/" + code
+			return "https://lulustream.com/embed/" + code
 		}
 		return link
 	case strings.Contains(normalizedHost, "doodstream") || strings.Contains(normalizedHost, "dood") || strings.Contains(normalizedLink, "dood.to/") || strings.Contains(normalizedLink, "doodstream.com/"):
